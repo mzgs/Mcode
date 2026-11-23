@@ -3,19 +3,315 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const char *tool_icon_for_name(const char *name) {
-    if (!name) return CUI_ICON_TERMINAL;
+typedef enum {
+    TOOL_KIND_CMD = 0,
+    TOOL_KIND_EDIT,
+    TOOL_KIND_READ,
+    TOOL_KIND_SEARCH,
+    TOOL_KIND_WEB,
+    TOOL_KIND_OTHER,
+} tool_kind;
+
+static tool_kind classify_tool_name(const char *name) {
+    if (!name || !name[0]) return TOOL_KIND_OTHER;
     if (strstr(name, "bash") || strstr(name, "Bash") || strstr(name, "command") || strstr(name, "shell"))
-        return CUI_ICON_SQUARE_TERMINAL;
+        return TOOL_KIND_CMD;
+    if (strstr(name, "Edit") || strstr(name, "Write") || strstr(name, "edit") ||
+        strstr(name, "write") || strstr(name, "file_change") || strstr(name, "patch"))
+        return TOOL_KIND_EDIT;
     if (strstr(name, "Read") || strstr(name, "read") || strstr(name, "view"))
-        return CUI_ICON_FILE_TEXT;
-    if (strstr(name, "Edit") || strstr(name, "Write") || strstr(name, "edit") || strstr(name, "file_change"))
-        return CUI_ICON_PENCIL;
-    if (strstr(name, "Search") || strstr(name, "Grep") || strstr(name, "Glob") || strstr(name, "search"))
-        return CUI_ICON_SEARCH;
+        return TOOL_KIND_READ;
+    if (strstr(name, "Search") || strstr(name, "Grep") || strstr(name, "Glob") ||
+        strstr(name, "search") || strstr(name, "grep") || strstr(name, "glob"))
+        return TOOL_KIND_SEARCH;
     if (strstr(name, "Web") || strstr(name, "web") || strstr(name, "fetch"))
-        return CUI_ICON_GLOBE;
-    return CUI_ICON_ZAP;
+        return TOOL_KIND_WEB;
+    return TOOL_KIND_OTHER;
+}
+
+static const char *tool_icon_for_kind(tool_kind kind) {
+    switch (kind) {
+    case TOOL_KIND_CMD:    return CUI_ICON_SQUARE_TERMINAL;
+    case TOOL_KIND_EDIT:   return CUI_ICON_PENCIL;
+    case TOOL_KIND_READ:   return CUI_ICON_FILE_TEXT;
+    case TOOL_KIND_SEARCH: return CUI_ICON_SEARCH;
+    case TOOL_KIND_WEB:    return CUI_ICON_GLOBE;
+    default:               return CUI_ICON_ZAP;
+    }
+}
+
+static bool looks_like_json(const char *s) {
+    if (!s) return false;
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') ++s;
+    return *s == '{' || *s == '[';
+}
+
+static void format_tool_detail(const char *raw, const char *workdir, char *out, size_t cap, size_t max_chars) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (!raw || !raw[0]) return;
+
+    const char *p = raw;
+    while (*p == ' ' || *p == '\t') ++p;
+
+    static const char *const prefixes[] = {
+        "/bin/zsh -lc ", "/bin/bash -lc ", "/bin/sh -c ", "zsh -lc ", "bash -lc ", "sh -c "
+    };
+    for (size_t i = 0; i < sizeof prefixes / sizeof prefixes[0]; ++i) {
+        size_t plen = strlen(prefixes[i]);
+        if (strncmp(p, prefixes[i], plen) == 0) {
+            p += plen;
+            break;
+        }
+    }
+    char quote = 0;
+    if (*p == '\'' || *p == '"') {
+        quote = *p++;
+    }
+
+    const char *home = getenv("HOME");
+    size_t home_len = (home && home[0]) ? strlen(home) : 0;
+    size_t wd_len = (workdir && workdir[0]) ? strlen(workdir) : 0;
+    while (wd_len > 1 && workdir[wd_len - 1] == '/') --wd_len;
+    while (home_len > 1 && home[home_len - 1] == '/') --home_len;
+
+    if (max_chars >= cap) max_chars = cap - 1;
+    size_t w = 0;
+    bool cut = false;
+    bool prev_space = false;
+
+    while (*p) {
+        if (*p == '\n' || *p == '\r') {
+            cut = true;
+            break;
+        }
+        if (quote && *p == quote && p[1] == '\0') break;
+
+        if (wd_len > 0 && strncmp(p, workdir, wd_len) == 0 && p[wd_len] == '/') {
+            p += wd_len + 1;
+            continue;
+        }
+        if (home_len > 0 && strncmp(p, home, home_len) == 0 &&
+            (p[home_len] == '/' || p[home_len] == '\0' || p[home_len] == ' ')) {
+            if (w + 1 > max_chars) { cut = true; break; }
+            out[w++] = '~';
+            p += home_len;
+            prev_space = false;
+            continue;
+        }
+
+        char ch = (*p == '\t') ? ' ' : *p;
+        ++p;
+        if (ch == ' ') {
+            if (prev_space || w == 0) continue;
+            prev_space = true;
+        } else {
+            prev_space = false;
+        }
+
+        if (w >= max_chars) {
+            cut = true;
+            break;
+        }
+        out[w++] = ch;
+    }
+
+    while (w > 0 && out[w - 1] == ' ') --w;
+    if (cut) {
+        if (w + 3 >= cap) w = (cap > 4) ? cap - 4 : 0;
+        out[w++] = '.';
+        out[w++] = '.';
+        out[w++] = '.';
+    }
+    out[w] = '\0';
+}
+
+static void format_tool_row_title(const mcode_block *b, const char *workdir, float secs,
+                                  bool include_meta, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (!b) return;
+
+    tool_kind kind = classify_tool_name(b->tool_name);
+    bool running = (b->status == CUI_TASK_RUNNING);
+    char detail[96] = "";
+    format_tool_detail(b->tool_detail, workdir, detail, sizeof detail, 60);
+
+    const char *verb = NULL;
+    const char *fallback = NULL;
+    switch (kind) {
+    case TOOL_KIND_CMD:
+        verb = running ? "Running" : "Ran";
+        fallback = "command";
+        break;
+    case TOOL_KIND_EDIT:
+        verb = running ? "Editing" : "Edited";
+        fallback = "file";
+        break;
+    case TOOL_KIND_READ:
+        verb = running ? "Reading" : "Read";
+        fallback = "file";
+        break;
+    case TOOL_KIND_SEARCH:
+        verb = running ? "Searching" : "Searched";
+        fallback = "files";
+        break;
+    case TOOL_KIND_WEB:
+        verb = running ? "Fetching" : "Fetched";
+        fallback = "web";
+        break;
+    default:
+        verb = b->tool_name[0] ? b->tool_name : "Tool";
+        fallback = "";
+        break;
+    }
+
+    int n = 0;
+    if (detail[0]) {
+        n = snprintf(out, cap, "%s %s", verb, detail);
+    } else if (fallback[0]) {
+        n = snprintf(out, cap, "%s %s", verb, fallback);
+    } else {
+        n = snprintf(out, cap, "%s", verb);
+    }
+    if (n < 0 || (size_t)n >= cap) return;
+
+    if (include_meta) {
+        if (b->status == CUI_TASK_FAILED) {
+            snprintf(out + n, cap - (size_t)n, " · failed");
+        } else if (secs >= 1.0f && b->status != CUI_TASK_PENDING) {
+            if (secs < 10.0f) snprintf(out + n, cap - (size_t)n, " · %.1fs", (double)secs);
+            else snprintf(out + n, cap - (size_t)n, " · %.0fs", (double)secs);
+        }
+    }
+}
+
+static void append_clause(char *buf, size_t cap, int *pos, const char *fmt, int count) {
+    if (!buf || !pos || *pos < 0 || (size_t)*pos >= cap) return;
+    if (*pos > 0) {
+        int s = snprintf(buf + *pos, cap - (size_t)*pos, ", ");
+        if (s > 0) *pos += s;
+    }
+    if ((size_t)*pos < cap) {
+        int w = snprintf(buf + *pos, cap - (size_t)*pos, fmt, count, count == 1 ? "" : "s");
+        if (w > 0) *pos += w;
+    }
+}
+
+static void format_tool_group_title(const mcode_block *blocks, int start, int count,
+                                    const char *workdir, char *out, size_t cap,
+                                    bool *out_running, int *out_failed) {
+    int n_cmd = 0, n_edit = 0, n_read = 0, n_search = 0, n_web = 0, n_other = 0;
+    int n_failed = 0;
+    int running_idx = -1;
+    float total_secs = 0.0f;
+
+    for (int i = 0; i < count; ++i) {
+        const mcode_block *b = &blocks[start + i];
+        switch (classify_tool_name(b->tool_name)) {
+        case TOOL_KIND_CMD:    ++n_cmd; break;
+        case TOOL_KIND_EDIT:   ++n_edit; break;
+        case TOOL_KIND_READ:   ++n_read; break;
+        case TOOL_KIND_SEARCH: ++n_search; break;
+        case TOOL_KIND_WEB:    ++n_web; break;
+        default:               ++n_other; break;
+        }
+        if (b->status == CUI_TASK_RUNNING) running_idx = start + i;
+        else if (b->status == CUI_TASK_FAILED) ++n_failed;
+        if (b->duration_sec > 0.0f) total_secs += b->duration_sec;
+    }
+
+    if (out_running) *out_running = (running_idx >= 0);
+    if (out_failed) *out_failed = n_failed;
+
+    if (running_idx >= 0) {
+        format_tool_row_title(&blocks[running_idx], workdir, 0.0f, false, out, cap);
+        return;
+    }
+
+    int pos = 0;
+    out[0] = '\0';
+    if (n_read > 0)   append_clause(out, cap, &pos, "read %d file%s", n_read);
+    if (n_search > 0) {
+        if (pos > 0) pos += snprintf(out + pos, cap - (size_t)pos, ", ");
+        if ((size_t)pos < cap) {
+            pos += snprintf(out + pos, cap - (size_t)pos, "%d %s",
+                            n_search, n_search == 1 ? "search" : "searches");
+        }
+    }
+    if (n_cmd > 0)    append_clause(out, cap, &pos, "ran %d command%s", n_cmd);
+    if (n_edit > 0)   append_clause(out, cap, &pos, "edited %d file%s", n_edit);
+    if (n_web > 0)    append_clause(out, cap, &pos, "%d web lookup%s", n_web);
+    if (n_other > 0)  append_clause(out, cap, &pos, "%d tool call%s", n_other);
+
+    if (out[0] >= 'a' && out[0] <= 'z') {
+        out[0] = (char)(out[0] - ('a' - 'A'));
+    }
+
+    if (n_failed > 0 && (size_t)pos < cap) {
+        pos += snprintf(out + pos, cap - (size_t)pos, " · %d failed", n_failed);
+    }
+    if (total_secs >= 1.0f && (size_t)pos < cap) {
+        snprintf(out + pos, cap - (size_t)pos, " · %.0fs", (double)total_secs);
+    }
+}
+
+static void draw_tool_payload(cui_ctx *ui, const char *id, const char *label,
+                              const char *body, const char *lang_hint, bool is_error) {
+    if (!body || !body[0]) return;
+    cui_text(ui, label, .font = CUI_FONT_MEDIUM, .size = 11.5f,
+             .color = is_error ? CUI_COLOR_DANGER : CUI_COLOR_TEXT_MUTED);
+    const char *lang = looks_like_json(body) ? "json" : lang_hint;
+    cui_code_block(ui, id, body, .lang = lang, .max_height = 180, .size = 12, .no_header = true);
+}
+
+static void draw_tool_row(cui_ctx *ui, const mcode_block *b, const char *workdir,
+                          const char *bid) {
+    float secs = (b->status == CUI_TASK_RUNNING)
+        ? (float)(mcode_now_mono() - b->started_mono)
+        : b->duration_sec;
+    const char *inp = b->input.len > 0 ? mcode_str_cstr(&b->input) : NULL;
+    const char *out = b->output.len > 0 ? mcode_str_cstr(&b->output) : NULL;
+    bool expandable = (inp != NULL || out != NULL);
+    bool running = (b->status == CUI_TASK_RUNNING);
+    bool failed = (b->status == CUI_TASK_FAILED);
+    tool_kind kind = classify_tool_name(b->tool_name);
+
+    char title[144];
+    format_tool_row_title(b, workdir, secs, true, title, sizeof title);
+
+    cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_START, .clip = true) {
+        cui_box(ui, .pad_top = 6) {
+            if (running) {
+                cui_spinner(ui, 12);
+            } else if (failed) {
+                cui_icon(ui, CUI_ICON_CIRCLE_ALERT, 13, CUI_COLOR_DANGER);
+            } else {
+                cui_icon(ui, tool_icon_for_kind(kind), 13, CUI_COLOR_TEXT_MUTED);
+            }
+        }
+
+        if (expandable) {
+            cui_reasoning(ui, bid, .thinking = false, .title = title) {
+                bool dup = (inp && out && strcmp(inp, out) == 0);
+                const char *in_lang = (kind == TOOL_KIND_CMD) ? "bash" : NULL;
+                if (dup) {
+                    draw_tool_payload(ui, "out", failed ? "Error" : "Details", out, NULL, failed);
+                } else {
+                    if (inp) draw_tool_payload(ui, "in", kind == TOOL_KIND_CMD ? "Command" : "Input",
+                                               inp, in_lang, false);
+                    if (out) draw_tool_payload(ui, "out", failed ? "Error" : "Output",
+                                               out, NULL, failed);
+                }
+            }
+        } else {
+            cui_box(ui, .pad_y = 4, .width = CUI_FILL) {
+                cui_text(ui, title, .font = CUI_FONT_MEDIUM, .size = 13,
+                         .color = failed ? CUI_COLOR_DANGER : CUI_COLOR_TEXT_SECONDARY,
+                         .nowrap = true);
+            }
+        }
+    }
 }
 
 static const cui_model k_agent_models[APP_AGENT_COUNT] = {
@@ -195,39 +491,37 @@ static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int tur
                              .color = CUI_COLOR_TEXT_SECONDARY, .selectable = true);
                 }
             } else if (b->kind == MCODE_BLOCK_TOOL) {
-                float secs = (b->status == CUI_TASK_RUNNING)
-                    ? (float)(mcode_now_mono() - b->started_mono)
-                    : b->duration_sec;
-                const char *inp = b->input.len > 0 ? mcode_str_cstr(&b->input) : NULL;
-                const char *out = b->output.len > 0 ? mcode_str_cstr(&b->output) : NULL;
-                /* Guarantee single-line summary even for older persisted threads */
-                char detail_line[104] = "";
-                if (b->tool_detail[0]) {
-                    const char *dp = b->tool_detail;
-                    if (strncmp(dp, "/bin/zsh -lc ", 13) == 0) dp += 13;
-                    else if (strncmp(dp, "/bin/bash -lc ", 14) == 0) dp += 14;
-                    if (*dp == '\'' || *dp == '"') ++dp;
-                    size_t w = 0;
-                    bool cut = false;
-                    while (*dp && w < 90) {
-                        if (*dp == '\n' || *dp == '\r') { cut = true; break; }
-                        detail_line[w++] = *dp++;
-                    }
-                    if (*dp) cut = true;
-                    if (cut && w + 3 < sizeof detail_line) {
-                        detail_line[w++] = '.';
-                        detail_line[w++] = '.';
-                        detail_line[w++] = '.';
-                    }
-                    detail_line[w] = '\0';
+                int end = bi + 1;
+                while (end < turn->block_count && turn->blocks[end].kind == MCODE_BLOCK_TOOL) {
+                    ++end;
                 }
-                cui_tool_call(ui, bid, b->tool_name[0] ? b->tool_name : "tool",
-                              .icon = tool_icon_for_name(b->tool_name),
-                              .detail = detail_line[0] ? detail_line : NULL,
-                              .status = b->status,
-                              .seconds = secs,
-                              .input = inp,
-                              .output = out);
+                int count = end - bi;
+                if (count == 1) {
+                    draw_tool_row(ui, b, thread->workdir, bid);
+                } else {
+                    char grp_id[48];
+                    snprintf(grp_id, sizeof grp_id, "tgrp-%d-%d", turn_idx, bi);
+                    char grp_title[160];
+                    bool any_running = false;
+                    int failed_count = 0;
+                    format_tool_group_title(turn->blocks, bi, count, thread->workdir,
+                                            grp_title, sizeof grp_title, &any_running, &failed_count);
+                    cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_START, .clip = true) {
+                        if (!any_running && failed_count > 0) {
+                            cui_box(ui, .pad_top = 6) {
+                                cui_icon(ui, CUI_ICON_CIRCLE_ALERT, 13, CUI_COLOR_DANGER);
+                            }
+                        }
+                        cui_reasoning(ui, grp_id, .thinking = any_running, .title = grp_title) {
+                            for (int ti = bi; ti < end; ++ti) {
+                                char row_id[48];
+                                snprintf(row_id, sizeof row_id, "blk-%d-%d", turn_idx, ti);
+                                draw_tool_row(ui, &turn->blocks[ti], thread->workdir, row_id);
+                            }
+                        }
+                    }
+                }
+                bi = end - 1;
             } else if (b->kind == MCODE_BLOCK_TEXT) {
                 const char *txt = mcode_str_cstr(&b->text);
                 if (txt[0]) {
