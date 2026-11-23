@@ -360,7 +360,7 @@ static void draw_empty_workspace(mcode_app *app, cui_ctx *ui) {
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
                .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER,
                .pad = 32, .gap = 18) {
-        cui_card(ui, .width = CUI_FILL, .max_width = 520, .pad = 24, .gap = 14, .radius = 14) {
+        cui_card(ui, .width = CUI_FILL, .max_width = 560, .pad = 24, .gap = 14, .radius = 14) {
             cui_row(ui, .gap = 10, .align = CUI_ALIGN_CENTER) {
                 cui_icon(ui, CUI_ICON_SPARKLES, 24, CUI_COLOR_ACCENT);
                 cui_heading(ui, "Welcome to Mcode", 3);
@@ -380,25 +380,129 @@ static void draw_empty_workspace(mcode_app *app, cui_ctx *ui) {
 
             cui_separator(ui);
 
-            cui_row(ui, .gap = 10, .wrap = true) {
-                if (app->store.project_count == 0) {
-                    if (cui_button(ui, "Add Project Folder", .variant = CUI_BUTTON_PRIMARY,
+            if (app->store.project_count == 0) {
+                cui_row(ui, .gap = 10, .wrap = true) {
+                    if (cui_button(ui, "Open Folder", .variant = CUI_BUTTON_PRIMARY,
                                    .icon = CUI_ICON_FOLDER_OPEN)) {
-                        mcode_app_action_add_project(ui, app);
+                        mcode_ui_open_project_dialog(app, MCODE_PROJ_DIALOG_OPEN);
                     }
-                } else {
-                    if (cui_button(ui, "New Thread", .variant = CUI_BUTTON_PRIMARY,
+                    if (cui_button(ui, "New Project", .variant = CUI_BUTTON_SECONDARY,
                                    .icon = CUI_ICON_PLUS)) {
-                        mcode_app_action_new_thread(ui, app);
+                        mcode_ui_open_project_dialog(app, MCODE_PROJ_DIALOG_CREATE);
                     }
-                    if (cui_button(ui, "Add Another Project", .variant = CUI_BUTTON_SECONDARY,
-                                   .icon = CUI_ICON_FOLDER_OPEN)) {
-                        mcode_app_action_add_project(ui, app);
+                    if (cui_button(ui, "Clone URL", .variant = CUI_BUTTON_OUTLINE,
+                                   .icon = CUI_ICON_DOWNLOAD)) {
+                        mcode_ui_open_project_dialog(app, MCODE_PROJ_DIALOG_CLONE);
+                    }
+                    if (cui_button(ui, "Settings", .variant = CUI_BUTTON_GHOST,
+                                   .icon = CUI_ICON_SETTINGS)) {
+                        app->chrome->settings_open = true;
+                        app->chrome->settings_section = SETTINGS_SECTION_GENERAL;
                     }
                 }
-                if (cui_button(ui, "Settings", .variant = CUI_BUTTON_GHOST, .icon = CUI_ICON_SETTINGS)) {
-                    app->chrome->settings_open = true;
-                    app->chrome->settings_section = SETTINGS_SECTION_GENERAL;
+
+                /* One-click quick-start for detected local Git repositories */
+                int shown = 0;
+                int avail = 0;
+                for (int i = 0; i < app->discovered_repo_count; ++i) {
+                    if (!mcode_store_find_project_by_path(&app->store, app->discovered_repos[i].path)) {
+                        ++avail;
+                    }
+                }
+                if (avail > 0) {
+                    cui_separator(ui);
+                    cui_text(ui, "Quick-open detected repositories", .font = CUI_FONT_MEDIUM,
+                             .size = 12.5f, .color = CUI_COLOR_TEXT_SECONDARY);
+                    cui_column(ui, .width = CUI_FILL, .gap = 5) {
+                        for (int i = 0; i < app->discovered_repo_count && shown < 4; ++i) {
+                            const mcode_discovered_repo *r = &app->discovered_repos[i];
+                            if (mcode_store_find_project_by_path(&app->store, r->path)) continue;
+                            ++shown;
+                            cui_push_id_int(ui, i);
+                            bool clicked = cui_card_begin(ui, &(cui_card_opts){
+                                .id = "welcome-repo",
+                                .dir = CUI_ROW,
+                                .align = CUI_ALIGN_CENTER,
+                                .width = CUI_FILL,
+                                .pad_x = 10,
+                                .pad_y = 7,
+                                .gap = 8,
+                                .hoverable = true,
+                                .muted = true,
+                                .radius = 8,
+                            });
+                            cui_icon(ui, CUI_ICON_FOLDER, 14, CUI_COLOR_ACCENT);
+                            cui_text(ui, r->name, .font = CUI_FONT_MEDIUM, .size = 13,
+                                     .nowrap = true);
+                            char short_p[MCODE_PATH_MAX];
+                            mcode_git_shorten_home_path(r->path, short_p, sizeof short_p);
+                            cui_text(ui, short_p, .font = CUI_FONT_MONO, .size = 11,
+                                     .color = CUI_COLOR_TEXT_MUTED, .width = CUI_FILL,
+                                     .nowrap = true);
+                            cui_icon(ui, CUI_ICON_ARROW_RIGHT, 13, CUI_COLOR_TEXT_MUTED);
+                            cui_card_end(ui);
+                            cui_pop_id(ui);
+                            if (clicked) {
+                                mcode_ui_add_project_and_open(app, ui, r->path, r->name);
+                                break;
+                            }
+                        }
+                    }
+                    if (avail > 4) {
+                        char more_lbl[48];
+                        snprintf(more_lbl, sizeof more_lbl, "Browse all %d detected repositories...", avail);
+                        if (cui_button(ui, more_lbl, .variant = CUI_BUTTON_GHOST,
+                                       .size = CUI_SIZE_SM)) {
+                            mcode_ui_open_project_dialog(app, MCODE_PROJ_DIALOG_OPEN);
+                        }
+                    }
+                }
+            } else {
+                cui_text(ui, "Start a thread in one of your projects", .font = CUI_FONT_MEDIUM,
+                         .size = 12.5f, .color = CUI_COLOR_TEXT_SECONDARY);
+                cui_column(ui, .width = CUI_FILL, .gap = 5) {
+                    int max_show = app->store.project_count < 5 ? app->store.project_count : 5;
+                    for (int i = 0; i < max_show; ++i) {
+                        mcode_project *p = &app->store.projects[i];
+                        cui_push_id(ui, p->id);
+                        bool clicked = cui_card_begin(ui, &(cui_card_opts){
+                            .id = "welcome-proj",
+                            .dir = CUI_ROW,
+                            .align = CUI_ALIGN_CENTER,
+                            .width = CUI_FILL,
+                            .pad_x = 10,
+                            .pad_y = 7,
+                            .gap = 8,
+                            .hoverable = true,
+                            .muted = true,
+                            .radius = 8,
+                        });
+                        cui_icon(ui, CUI_ICON_FOLDER_OPEN, 14, CUI_COLOR_ACCENT);
+                        cui_text(ui, p->name, .font = CUI_FONT_MEDIUM, .size = 13, .nowrap = true);
+                        char short_p[MCODE_PATH_MAX];
+                        mcode_git_shorten_home_path(p->path, short_p, sizeof short_p);
+                        cui_text(ui, short_p, .font = CUI_FONT_MONO, .size = 11,
+                                 .color = CUI_COLOR_TEXT_MUTED, .width = CUI_FILL, .nowrap = true);
+                        cui_icon(ui, CUI_ICON_PLUS, 14, CUI_COLOR_ACCENT);
+                        cui_card_end(ui);
+                        cui_pop_id(ui);
+                        if (clicked) {
+                            mcode_ui_quick_new_thread(app, ui, p);
+                            break;
+                        }
+                    }
+                }
+
+                cui_row(ui, .gap = 10, .wrap = true) {
+                    if (cui_button(ui, "Add or Create Project", .variant = CUI_BUTTON_SECONDARY,
+                                   .icon = CUI_ICON_PLUS)) {
+                        mcode_ui_open_project_dialog(app, MCODE_PROJ_DIALOG_OPEN);
+                    }
+                    if (cui_button(ui, "Settings", .variant = CUI_BUTTON_GHOST,
+                                   .icon = CUI_ICON_SETTINGS)) {
+                        app->chrome->settings_open = true;
+                        app->chrome->settings_section = SETTINGS_SECTION_GENERAL;
+                    }
                 }
             }
         }
@@ -474,6 +578,13 @@ static void draw_thread_header(mcode_app *app, cui_ctx *ui, mcode_thread *thread
                     if (cui_button(ui, "PR", .variant = CUI_BUTTON_SECONDARY, .size = CUI_SIZE_SM,
                                    .icon = CUI_ICON_ARROW_UP_RIGHT)) {
                         mcode_app_action_create_pr(ui, app);
+                    }
+                } else if (proj && !proj->is_git_repo) {
+                    if (cui_button(ui, "Init Git", .variant = CUI_BUTTON_OUTLINE, .size = CUI_SIZE_SM,
+                                   .icon = CUI_ICON_GIT_BRANCH,
+                                   .tooltip = "Initialize a Git repository to enable diffs and worktrees")) {
+                        mcode_project *mut_proj = mcode_store_find_project(&app->store, proj->id);
+                        if (mut_proj) mcode_ui_init_project_git(app, ui, mut_proj);
                     }
                 }
 
@@ -1309,6 +1420,7 @@ void mcode_ui_draw_chat(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
                 bool busy = (thread->active_run != NULL);
 
                 /* Compact pre-composer options strip */
+                const mcode_project *comp_proj = mcode_store_find_project(&app->store, thread->project_id);
                 cui_row(ui, .width = CUI_FILL, .gap = 10, .align = CUI_ALIGN_CENTER, .wrap = true) {
                     if (!app->cli_status.available[thread->agent]) {
                         cui_badge(ui, "CLI not found", .icon = CUI_ICON_TRIANGLE_ALERT,
@@ -1320,6 +1432,12 @@ void mcode_ui_draw_chat(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
                         cui_muted(ui, sshort);
                     }
                     cui_spacer(ui);
+                    if (thread->turn_count == 0 && !busy && comp_proj && comp_proj->is_git_repo) {
+                        bool wt = thread->use_worktree;
+                        if (cui_chip(ui, "Worktree", &wt)) {
+                            mcode_ui_toggle_thread_worktree(app, ui, thread);
+                        }
+                    }
                     if (cui_chip(ui, "Auto-approve", &thread->auto_approve)) {
                         mcode_ui_mark_dirty(app);
                     }

@@ -17,21 +17,16 @@ static bool contains_icase(const char *hay, const char *needle) {
     return false;
 }
 
-static bool thread_matches_filter(mcode_app *app, const mcode_thread *t) {
-    if (app->store.selected_project_id[0] &&
-        strcmp(t->project_id, app->store.selected_project_id) != 0) {
-        return false;
-    }
+static bool thread_matches_query(mcode_app *app, const mcode_thread *t, const mcode_project *p) {
     if (!app->thread_search[0]) return true;
     if (contains_icase(t->title, app->thread_search)) return true;
     if (contains_icase(t->branch, app->thread_search)) return true;
-    const mcode_project *p = mcode_store_find_project(&app->store, t->project_id);
     if (p && contains_icase(p->name, app->thread_search)) return true;
     return false;
 }
 
 /* Returns false if the thread was deleted during this frame. */
-static bool draw_thread_card(mcode_app *app, cui_ctx *ui, int idx) {
+static bool draw_thread_card(mcode_app *app, cui_ctx *ui, int idx, bool show_project_name) {
     mcode_thread *t = &app->store.threads[idx];
     const mcode_project *p = mcode_store_find_project(&app->store, t->project_id);
     bool is_selected = strcmp(app->store.selected_thread_id, t->id) == 0;
@@ -42,9 +37,9 @@ static bool draw_thread_card(mcode_app *app, cui_ctx *ui, int idx) {
     bool clicked = cui_card_begin(ui, &(cui_card_opts){
         .id = "tcard",
         .width = CUI_FILL,
-        .pad_x = 10,
-        .pad_y = 8,
-        .gap = 5,
+        .pad_x = 9,
+        .pad_y = 7,
+        .gap = 4,
         .hoverable = true,
         .selected = is_selected,
         .radius = 8,
@@ -53,7 +48,7 @@ static bool draw_thread_card(mcode_app *app, cui_ctx *ui, int idx) {
     /* Top row: live status indicator + title + timer/diff */
     cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
         if (running) {
-            cui_spinner(ui, 13);
+            cui_spinner(ui, 12);
         } else if (last_failed) {
             cui_icon(ui, CUI_ICON_CIRCLE_ALERT, 13, CUI_COLOR_DANGER);
         } else if (t->state == MCODE_THREAD_SETTLED) {
@@ -63,10 +58,11 @@ static bool draw_thread_card(mcode_app *app, cui_ctx *ui, int idx) {
         } else if (t->turn_count > 0) {
             cui_icon(ui, CUI_ICON_CIRCLE_DOT, 13, CUI_COLOR_SUCCESS);
         } else {
-            cui_icon(ui, CUI_ICON_CIRCLE, 12, CUI_COLOR_TEXT_MUTED);
+            cui_icon(ui, CUI_ICON_CIRCLE, 11.5f, CUI_COLOR_TEXT_MUTED);
         }
 
-        cui_text(ui, t->title, .font = CUI_FONT_MEDIUM, .size = 13,
+        cui_text(ui, t->title, .font = CUI_FONT_MEDIUM, .size = 12.5f,
+                 .color = (t->state == MCODE_THREAD_SNOOZED) ? CUI_COLOR_TEXT_SECONDARY : CUI_COLOR_FOREGROUND,
                  .width = CUI_FILL, .nowrap = true);
 
         if (running) {
@@ -78,28 +74,34 @@ static bool draw_thread_card(mcode_app *app, cui_ctx *ui, int idx) {
         } else if (t->total_added > 0 || t->total_removed > 0) {
             char stat[32];
             snprintf(stat, sizeof stat, "+%d -%d", t->total_added, t->total_removed);
-            cui_text(ui, stat, .font = CUI_FONT_MONO, .size = 11,
+            cui_text(ui, stat, .font = CUI_FONT_MONO, .size = 10.5f,
                      .color = CUI_COLOR_TEXT_MUTED, .tabular = true);
         }
     }
 
-    /* Bottom row: agent badge + project/branch */
+    /* Bottom row: agent badge + branch (and project name only in Settled bucket) */
     cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
         cui_tone ag_tone = (t->agent == APP_AGENT_CLAUDE) ? CUI_TONE_WARNING
                          : (t->agent == APP_AGENT_CODEX)  ? CUI_TONE_SUCCESS
                          : CUI_TONE_INFO;
         cui_badge(ui, mcode_agent_short_label(t->agent), .tone = ag_tone, .size = CUI_SIZE_SM);
 
-        char meta[192];
-        if (p && t->branch[0]) {
+        char meta[192] = "";
+        if (show_project_name && p && t->branch[0]) {
             snprintf(meta, sizeof meta, "%s · %s", p->name, t->branch);
-        } else if (p) {
+        } else if (show_project_name && p) {
             snprintf(meta, sizeof meta, "%s", p->name);
-        } else {
-            snprintf(meta, sizeof meta, "%s", t->branch);
+        } else if (t->branch[0]) {
+            snprintf(meta, sizeof meta, "%s%s",
+                     t->branch,
+                     (t->state == MCODE_THREAD_SNOOZED) ? " · snoozed" : "");
+        } else if (t->state == MCODE_THREAD_SNOOZED) {
+            snprintf(meta, sizeof meta, "Snoozed");
         }
-        cui_text(ui, meta, .size = 11.5f, .color = CUI_COLOR_TEXT_MUTED,
-                 .width = CUI_FILL, .nowrap = true);
+        if (meta[0]) {
+            cui_text(ui, meta, .size = 11.0f, .color = CUI_COLOR_TEXT_MUTED,
+                     .width = CUI_FILL, .nowrap = true);
+        }
     }
 
     cui_card_end(ui);
@@ -154,115 +156,250 @@ static bool draw_thread_card(mcode_app *app, cui_ctx *ui, int idx) {
     return !deleted;
 }
 
+/* Draws one collapsible project section and its non-settled threads.
+ * Returns false if the project was removed during this frame. */
+static bool draw_project_section(mcode_app *app, cui_ctx *ui, int proj_idx) {
+    mcode_project *p = &app->store.projects[proj_idx];
+    char proj_id[MCODE_ID_MAX];
+    snprintf(proj_id, sizeof proj_id, "%s", p->id);
+
+    bool searching = (app->thread_search[0] != '\0');
+    bool proj_name_matches = !searching || contains_icase(p->name, app->thread_search);
+
+    int open_count = 0;
+    int matching_open_count = 0;
+    int running_count = 0;
+    bool has_selected_thread = false;
+    for (int i = 0; i < app->store.thread_count; ++i) {
+        const mcode_thread *t = &app->store.threads[i];
+        if (strcmp(t->project_id, proj_id) != 0) continue;
+        if (t->state == MCODE_THREAD_SETTLED) continue;
+        ++open_count;
+        if (t->active_run) ++running_count;
+        if (strcmp(app->store.selected_thread_id, t->id) == 0) has_selected_thread = true;
+        if (proj_name_matches || thread_matches_query(app, t, p)) ++matching_open_count;
+    }
+
+    if (searching && !proj_name_matches && matching_open_count == 0) {
+        return true;
+    }
+
+    bool expanded = searching || !p->collapsed;
+    bool is_active_proj = has_selected_thread ||
+                          (strcmp(app->store.selected_project_id, proj_id) == 0);
+    bool removed = false;
+
+    cui_push_id(ui, proj_id);
+
+    cui_column(ui, .width = CUI_FILL, .gap = 5) {
+        /* Project header row: clickable folder toggle + sibling 1-click "+" button */
+        cui_row(ui, .width = CUI_FILL, .gap = 4, .align = CUI_ALIGN_CENTER) {
+            cui_id hid = cui_make_id(ui, "phdr");
+            cui_rect hr = cui_get_rect(ui, hid);
+            cui_vec2 mp = cui_mouse_pos(ui);
+            bool hov = hr.w > 0.0f && mp.x >= hr.x && mp.x <= hr.x + hr.w &&
+                       mp.y >= hr.y && mp.y <= hr.y + hr.h;
+            cui_color hbg = hov
+                ? cui_alpha(cui_color_of(ui, CUI_COLOR_FOREGROUND), 0.06f)
+                : CUI_RGBA(0x00000001u);
+
+            bool hdr_clicked = cui_card_begin(ui, &(cui_card_opts){
+                .id = "phdr",
+                .dir = CUI_ROW,
+                .align = CUI_ALIGN_CENTER,
+                .width = CUI_FILL,
+                .pad_x = 6,
+                .pad_y = 5,
+                .gap = 6,
+                .hoverable = true,
+                .border = -1.0f,
+                .radius = 7,
+                .bg = hbg,
+            });
+            cui_icon(ui, expanded ? CUI_ICON_CHEVRON_DOWN : CUI_ICON_CHEVRON_RIGHT,
+                     13, CUI_COLOR_TEXT_MUTED);
+            cui_icon(ui, expanded ? CUI_ICON_FOLDER_OPEN : CUI_ICON_FOLDER,
+                     14, is_active_proj ? CUI_COLOR_ACCENT : CUI_COLOR_TEXT_SECONDARY);
+            cui_text(ui, p->name, .font = CUI_FONT_MEDIUM, .size = 13,
+                     .color = CUI_COLOR_FOREGROUND, .width = CUI_FILL, .nowrap = true);
+            if (running_count > 0) {
+                cui_spinner(ui, 12);
+            } else if (!expanded && open_count > 0) {
+                char cnt[16];
+                snprintf(cnt, sizeof cnt, "%d", open_count);
+                cui_badge(ui, cnt, .size = CUI_SIZE_SM);
+            }
+            cui_card_end(ui);
+
+            char tip[MCODE_PATH_MAX + 32];
+            mcode_git_shorten_home_path(p->path, tip, sizeof tip);
+            cui_tooltip(ui, tip);
+
+            /* Right-click project management menu */
+            cui_context_menu(ui, "pmenu") {
+                if (cui_menu_item(ui, "New Thread", .icon = CUI_ICON_PLUS)) {
+                    mcode_project *cur = mcode_store_find_project(&app->store, proj_id);
+                    if (cur) {
+                        cur->collapsed = false;
+                        mcode_ui_quick_new_thread(app, ui, cur);
+                    }
+                }
+                if (cui_menu_item(ui, "New Thread (Custom Options...)",
+                                  .icon = CUI_ICON_SLIDERS_HORIZONTAL)) {
+                    mcode_project *cur = mcode_store_find_project(&app->store, proj_id);
+                    if (cur) mcode_ui_open_new_thread_dialog(app, cur);
+                }
+                cui_menu_separator(ui);
+                if (cui_menu_item(ui, "Open Folder in Finder", .icon = CUI_ICON_FOLDER_OPEN)) {
+                    mcode_project *cur = mcode_store_find_project(&app->store, proj_id);
+                    if (cur && cur->path[0] && !cui_app_open_url(cur->path)) {
+                        app_chrome_notify(app->chrome, ui, "Could not open folder.", CUI_TONE_DANGER);
+                    }
+                }
+                if (cui_menu_item(ui, "Setup & Quick Actions...", .icon = CUI_ICON_SQUARE_TERMINAL)) {
+                    mcode_ui_open_project_actions_for(app, ui, proj_id);
+                }
+                if (!p->is_git_repo) {
+                    if (cui_menu_item(ui, "Initialize Git Repository", .icon = CUI_ICON_GIT_BRANCH)) {
+                        mcode_project *cur = mcode_store_find_project(&app->store, proj_id);
+                        if (cur) mcode_ui_init_project_git(app, ui, cur);
+                    }
+                }
+                if (cui_menu_item(ui, "Rename Project...", .icon = CUI_ICON_PENCIL)) {
+                    mcode_project *cur = mcode_store_find_project(&app->store, proj_id);
+                    if (cur) mcode_ui_open_rename_project(app, cur);
+                }
+                cui_menu_separator(ui);
+                if (cui_menu_item(ui, "Remove from Mcode", .icon = CUI_ICON_TRASH_2, .danger = true)) {
+                    mcode_ui_remove_project(app, ui, proj_id);
+                    removed = true;
+                }
+            }
+
+            if (hdr_clicked && !removed) {
+                mcode_project *cur = mcode_store_find_project(&app->store, proj_id);
+                if (cur) {
+                    if (!searching) cur->collapsed = !cur->collapsed;
+                    snprintf(app->store.selected_project_id,
+                             sizeof app->store.selected_project_id, "%s", cur->id);
+                    mcode_ui_mark_dirty(app);
+                }
+            }
+
+            if (!removed) {
+                char add_tip[192];
+                snprintf(add_tip, sizeof add_tip, "New thread in %s", p->name);
+                if (cui_icon_button(ui, CUI_ICON_PLUS, .size = CUI_SIZE_SM,
+                                    .variant = CUI_BUTTON_GHOST, .tooltip = add_tip)) {
+                    mcode_project *cur = mcode_store_find_project(&app->store, proj_id);
+                    if (cur) {
+                        cur->collapsed = false;
+                        mcode_ui_quick_new_thread(app, ui, cur);
+                    }
+                }
+            }
+        }
+
+        /* Nested threads under this project */
+        if (!removed && expanded) {
+            cui_column(ui, .width = CUI_FILL, .pad_left = 10, .gap = 5) {
+                int drawn = 0;
+                for (int i = app->store.thread_count - 1; i >= 0; --i) {
+                    mcode_thread *t = &app->store.threads[i];
+                    if (strcmp(t->project_id, proj_id) != 0) continue;
+                    if (t->state == MCODE_THREAD_SETTLED) continue;
+                    mcode_project *cur = mcode_store_find_project(&app->store, proj_id);
+                    if (!proj_name_matches && !thread_matches_query(app, t, cur)) continue;
+                    ++drawn;
+                    if (!draw_thread_card(app, ui, i, false)) {
+                        if (i > app->store.thread_count) i = app->store.thread_count;
+                    }
+                }
+                if (drawn == 0 && !searching) {
+                    if (cui_button(ui, "New thread", .variant = CUI_BUTTON_GHOST,
+                                   .size = CUI_SIZE_SM, .icon = CUI_ICON_PLUS,
+                                   .full_width = true)) {
+                        mcode_project *cur = mcode_store_find_project(&app->store, proj_id);
+                        if (cur) mcode_ui_quick_new_thread(app, ui, cur);
+                    }
+                }
+            }
+        }
+    }
+
+    cui_pop_id(ui);
+    return !removed;
+}
+
 void mcode_ui_draw_sidebar(mcode_app *app, cui_ctx *ui) {
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
                .bg = CUI_COLOR_SURFACE_MUTED, .pad = 10, .gap = 10) {
 
-        /* Brand & primary create actions */
+        /* Brand & primary "+ Project" button */
         cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
             cui_icon(ui, CUI_ICON_SPARKLES, 16, CUI_COLOR_ACCENT);
             cui_text(ui, "Mcode", .font = CUI_FONT_MEDIUM, .size = 15);
             cui_spacer(ui);
-            if (cui_icon_button(ui, CUI_ICON_FOLDER_OPEN, .tooltip = "Add Project Folder",
-                                .shortcut = "Cmd Shift O")) {
-                mcode_app_action_add_project(ui, app);
-            }
-            if (cui_button(ui, "New", .variant = CUI_BUTTON_PRIMARY, .size = CUI_SIZE_SM,
-                           .icon = CUI_ICON_PLUS, .tooltip = "New Thread", .shortcut = "Cmd N")) {
-                mcode_app_action_new_thread(ui, app);
+            if (cui_button(ui, "Project", .variant = CUI_BUTTON_SECONDARY, .size = CUI_SIZE_SM,
+                           .icon = CUI_ICON_PLUS,
+                           .tooltip = "Open, create, or clone a project",
+                           .shortcut = "Cmd Shift O")) {
+                mcode_ui_open_project_dialog(app, MCODE_PROJ_DIALOG_OPEN);
             }
         }
 
-        /* Project filter row */
-        if (app->store.project_count > 0) {
-            const char *labels[65];
-            labels[0] = "All Projects";
-            int sel_idx = 0;
-            int n_proj = app->store.project_count < 64 ? app->store.project_count : 64;
-            for (int i = 0; i < n_proj; ++i) {
-                labels[i + 1] = app->store.projects[i].name;
-                if (strcmp(app->store.selected_project_id, app->store.projects[i].id) == 0) {
-                    sel_idx = i + 1;
-                }
-            }
-            cui_row(ui, .width = CUI_FILL, .gap = 4, .align = CUI_ALIGN_CENTER) {
-                if (cui_select(ui, "project-filter", labels, n_proj + 1, &sel_idx,
-                               .width = CUI_FILL)) {
-                    if (sel_idx == 0) {
-                        app->store.selected_project_id[0] = '\0';
-                    } else {
-                        snprintf(app->store.selected_project_id, sizeof app->store.selected_project_id,
-                                 "%s", app->store.projects[sel_idx - 1].id);
-                    }
-                    mcode_ui_mark_dirty(app);
-                }
-                if (cui_icon_button(ui, CUI_ICON_SLIDERS_HORIZONTAL,
-                                    .tooltip = "Project Quick Actions & Worktree Setup")) {
-                    mcode_app_action_project_actions(ui, app);
-                }
-            }
-        }
-
-        /* Search threads */
+        /* Filter projects & threads */
         cui_search(ui, "thread-search", app->thread_search, sizeof app->thread_search,
-                   .placeholder = "Filter threads...", .width = CUI_FILL);
+                   .placeholder = "Filter projects & threads...", .width = CUI_FILL);
 
-        /* Inbox thread list */
+        /* Project tree + settled footer */
         cui_scroll(ui, .id = "sidebar-threads", .width = CUI_FILL, .height = CUI_FILL, .gap = 8) {
-            int active_count = 0, snoozed_count = 0, settled_count = 0;
-            for (int i = 0; i < app->store.thread_count; ++i) {
-                if (!thread_matches_filter(app, &app->store.threads[i])) continue;
-                if (app->store.threads[i].state == MCODE_THREAD_ACTIVE) ++active_count;
-                else if (app->store.threads[i].state == MCODE_THREAD_SNOOZED) ++snoozed_count;
-                else ++settled_count;
-            }
-
-            /* Active threads */
-            cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
-                cui_text(ui, "ACTIVE", .font = CUI_FONT_MEDIUM, .size = 11,
-                         .color = CUI_COLOR_TEXT_MUTED);
-                char cnt[16];
-                snprintf(cnt, sizeof cnt, "%d", active_count);
-                cui_badge(ui, cnt, .size = CUI_SIZE_SM);
-            }
-
-            if (active_count == 0) {
-                cui_column(ui, .width = CUI_FILL, .pad_y = 12, .gap = 6, .align = CUI_ALIGN_CENTER) {
-                    cui_muted(ui, app->store.project_count == 0
-                              ? "Add a Git project to start."
-                              : "No active threads.");
+            if (app->store.project_count == 0) {
+                cui_column(ui, .width = CUI_FILL, .pad_y = 20, .pad_x = 6, .gap = 10,
+                           .align = CUI_ALIGN_CENTER) {
+                    cui_icon(ui, CUI_ICON_FOLDER_OPEN, 22, CUI_COLOR_TEXT_MUTED);
+                    cui_text(ui, "No projects yet", .font = CUI_FONT_MEDIUM, .size = 13);
+                    cui_muted(ui, "Open a repo or create a new folder to start.");
+                    cui_column(ui, .width = CUI_FILL, .gap = 6) {
+                        if (cui_button(ui, "Open Folder", .variant = CUI_BUTTON_PRIMARY,
+                                       .size = CUI_SIZE_SM, .icon = CUI_ICON_FOLDER_OPEN,
+                                       .full_width = true)) {
+                            mcode_ui_open_project_dialog(app, MCODE_PROJ_DIALOG_OPEN);
+                        }
+                        if (cui_button(ui, "New Project", .variant = CUI_BUTTON_OUTLINE,
+                                       .size = CUI_SIZE_SM, .icon = CUI_ICON_PLUS,
+                                       .full_width = true)) {
+                            mcode_ui_open_project_dialog(app, MCODE_PROJ_DIALOG_CREATE);
+                        }
+                    }
                 }
             } else {
+                for (int pi = 0; pi < app->store.project_count; ++pi) {
+                    if (!draw_project_section(app, ui, pi)) {
+                        --pi;
+                    }
+                }
+
+                /* Orphan threads (defensive fallback if a thread has no project) */
                 for (int i = app->store.thread_count - 1; i >= 0; --i) {
-                    if (app->store.threads[i].state != MCODE_THREAD_ACTIVE) continue;
-                    if (!thread_matches_filter(app, &app->store.threads[i])) continue;
-                    if (!draw_thread_card(app, ui, i)) {
-                        /* Array shifted; adjust index cleanly */
+                    mcode_thread *t = &app->store.threads[i];
+                    if (t->state == MCODE_THREAD_SETTLED) continue;
+                    if (mcode_store_find_project(&app->store, t->project_id)) continue;
+                    if (!thread_matches_query(app, t, NULL)) continue;
+                    if (!draw_thread_card(app, ui, i, true)) {
                         if (i > app->store.thread_count) i = app->store.thread_count;
                     }
                 }
             }
 
-            /* Snoozed threads */
-            if (snoozed_count > 0) {
-                cui_separator(ui);
-                cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
-                    cui_text(ui, "SNOOZED", .font = CUI_FONT_MEDIUM, .size = 11,
-                             .color = CUI_COLOR_TEXT_MUTED);
-                    char cnt[16];
-                    snprintf(cnt, sizeof cnt, "%d", snoozed_count);
-                    cui_badge(ui, cnt, .tone = CUI_TONE_WARNING, .size = CUI_SIZE_SM);
-                }
-                for (int i = app->store.thread_count - 1; i >= 0; --i) {
-                    if (app->store.threads[i].state != MCODE_THREAD_SNOOZED) continue;
-                    if (!thread_matches_filter(app, &app->store.threads[i])) continue;
-                    if (!draw_thread_card(app, ui, i)) {
-                        if (i > app->store.thread_count) i = app->store.thread_count;
-                    }
-                }
+            /* Collapsible Settled threads across projects */
+            int settled_count = 0;
+            for (int i = 0; i < app->store.thread_count; ++i) {
+                const mcode_thread *t = &app->store.threads[i];
+                if (t->state != MCODE_THREAD_SETTLED) continue;
+                const mcode_project *p = mcode_store_find_project(&app->store, t->project_id);
+                if (thread_matches_query(app, t, p)) ++settled_count;
             }
-
-            /* Collapsible Settled threads */
             if (settled_count > 0) {
                 cui_separator(ui);
                 char hdr[48];
@@ -275,9 +412,11 @@ void mcode_ui_draw_sidebar(mcode_app *app, cui_ctx *ui) {
                 }
                 if (app->store.settled_expanded) {
                     for (int i = app->store.thread_count - 1; i >= 0; --i) {
-                        if (app->store.threads[i].state != MCODE_THREAD_SETTLED) continue;
-                        if (!thread_matches_filter(app, &app->store.threads[i])) continue;
-                        if (!draw_thread_card(app, ui, i)) {
+                        mcode_thread *t = &app->store.threads[i];
+                        if (t->state != MCODE_THREAD_SETTLED) continue;
+                        const mcode_project *p = mcode_store_find_project(&app->store, t->project_id);
+                        if (!thread_matches_query(app, t, p)) continue;
+                        if (!draw_thread_card(app, ui, i, true)) {
                             if (i > app->store.thread_count) i = app->store.thread_count;
                         }
                     }

@@ -13,6 +13,32 @@ bool mcode_git_inspect_repo(const char *dir, bool *is_repo,
 /* Initialize a new Git repository in `dir` (`git init`). */
 bool mcode_git_init_repo(const char *dir, char *err, size_t err_cap);
 
+/* True if `dir` is a Git repository with at least one commit (valid HEAD). */
+bool mcode_git_has_commits(const char *dir);
+
+/* Resolve a sensible default parent folder for new/cloned projects (e.g. ~/Developer). */
+void mcode_git_default_projects_dir(char *out, size_t cap);
+
+/* Create a new project folder `<parent_dir>/<folder_name>` and optionally run `git init`. */
+bool mcode_git_create_project_dir(const char *parent_dir, const char *folder_name,
+                                  bool init_git, char *out_path, size_t out_cap,
+                                  char *err, size_t err_cap);
+
+/* Extract a default folder name from a Git remote URL (https or ssh). */
+void mcode_git_repo_name_from_url(const char *url, char *out, size_t out_cap);
+
+/* Format a path with a leading `~` when inside the user's home directory. */
+void mcode_git_shorten_home_path(const char *path, char *out, size_t out_cap);
+
+typedef struct {
+    char name[MCODE_NAME_MAX];
+    char path[MCODE_PATH_MAX];
+    int64_t mtime;
+} mcode_discovered_repo;
+
+/* Discover local Git repositories (1 level deep) in common workspace folders + optional `extra_dir`. */
+int mcode_git_discover_repos(const char *extra_dir, mcode_discovered_repo *out, int max_count);
+
 /* Create an isolated worktree under ~/.mcode/worktrees/<project>-<slug> on branch mcode/<slug>.
  * Writes worktree path and branch name to outputs; on failure writes error message to err. */
 bool mcode_git_create_worktree(const char *repo_path, const char *project_name,

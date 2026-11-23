@@ -12,6 +12,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef _WIN32
+#include <sys/stat.h>
+#else
+#include <sys/stat.h>
+#endif
+
 enum {
     MCODE_TERM_TEXT_CAP = 256 * 1024,
     MCODE_TERM_LINE_CAP = 4096,
@@ -186,6 +192,305 @@ void mcode_ui_stop_terminal(mcode_app *app) {
     mcode_proc_stop(app->term_proc);
 }
 
+void mcode_ui_refresh_discovered_repos(mcode_app *app) {
+    if (!app) return;
+    app->discovered_repo_count = mcode_git_discover_repos(
+        app->store.default_project_dir, app->discovered_repos, MCODE_MAX_DISCOVERED_REPOS);
+}
+
+static void remember_parent_dir(mcode_app *app, const char *project_path) {
+    if (!app || !project_path || !project_path[0]) return;
+    size_t len = strlen(project_path);
+    while (len > 1 && (project_path[len - 1] == '/' || project_path[len - 1] == '\\')) --len;
+    const char *sep = NULL;
+    for (size_t i = len; i > 0; --i) {
+        if (project_path[i - 1] == '/' || project_path[i - 1] == '\\') {
+            sep = project_path + i - 1;
+            break;
+        }
+    }
+    if (sep && sep > project_path) {
+        size_t plen = (size_t)(sep - project_path);
+        if (plen < sizeof app->store.default_project_dir) {
+            memcpy(app->store.default_project_dir, project_path, plen);
+            app->store.default_project_dir[plen] = '\0';
+        }
+    }
+}
+
+void mcode_ui_open_project_dialog(mcode_app *app, mcode_project_dialog_mode mode) {
+    if (!app) return;
+    app->project_dialog_mode = (int)mode;
+    app->project_dialog_err[0] = '\0';
+    app->new_proj_name[0] = '\0';
+    app->new_proj_init_git = true;
+    app->clone_url[0] = '\0';
+    app->clone_folder[0] = '\0';
+    app->clone_folder_edited = false;
+    app->discovered_filter[0] = '\0';
+
+    if (app->store.default_project_dir[0]) {
+        snprintf(app->new_proj_parent, sizeof app->new_proj_parent, "%s",
+                 app->store.default_project_dir);
+    } else {
+        mcode_git_default_projects_dir(app->new_proj_parent, sizeof app->new_proj_parent);
+    }
+    if (mode == MCODE_PROJ_DIALOG_OPEN) {
+        mcode_ui_refresh_discovered_repos(app);
+    }
+    app->project_dialog_open = true;
+}
+
+mcode_project *mcode_ui_add_project_and_open(mcode_app *app, cui_ctx *ui,
+                                             const char *path, const char *name) {
+    if (!app || !path || !path[0]) return NULL;
+    bool existed = (mcode_store_find_project_by_path(&app->store, path) != NULL);
+    mcode_project *p = mcode_store_add_project(&app->store, path, name);
+    if (!p) return NULL;
+
+    p->collapsed = false;
+    snprintf(app->store.selected_project_id, sizeof app->store.selected_project_id, "%s", p->id);
+    remember_parent_dir(app, p->path);
+
+    /* Jump straight into an active thread for this project (or create one immediately) */
+    const char *existing_tid = NULL;
+    for (int i = app->store.thread_count - 1; i >= 0; --i) {
+        if (strcmp(app->store.threads[i].project_id, p->id) == 0 &&
+            app->store.threads[i].state != MCODE_THREAD_SETTLED) {
+            existing_tid = app->store.threads[i].id;
+            break;
+        }
+    }
+    if (existing_tid) {
+        mcode_ui_select_thread(app, existing_tid);
+    } else {
+        mcode_ui_quick_new_thread(app, ui, p);
+    }
+
+    mcode_ui_mark_dirty(app);
+    char msg[240];
+    snprintf(msg, sizeof msg, "%s project: %s%s",
+             existed ? "Opened" : "Added",
+             p->name,
+             p->is_git_repo ? "" : " (not a Git repo)");
+    if (ui) app_chrome_notify(app->chrome, ui, msg, CUI_TONE_SUCCESS);
+    return p;
+}
+
+void mcode_ui_remove_project(mcode_app *app, cui_ctx *ui, const char *project_id) {
+    if (!app || !project_id || !project_id[0]) return;
+    mcode_project *p = mcode_store_find_project(&app->store, project_id);
+    if (!p) return;
+
+    char name[MCODE_NAME_MAX];
+    snprintf(name, sizeof name, "%s", p->name);
+
+    /* Remove threads belonging to this project from Mcode state without touching files on disk */
+    for (int i = app->store.thread_count - 1; i >= 0; --i) {
+        mcode_thread *t = &app->store.threads[i];
+        if (strcmp(t->project_id, project_id) != 0) continue;
+        if (t->active_run) {
+            mcode_agent_destroy(t->active_run);
+            t->active_run = NULL;
+        }
+        if (t->title_run) {
+            mcode_agent_title_destroy(t->title_run);
+            t->title_run = NULL;
+        }
+        char tid[MCODE_ID_MAX];
+        snprintf(tid, sizeof tid, "%s", t->id);
+        mcode_store_remove_thread(&app->store, tid);
+    }
+
+    mcode_store_remove_project(&app->store, project_id);
+    if (strcmp(app->actions_project_id, project_id) == 0) {
+        app->actions_project_id[0] = '\0';
+        app->actions_dialog_open = false;
+    }
+    if (strcmp(app->rename_project_id, project_id) == 0) {
+        app->rename_project_id[0] = '\0';
+        app->rename_project_open = false;
+    }
+
+    mcode_thread *next = mcode_store_selected_thread(&app->store);
+    if (next) mcode_ui_refresh_thread_diff(next);
+    mcode_ui_refresh_discovered_repos(app);
+    mcode_ui_mark_dirty(app);
+
+    char msg[240];
+    snprintf(msg, sizeof msg, "Removed %s from Mcode (files on disk untouched).", name);
+    if (ui) app_chrome_notify(app->chrome, ui, msg, CUI_TONE_INFO);
+}
+
+void mcode_ui_init_project_git(mcode_app *app, cui_ctx *ui, mcode_project *proj) {
+    if (!app || !proj) return;
+    char err[256] = "";
+    if (!mcode_git_init_repo(proj->path, err, sizeof err)) {
+        if (ui) app_chrome_notify(app->chrome, ui, err[0] ? err : "git init failed.", CUI_TONE_DANGER);
+        return;
+    }
+    mcode_git_inspect_repo(proj->path, &proj->is_git_repo,
+                           proj->default_branch, sizeof proj->default_branch,
+                           proj->remote_url, sizeof proj->remote_url);
+    for (int i = 0; i < app->store.thread_count; ++i) {
+        mcode_thread *t = &app->store.threads[i];
+        if (strcmp(t->project_id, proj->id) == 0 && !t->branch[0] && proj->default_branch[0]) {
+            snprintf(t->branch, sizeof t->branch, "%s", proj->default_branch);
+        }
+    }
+    mcode_thread *sel = mcode_store_selected_thread(&app->store);
+    if (sel && strcmp(sel->project_id, proj->id) == 0) {
+        mcode_ui_refresh_thread_diff(sel);
+    }
+    mcode_ui_mark_dirty(app);
+    if (ui) app_chrome_notify(app->chrome, ui, "Initialized Git repository.", CUI_TONE_SUCCESS);
+}
+
+void mcode_ui_open_project_actions_for(mcode_app *app, cui_ctx *ui, const char *project_id) {
+    if (!app) return;
+    if (app->store.project_count == 0) {
+        if (ui) app_chrome_notify(app->chrome, ui, "Add a project first.", CUI_TONE_WARNING);
+        return;
+    }
+    if (project_id && project_id[0]) {
+        snprintf(app->actions_project_id, sizeof app->actions_project_id, "%s", project_id);
+    } else {
+        app->actions_project_id[0] = '\0';
+    }
+    app->qa_new_name[0] = '\0';
+    app->qa_new_cmd[0] = '\0';
+    app->actions_dialog_open = true;
+}
+
+void mcode_ui_open_rename_project(mcode_app *app, const mcode_project *proj) {
+    if (!app || !proj) return;
+    snprintf(app->rename_project_id, sizeof app->rename_project_id, "%s", proj->id);
+    snprintf(app->rename_project_buf, sizeof app->rename_project_buf, "%s", proj->name);
+    app->rename_project_open = true;
+}
+
+static void on_clone_bytes(const char *data, size_t len, bool is_stderr, void *user) {
+    (void)is_stderr;
+    mcode_app *app = (mcode_app *)user;
+    if (!app || !data || len == 0) return;
+
+    /* Extract the latest non-empty progress segment (git prints \r-separated progress lines). */
+    char latest[256] = "";
+    size_t seg_start = 0;
+    for (size_t i = 0; i <= len; ++i) {
+        if (i == len || data[i] == '\r' || data[i] == '\n') {
+            size_t a = seg_start;
+            size_t b = i;
+            while (a < b && isspace((unsigned char)data[a])) ++a;
+            while (b > a && isspace((unsigned char)data[b - 1])) --b;
+            if (b > a) {
+                size_t n = b - a;
+                if (n >= sizeof latest) n = sizeof latest - 1;
+                memcpy(latest, data + a, n);
+                latest[n] = '\0';
+            }
+            seg_start = i + 1;
+        }
+    }
+    if (latest[0]) {
+        pthread_mutex_lock(&app->clone_mu);
+        snprintf(app->clone_status, sizeof app->clone_status, "%s", latest);
+        snprintf(app->clone_last_error, sizeof app->clone_last_error, "%s", latest);
+        pthread_mutex_unlock(&app->clone_mu);
+    }
+}
+
+static void on_clone_exit(int exit_code, bool killed, void *user) {
+    mcode_app *app = (mcode_app *)user;
+    if (!app) return;
+    pthread_mutex_lock(&app->clone_mu);
+    app->clone_finished = true;
+    app->clone_killed = killed;
+    app->clone_exit_code = exit_code;
+    pthread_mutex_unlock(&app->clone_mu);
+}
+
+bool mcode_ui_start_clone(mcode_app *app, cui_ctx *ui, const char *url,
+                          const char *parent_dir, const char *folder_name) {
+    (void)ui;
+    if (!app || app->clone_proc) return false;
+    app->project_dialog_err[0] = '\0';
+
+    if (!url || !url[0]) {
+        snprintf(app->project_dialog_err, sizeof app->project_dialog_err, "Enter a Git repository URL.");
+        return false;
+    }
+    if (!parent_dir || !parent_dir[0]) {
+        snprintf(app->project_dialog_err, sizeof app->project_dialog_err, "Choose a destination folder.");
+        return false;
+    }
+    if (!folder_name || !folder_name[0] || strcmp(folder_name, ".") == 0 ||
+        strcmp(folder_name, "..") == 0 || strchr(folder_name, '/') || strchr(folder_name, '\\')) {
+        snprintf(app->project_dialog_err, sizeof app->project_dialog_err, "Enter a valid folder name.");
+        return false;
+    }
+
+    /* Expand leading ~/ in parent_dir */
+    char base[MCODE_PATH_MAX];
+    if (parent_dir[0] == '~' && (parent_dir[1] == '/' || parent_dir[1] == '\0')) {
+        const char *home = getenv("HOME");
+        if (!home || !home[0]) {
+            snprintf(app->project_dialog_err, sizeof app->project_dialog_err,
+                     "Could not resolve home directory.");
+            return false;
+        }
+        snprintf(base, sizeof base, "%s%s", home, parent_dir + 1);
+    } else {
+        snprintf(base, sizeof base, "%s", parent_dir);
+    }
+    size_t blen = strlen(base);
+    while (blen > 1 && (base[blen - 1] == '/' || base[blen - 1] == '\\')) base[--blen] = '\0';
+
+    char dest[MCODE_PATH_MAX];
+    int n = snprintf(dest, sizeof dest, "%s/%s", base, folder_name);
+    if (n <= 0 || (size_t)n >= sizeof dest) {
+        snprintf(app->project_dialog_err, sizeof app->project_dialog_err, "Destination path is too long.");
+        return false;
+    }
+
+    struct stat st;
+    if (stat(dest, &st) == 0) {
+        snprintf(app->project_dialog_err, sizeof app->project_dialog_err,
+                 "Folder already exists: %s (use Open Folder instead).", folder_name);
+        return false;
+    }
+
+    pthread_mutex_lock(&app->clone_mu);
+    snprintf(app->clone_dest, sizeof app->clone_dest, "%s", dest);
+    snprintf(app->clone_status, sizeof app->clone_status, "Cloning %s...", folder_name);
+    app->clone_last_error[0] = '\0';
+    app->clone_finished = false;
+    app->clone_killed = false;
+    app->clone_exit_code = 0;
+    pthread_mutex_unlock(&app->clone_mu);
+
+    const char *argv[] = { "git", "clone", "--progress", url, dest, NULL };
+    app->clone_proc = mcode_proc_spawn(&(mcode_proc_desc){
+        .argv = argv,
+        .cwd = NULL,
+        .merge_stderr = true,
+        .on_bytes = on_clone_bytes,
+        .on_exit = on_clone_exit,
+        .user = app,
+    });
+    if (!app->clone_proc) {
+        snprintf(app->project_dialog_err, sizeof app->project_dialog_err,
+                 "Could not start git clone (is git installed?).");
+        return false;
+    }
+    return true;
+}
+
+void mcode_ui_cancel_clone(mcode_app *app) {
+    if (!app || !app->clone_proc) return;
+    mcode_proc_stop(app->clone_proc);
+}
+
 mcode_thread *mcode_ui_create_thread(mcode_app *app, cui_ctx *ui, mcode_project *proj,
                                      const char *title, app_agent_kind agent,
                                      const char *model, bool use_worktree, bool auto_approve) {
@@ -198,7 +503,7 @@ mcode_thread *mcode_ui_create_thread(mcode_app *app, cui_ctx *ui, mcode_project 
     snprintf(branch, sizeof branch, "%s", proj->default_branch);
 
     bool actual_worktree = false;
-    if (use_worktree && proj->is_git_repo) {
+    if (use_worktree && proj->is_git_repo && mcode_git_has_commits(proj->path)) {
         char err[256] = "";
         if (mcode_git_create_worktree(proj->path, proj->name, final_title,
                                       workdir, sizeof workdir,
@@ -219,10 +524,91 @@ mcode_thread *mcode_ui_create_thread(mcode_app *app, cui_ctx *ui, mcode_project 
                                              agent, model, actual_worktree, auto_approve,
                                              workdir, branch);
     if (t) {
+        proj->collapsed = false;
+        snprintf(app->store.selected_project_id, sizeof app->store.selected_project_id,
+                 "%s", proj->id);
         mcode_ui_refresh_thread_diff(t);
         mcode_ui_mark_dirty(app);
     }
     return t;
+}
+
+mcode_thread *mcode_ui_quick_new_thread(mcode_app *app, cui_ctx *ui, mcode_project *proj) {
+    if (!app || !proj) return NULL;
+    const app_settings *s = app_chrome_settings(app->chrome);
+    bool use_wt = s && s->mcode.use_worktrees_by_default && proj->is_git_repo;
+    bool auto_app = s ? s->mcode.auto_approve_permissions : false;
+    app_agent_kind ag = s ? s->mcode.default_agent : APP_AGENT_CLAUDE;
+    return mcode_ui_create_thread(app, ui, proj, "", ag, "", use_wt, auto_app);
+}
+
+void mcode_ui_open_new_thread_dialog(mcode_app *app, const mcode_project *proj) {
+    if (!app || app->store.project_count == 0) return;
+    const app_settings *s = app_chrome_settings(app->chrome);
+    app->new_thread_project_idx = 0;
+    const char *want_id = proj ? proj->id : app->store.selected_project_id;
+    if (want_id && want_id[0]) {
+        for (int i = 0; i < app->store.project_count; ++i) {
+            if (strcmp(app->store.projects[i].id, want_id) == 0) {
+                app->new_thread_project_idx = i;
+                break;
+            }
+        }
+    }
+    app->new_thread_agent = (int)s->mcode.default_agent;
+    app->new_thread_title[0] = '\0';
+    app->new_thread_model[0] = '\0';
+    app->new_thread_custom_model = false;
+    app->new_thread_worktree = s->mcode.use_worktrees_by_default;
+    app->new_thread_auto_approve = s->mcode.auto_approve_permissions;
+    app->new_thread_open = true;
+}
+
+void mcode_ui_toggle_thread_worktree(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
+    if (!app || !thread || thread->turn_count > 0 || thread->active_run) return;
+    mcode_project *proj = mcode_store_find_project(&app->store, thread->project_id);
+    if (!proj || !proj->is_git_repo) return;
+
+    if (!thread->use_worktree) {
+        if (!mcode_git_has_commits(proj->path)) {
+            if (ui) {
+                app_chrome_notify(app->chrome, ui,
+                                  "Make an initial commit first to use isolated Git worktrees.",
+                                  CUI_TONE_INFO);
+            }
+            return;
+        }
+        char wt_dir[MCODE_PATH_MAX] = "";
+        char wt_branch[MCODE_BRANCH_MAX] = "";
+        char err[256] = "";
+        if (!mcode_git_create_worktree(proj->path, proj->name, thread->title,
+                                       wt_dir, sizeof wt_dir,
+                                       wt_branch, sizeof wt_branch,
+                                       err, sizeof err)) {
+            if (ui) app_chrome_notify(app->chrome, ui, err[0] ? err : "Could not create worktree.", CUI_TONE_WARNING);
+            return;
+        }
+        snprintf(thread->workdir, sizeof thread->workdir, "%s", wt_dir);
+        snprintf(thread->branch, sizeof thread->branch, "%s", wt_branch);
+        thread->use_worktree = true;
+        if (proj->setup_script[0]) {
+            mcode_ui_run_terminal_cmd(app, ui, proj->setup_script, wt_dir);
+        }
+        mcode_ui_refresh_thread_diff(thread);
+        mcode_ui_mark_dirty(app);
+    } else {
+        if (strcmp(proj->path, thread->workdir) != 0) {
+            char err[256] = "";
+            if (!mcode_git_remove_worktree(proj->path, thread->workdir, err, sizeof err)) {
+                app_log_warn("Could not remove unused worktree %s: %s", thread->workdir, err);
+            }
+        }
+        snprintf(thread->workdir, sizeof thread->workdir, "%s", proj->path);
+        snprintf(thread->branch, sizeof thread->branch, "%s", proj->default_branch);
+        thread->use_worktree = false;
+        mcode_ui_refresh_thread_diff(thread);
+        mcode_ui_mark_dirty(app);
+    }
 }
 
 void mcode_ui_send_prompt(mcode_app *app, cui_ctx *ui, mcode_thread *thread, const char *prompt) {
@@ -302,6 +688,7 @@ void mcode_app_init(mcode_app *app, app_chrome *chrome) {
     app->chrome = chrome;
     mcode_store_init(&app->store);
     pthread_mutex_init(&app->term_mu, NULL);
+    pthread_mutex_init(&app->clone_mu, NULL);
     mcode_str_init(&app->term_pending);
 
     app->term_text = calloc(1, MCODE_TERM_TEXT_CAP);
@@ -325,11 +712,18 @@ void mcode_app_init(mcode_app *app, app_chrome *chrome) {
     app->cli_checked_at = mcode_now_mono();
     mcode_model_catalog_init(&app->models);
     mcode_model_catalog_refresh(&app->models, &app->cli_status);
+    if (app->store.project_count == 0) {
+        mcode_ui_refresh_discovered_repos(app);
+    }
 }
 
 void mcode_app_shutdown(mcode_app *app) {
     if (!app) return;
     mcode_model_catalog_free(&app->models);
+    if (app->clone_proc) {
+        mcode_proc_destroy(app->clone_proc);
+        app->clone_proc = NULL;
+    }
     if (app->term_proc) {
         mcode_proc_destroy(app->term_proc);
         app->term_proc = NULL;
@@ -349,6 +743,7 @@ void mcode_app_shutdown(mcode_app *app) {
     }
     mcode_store_free(&app->store);
     mcode_str_free(&app->term_pending);
+    pthread_mutex_destroy(&app->clone_mu);
     pthread_mutex_destroy(&app->term_mu);
     free(app->term_text);
     free(app->term_lines);
@@ -423,8 +818,38 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
         if (sel) mcode_ui_refresh_thread_diff(sel);
     }
 
+    /* Poll async git clone */
+    bool clone_active = (app->clone_proc != NULL);
+    if (clone_active) {
+        pthread_mutex_lock(&app->clone_mu);
+        bool cfin = app->clone_finished;
+        bool ckilled = app->clone_killed;
+        int ccode = app->clone_exit_code;
+        char cdest[MCODE_PATH_MAX];
+        char cerr[256];
+        snprintf(cdest, sizeof cdest, "%s", app->clone_dest);
+        snprintf(cerr, sizeof cerr, "%s", app->clone_last_error);
+        app->clone_finished = false;
+        pthread_mutex_unlock(&app->clone_mu);
+
+        if (cfin) {
+            mcode_proc_destroy(app->clone_proc);
+            app->clone_proc = NULL;
+            clone_active = false;
+            any_finished = true;
+            if (!ckilled && ccode == 0) {
+                app->project_dialog_err[0] = '\0';
+                mcode_ui_add_project_and_open(app, ui, cdest, NULL);
+                app->project_dialog_open = false;
+            } else if (!ckilled) {
+                snprintf(app->project_dialog_err, sizeof app->project_dialog_err, "%s",
+                         cerr[0] ? cerr : "git clone failed.");
+            }
+        }
+    }
+
     bool catalog_updated = mcode_model_catalog_poll(&app->models);
-    if (running > 0 || term_active) {
+    if (running > 0 || term_active || clone_active) {
         cui_request_wakeup(ui, 0.05f);
     } else if (title_running > 0 || app->models.loading_agy) {
         cui_request_wakeup(ui, 0.1f);
@@ -564,49 +989,26 @@ void mcode_app_frame(mcode_app *app, cui_ctx *ui) {
 /* ---- Actions & Command Palette ---- */
 
 void mcode_app_action_add_project(cui_ctx *ui, void *user) {
+    (void)ui;
     mcode_app *app = (mcode_app *)user;
     if (!app) return;
-    char path[MCODE_PATH_MAX] = "";
-    if (cui_app_file_dialog(NULL, &(cui_file_dialog_opts){
-            .kind = CUI_FILE_FOLDER,
-            .title = "Select Project Repository Folder",
-        }, path, sizeof path)) {
-        mcode_project *p = mcode_store_add_project(&app->store, path, NULL);
-        if (p) {
-            snprintf(app->store.selected_project_id, sizeof app->store.selected_project_id, "%s", p->id);
-            mcode_ui_mark_dirty(app);
-            char msg[220];
-            snprintf(msg, sizeof msg, "Added project: %s%s", p->name,
-                     p->is_git_repo ? "" : " (not a Git repo)");
-            if (ui) app_chrome_notify(app->chrome, ui, msg, CUI_TONE_SUCCESS);
-        }
-    }
+    mcode_ui_open_project_dialog(app, MCODE_PROJ_DIALOG_OPEN);
 }
 
 void mcode_app_action_new_thread(cui_ctx *ui, void *user) {
     mcode_app *app = (mcode_app *)user;
     if (!app) return;
     if (app->store.project_count == 0) {
-        mcode_app_action_add_project(ui, app);
-        if (app->store.project_count == 0) return;
+        mcode_ui_open_project_dialog(app, MCODE_PROJ_DIALOG_OPEN);
+        return;
     }
-    const app_settings *s = app_chrome_settings(app->chrome);
-    app->new_thread_project_idx = 0;
-    if (app->store.selected_project_id[0]) {
-        for (int i = 0; i < app->store.project_count; ++i) {
-            if (strcmp(app->store.projects[i].id, app->store.selected_project_id) == 0) {
-                app->new_thread_project_idx = i;
-                break;
-            }
-        }
+    mcode_thread *sel = mcode_store_selected_thread(&app->store);
+    mcode_project *proj = sel ? mcode_store_find_project(&app->store, sel->project_id) : NULL;
+    if (!proj && app->store.selected_project_id[0]) {
+        proj = mcode_store_find_project(&app->store, app->store.selected_project_id);
     }
-    app->new_thread_agent = (int)s->mcode.default_agent;
-    app->new_thread_title[0] = '\0';
-    app->new_thread_model[0] = '\0';
-    app->new_thread_custom_model = false;
-    app->new_thread_worktree = s->mcode.use_worktrees_by_default;
-    app->new_thread_auto_approve = s->mcode.auto_approve_permissions;
-    app->new_thread_open = true;
+    if (!proj) proj = &app->store.projects[0];
+    mcode_ui_quick_new_thread(app, ui, proj);
 }
 
 void mcode_app_action_toggle_diff(cui_ctx *ui, void *user) {
@@ -674,13 +1076,7 @@ void mcode_app_action_refresh_diff(cui_ctx *ui, void *user) {
 void mcode_app_action_project_actions(cui_ctx *ui, void *user) {
     mcode_app *app = (mcode_app *)user;
     if (!app) return;
-    if (app->store.project_count == 0) {
-        if (ui) app_chrome_notify(app->chrome, ui, "Add a project first.", CUI_TONE_WARNING);
-        return;
-    }
-    app->qa_new_name[0] = '\0';
-    app->qa_new_cmd[0] = '\0';
-    app->actions_dialog_open = true;
+    mcode_ui_open_project_actions_for(app, ui, NULL);
 }
 
 void mcode_app_action_open_folder(cui_ctx *ui, void *user) {
@@ -707,8 +1103,27 @@ typedef struct {
     int index;
 } palette_target;
 
+static palette_target s_project_targets[64];
 static palette_target s_thread_targets[64];
 static palette_target s_action_targets[MCODE_MAX_QUICK_ACTIONS];
+
+static void on_palette_new_thread_in_project(cui_ctx *ui, void *user) {
+    palette_target *pt = (palette_target *)user;
+    if (!pt || !pt->app || pt->index < 0 || pt->index >= pt->app->store.project_count) return;
+    mcode_ui_quick_new_thread(pt->app, ui, &pt->app->store.projects[pt->index]);
+}
+
+static void on_palette_create_project(cui_ctx *ui, void *user) {
+    (void)ui;
+    mcode_app *app = (mcode_app *)user;
+    if (app) mcode_ui_open_project_dialog(app, MCODE_PROJ_DIALOG_CREATE);
+}
+
+static void on_palette_clone_project(cui_ctx *ui, void *user) {
+    (void)ui;
+    mcode_app *app = (mcode_app *)user;
+    if (app) mcode_ui_open_project_dialog(app, MCODE_PROJ_DIALOG_CLONE);
+}
 
 static void on_palette_select_thread(cui_ctx *ui, void *user) {
     (void)ui;
@@ -731,6 +1146,36 @@ static void on_palette_run_quick_action(cui_ctx *ui, void *user) {
 void mcode_app_palette_provider(app_palette_builder *builder, void *user) {
     mcode_app *app = (mcode_app *)user;
     if (!app) return;
+
+    app_palette_add(builder, &(app_palette_command){
+        .title = "Create New Project...",
+        .icon = CUI_ICON_PLUS,
+        .group = "Projects",
+        .on_trigger = on_palette_create_project,
+        .user = app,
+    });
+    app_palette_add(builder, &(app_palette_command){
+        .title = "Clone Git Repository...",
+        .icon = CUI_ICON_DOWNLOAD,
+        .group = "Projects",
+        .on_trigger = on_palette_clone_project,
+        .user = app,
+    });
+
+    int max_projects = app->store.project_count < 64 ? app->store.project_count : 64;
+    for (int i = 0; i < max_projects; ++i) {
+        const mcode_project *p = &app->store.projects[i];
+        s_project_targets[i] = (palette_target){ app, i };
+        char title[224];
+        snprintf(title, sizeof title, "New Thread in %s", p->name);
+        app_palette_add(builder, &(app_palette_command){
+            .title = title,
+            .icon = CUI_ICON_FOLDER_OPEN,
+            .group = "Projects",
+            .on_trigger = on_palette_new_thread_in_project,
+            .user = &s_project_targets[i],
+        });
+    }
 
     int max_threads = app->store.thread_count < 64 ? app->store.thread_count : 64;
     for (int i = 0; i < max_threads; ++i) {

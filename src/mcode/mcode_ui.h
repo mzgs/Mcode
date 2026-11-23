@@ -3,10 +3,21 @@
 
 #include "app_chrome.h"
 #include "mcode_agent.h"
+#include "mcode_git.h"
 #include "mcode_proc.h"
 #include "mcode_store.h"
 #include <pthread.h>
 #include <stdbool.h>
+
+enum {
+    MCODE_MAX_DISCOVERED_REPOS = 32,
+};
+
+typedef enum {
+    MCODE_PROJ_DIALOG_OPEN = 0,
+    MCODE_PROJ_DIALOG_CREATE,
+    MCODE_PROJ_DIALOG_CLONE,
+} mcode_project_dialog_mode;
 
 typedef struct {
     app_chrome *chrome;
@@ -29,7 +40,38 @@ typedef struct {
     /* Sidebar search & filter */
     char thread_search[128];
 
-    /* New Thread dialog state */
+    /* Add / Create / Clone Project dialog state */
+    bool project_dialog_open;
+    int project_dialog_mode;
+    char new_proj_name[MCODE_NAME_MAX];
+    char new_proj_parent[MCODE_PATH_MAX];
+    bool new_proj_init_git;
+    char clone_url[512];
+    char clone_folder[MCODE_NAME_MAX];
+    bool clone_folder_edited;
+    char project_dialog_err[256];
+
+    /* Async git clone state */
+    mcode_proc *clone_proc;
+    pthread_mutex_t clone_mu;
+    char clone_dest[MCODE_PATH_MAX];
+    char clone_status[256];
+    char clone_last_error[256];
+    bool clone_finished;
+    bool clone_killed;
+    int clone_exit_code;
+
+    /* Discovered local Git repositories */
+    mcode_discovered_repo discovered_repos[MCODE_MAX_DISCOVERED_REPOS];
+    int discovered_repo_count;
+    char discovered_filter[96];
+
+    /* Rename Project dialog state */
+    bool rename_project_open;
+    char rename_project_id[MCODE_ID_MAX];
+    char rename_project_buf[MCODE_NAME_MAX];
+
+    /* New Thread (Custom Options) dialog state */
     bool new_thread_open;
     int new_thread_project_idx;
     int new_thread_agent;
@@ -48,6 +90,7 @@ typedef struct {
 
     /* Project Quick Actions & Worktree Setup dialog */
     bool actions_dialog_open;
+    char actions_project_id[MCODE_ID_MAX];
     char qa_new_name[64];
     char qa_new_cmd[MCODE_CMD_MAX];
 

@@ -8,9 +8,26 @@ void mcode_ui_select_thread(mcode_app *app, const char *thread_id);
 void mcode_ui_refresh_thread_diff(mcode_thread *thread);
 void mcode_ui_load_selected_diff(mcode_thread *thread);
 
+/* Project lifecycle & dialogs */
+void mcode_ui_open_project_dialog(mcode_app *app, mcode_project_dialog_mode mode);
+void mcode_ui_refresh_discovered_repos(mcode_app *app);
+mcode_project *mcode_ui_add_project_and_open(mcode_app *app, cui_ctx *ui,
+                                             const char *path, const char *name);
+void mcode_ui_remove_project(mcode_app *app, cui_ctx *ui, const char *project_id);
+void mcode_ui_init_project_git(mcode_app *app, cui_ctx *ui, mcode_project *proj);
+void mcode_ui_open_project_actions_for(mcode_app *app, cui_ctx *ui, const char *project_id);
+void mcode_ui_open_rename_project(mcode_app *app, const mcode_project *proj);
+bool mcode_ui_start_clone(mcode_app *app, cui_ctx *ui, const char *url,
+                          const char *parent_dir, const char *folder_name);
+void mcode_ui_cancel_clone(mcode_app *app);
+
+/* Thread lifecycle */
 mcode_thread *mcode_ui_create_thread(mcode_app *app, cui_ctx *ui, mcode_project *proj,
                                      const char *title, app_agent_kind agent,
                                      const char *model, bool use_worktree, bool auto_approve);
+mcode_thread *mcode_ui_quick_new_thread(mcode_app *app, cui_ctx *ui, mcode_project *proj);
+void mcode_ui_open_new_thread_dialog(mcode_app *app, const mcode_project *proj);
+void mcode_ui_toggle_thread_worktree(mcode_app *app, cui_ctx *ui, mcode_thread *thread);
 
 void mcode_ui_send_prompt(mcode_app *app, cui_ctx *ui, mcode_thread *thread, const char *prompt);
 void mcode_ui_stop_thread(mcode_app *app, cui_ctx *ui, mcode_thread *thread);

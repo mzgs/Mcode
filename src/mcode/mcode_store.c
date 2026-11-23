@@ -282,6 +282,8 @@ bool mcode_store_load(mcode_store *store, const char *path) {
              jstr_or(root, "selected_project_id", ""));
     snprintf(store->selected_thread_id, sizeof store->selected_thread_id, "%s",
              jstr_or(root, "selected_thread_id", ""));
+    snprintf(store->default_project_dir, sizeof store->default_project_dir, "%s",
+             jstr_or(root, "default_project_dir", ""));
 
     yyjson_val *layout = yyjson_obj_get(root, "layout");
     if (yyjson_is_obj(layout)) {
@@ -322,6 +324,7 @@ bool mcode_store_load(mcode_store *store, const char *path) {
             snprintf(p->default_branch, sizeof p->default_branch, "%s", jstr_or(pv, "default_branch", ""));
             snprintf(p->remote_url, sizeof p->remote_url, "%s", jstr_or(pv, "remote_url", ""));
             p->is_git_repo = jbool_or(pv, "is_git_repo", false);
+            p->collapsed = jbool_or(pv, "collapsed", false);
 
             yyjson_val *acts = yyjson_obj_get(pv, "actions");
             if (yyjson_is_arr(acts)) {
@@ -441,6 +444,9 @@ bool mcode_store_save(const mcode_store *store, const char *path) {
     yyjson_mut_obj_add_int(doc, root, "version", 1);
     yyjson_mut_obj_add_str(doc, root, "selected_project_id", store->selected_project_id);
     yyjson_mut_obj_add_str(doc, root, "selected_thread_id", store->selected_thread_id);
+    if (store->default_project_dir[0]) {
+        yyjson_mut_obj_add_str(doc, root, "default_project_dir", store->default_project_dir);
+    }
 
     yyjson_mut_val *layout = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_real(doc, layout, "sidebar_ratio", store->sidebar_ratio);
@@ -463,6 +469,7 @@ bool mcode_store_save(const mcode_store *store, const char *path) {
         yyjson_mut_obj_add_str(doc, po, "default_branch", p->default_branch);
         yyjson_mut_obj_add_str(doc, po, "remote_url", p->remote_url);
         yyjson_mut_obj_add_bool(doc, po, "is_git_repo", p->is_git_repo);
+        yyjson_mut_obj_add_bool(doc, po, "collapsed", p->collapsed);
 
         yyjson_mut_val *acts = yyjson_mut_arr(doc);
         for (int j = 0; j < p->action_count; ++j) {

@@ -13,8 +13,12 @@
 #include <string.h>
 
 #ifndef _WIN32
+#include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#else
+#include <direct.h>
+#include <sys/stat.h>
 #endif
 
 static void trim_trailing(char *s) {
@@ -105,6 +109,299 @@ bool mcode_git_init_repo(const char *dir, char *err, size_t err_cap) {
     }
     free(out);
     return true;
+}
+
+bool mcode_git_has_commits(const char *dir) {
+    if (!dir || !dir[0]) return false;
+    const char *argv[] = { "git", "rev-parse", "--verify", "HEAD", NULL };
+    int rc = -1;
+    char *out = NULL;
+    bool ran = mcode_proc_run_capture(argv, dir, true, &rc, &out, NULL);
+    free(out);
+    return ran && rc == 0;
+}
+
+static bool path_is_dir(const char *path) {
+    if (!path || !path[0]) return false;
+    struct stat st;
+    if (stat(path, &st) != 0) return false;
+    return (st.st_mode & S_IFMT) == S_IFDIR;
+}
+
+static bool path_exists(const char *path) {
+    if (!path || !path[0]) return false;
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+void mcode_git_default_projects_dir(char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    const char *home = getenv("HOME");
+#ifdef _WIN32
+    if (!home || !home[0]) home = getenv("USERPROFILE");
+#endif
+    if (!home || !home[0]) return;
+
+    static const char *const k_candidates[] = {
+        "Developer", "Projects", "projects", "Code", "code", "src", "workspace", "repos"
+    };
+    char probe[MCODE_PATH_MAX];
+    for (size_t i = 0; i < sizeof k_candidates / sizeof k_candidates[0]; ++i) {
+        snprintf(probe, sizeof probe, "%s/%s", home, k_candidates[i]);
+        if (path_is_dir(probe)) {
+            snprintf(out, cap, "%s", probe);
+            return;
+        }
+    }
+    snprintf(out, cap, "%s", home);
+}
+
+void mcode_git_shorten_home_path(const char *path, char *out, size_t out_cap) {
+    if (!out || out_cap == 0) return;
+    out[0] = '\0';
+    if (!path || !path[0]) return;
+    const char *home = getenv("HOME");
+    if (home && home[0]) {
+        size_t hlen = strlen(home);
+        while (hlen > 1 && home[hlen - 1] == '/') --hlen;
+        if (strncmp(path, home, hlen) == 0 && (path[hlen] == '/' || path[hlen] == '\0')) {
+            snprintf(out, out_cap, "~%s", path + hlen);
+            return;
+        }
+    }
+    snprintf(out, out_cap, "%s", path);
+}
+
+void mcode_git_repo_name_from_url(const char *url, char *out, size_t out_cap) {
+    if (!out || out_cap == 0) return;
+    out[0] = '\0';
+    if (!url || !url[0]) return;
+
+    const char *start = url;
+    while (*start && isspace((unsigned char)*start)) ++start;
+    size_t len = strlen(start);
+    while (len > 0 && (isspace((unsigned char)start[len - 1]) || start[len - 1] == '/')) --len;
+    if (len == 0) return;
+
+    const char *last_sep = NULL;
+    for (size_t i = 0; i < len; ++i) {
+        if (start[i] == '/' || start[i] == ':') last_sep = start + i + 1;
+    }
+    const char *name = last_sep ? last_sep : start;
+    size_t nlen = (size_t)((start + len) - name);
+    if (nlen >= 4 && memcmp(name + nlen - 4, ".git", 4) == 0) {
+        nlen -= 4;
+    }
+    if (nlen == 0) return;
+    if (nlen >= out_cap) nlen = out_cap - 1;
+    memcpy(out, name, nlen);
+    out[nlen] = '\0';
+}
+
+bool mcode_git_create_project_dir(const char *parent_dir, const char *folder_name,
+                                  bool init_git, char *out_path, size_t out_cap,
+                                  char *err, size_t err_cap) {
+    if (out_path && out_cap) out_path[0] = '\0';
+    if (err && err_cap) err[0] = '\0';
+
+    if (!parent_dir || !parent_dir[0]) {
+        if (err && err_cap) snprintf(err, err_cap, "Choose a location folder.");
+        return false;
+    }
+    if (!folder_name || !folder_name[0]) {
+        if (err && err_cap) snprintf(err, err_cap, "Enter a project name.");
+        return false;
+    }
+
+    while (*folder_name && isspace((unsigned char)*folder_name)) ++folder_name;
+    size_t flen = strlen(folder_name);
+    while (flen > 0 && isspace((unsigned char)folder_name[flen - 1])) --flen;
+    if (flen == 0 || flen >= MCODE_NAME_MAX) {
+        if (err && err_cap) snprintf(err, err_cap, "Enter a valid project name.");
+        return false;
+    }
+
+    char clean_name[MCODE_NAME_MAX];
+    memcpy(clean_name, folder_name, flen);
+    clean_name[flen] = '\0';
+
+    if (strcmp(clean_name, ".") == 0 || strcmp(clean_name, "..") == 0 ||
+        strchr(clean_name, '/') != NULL || strchr(clean_name, '\\') != NULL) {
+        if (err && err_cap) snprintf(err, err_cap, "Project name cannot contain path separators.");
+        return false;
+    }
+
+    /* Expand leading ~/ in parent_dir */
+    char base[MCODE_PATH_MAX];
+    if (parent_dir[0] == '~' && (parent_dir[1] == '/' || parent_dir[1] == '\0')) {
+        const char *home = getenv("HOME");
+        if (!home || !home[0]) {
+            if (err && err_cap) snprintf(err, err_cap, "Could not resolve home directory.");
+            return false;
+        }
+        snprintf(base, sizeof base, "%s%s", home, parent_dir + 1);
+    } else {
+        snprintf(base, sizeof base, "%s", parent_dir);
+    }
+    size_t blen = strlen(base);
+    while (blen > 1 && (base[blen - 1] == '/' || base[blen - 1] == '\\')) {
+        base[--blen] = '\0';
+    }
+
+    char full[MCODE_PATH_MAX];
+    int n = snprintf(full, sizeof full, "%s/%s", base, clean_name);
+    if (n <= 0 || (size_t)n >= sizeof full) {
+        if (err && err_cap) snprintf(err, err_cap, "Project path is too long.");
+        return false;
+    }
+
+    if (path_exists(full)) {
+        if (err && err_cap) {
+            snprintf(err, err_cap, "Folder already exists: %s (use Open Folder instead).", clean_name);
+        }
+        return false;
+    }
+
+    if (!path_is_dir(base)) {
+        if (!mkdir_p(base)) {
+            if (err && err_cap) snprintf(err, err_cap, "Could not create parent folder.");
+            return false;
+        }
+    }
+
+#ifdef _WIN32
+    if (_mkdir(full) != 0) {
+        if (err && err_cap) snprintf(err, err_cap, "Could not create folder: %s", strerror(errno));
+        return false;
+    }
+#else
+    if (mkdir(full, 0755) != 0) {
+        if (err && err_cap) snprintf(err, err_cap, "Could not create folder: %s", strerror(errno));
+        return false;
+    }
+#endif
+
+    if (init_git) {
+        char git_err[256] = "";
+        if (!mcode_git_init_repo(full, git_err, sizeof git_err)) {
+            app_log_warn("Created %s but git init failed: %s", full, git_err);
+        }
+    }
+
+    if (out_path && out_cap) snprintf(out_path, out_cap, "%s", full);
+    app_log_info("Created project folder %s (git=%s)", full, init_git ? "yes" : "no");
+    return true;
+}
+
+static int compare_discovered_repos(const void *a, const void *b) {
+    const mcode_discovered_repo *ra = (const mcode_discovered_repo *)a;
+    const mcode_discovered_repo *rb = (const mcode_discovered_repo *)b;
+    if (rb->mtime != ra->mtime) {
+        return (rb->mtime > ra->mtime) ? 1 : -1;
+    }
+    const char *sa = ra->name;
+    const char *sb = rb->name;
+    while (*sa && *sb) {
+        int ca = tolower((unsigned char)*sa);
+        int cb = tolower((unsigned char)*sb);
+        if (ca != cb) return ca - cb;
+        ++sa;
+        ++sb;
+    }
+    return tolower((unsigned char)*sa) - tolower((unsigned char)*sb);
+}
+
+int mcode_git_discover_repos(const char *extra_dir, mcode_discovered_repo *out, int max_count) {
+    if (!out || max_count <= 0) return 0;
+#ifdef _WIN32
+    (void)extra_dir;
+    return 0;
+#else
+    char roots[10][MCODE_PATH_MAX];
+    int root_count = 0;
+
+    if (extra_dir && extra_dir[0] && path_is_dir(extra_dir)) {
+        snprintf(roots[root_count++], sizeof roots[0], "%s", extra_dir);
+    }
+
+    const char *home = getenv("HOME");
+    if (home && home[0]) {
+        static const char *const k_dirs[] = {
+            "Developer", "Projects", "projects", "Code", "code", "src", "workspace", "repos"
+        };
+        for (size_t i = 0; i < sizeof k_dirs / sizeof k_dirs[0] && root_count < 10; ++i) {
+            char cand[MCODE_PATH_MAX];
+            snprintf(cand, sizeof cand, "%s/%s", home, k_dirs[i]);
+            if (!path_is_dir(cand)) continue;
+            bool dup = false;
+            for (int r = 0; r < root_count; ++r) {
+                if (strcmp(roots[r], cand) == 0) { dup = true; break; }
+            }
+            if (!dup) snprintf(roots[root_count++], sizeof roots[0], "%s", cand);
+        }
+    }
+
+    int cap = max_count * 4;
+    if (cap < 128) cap = 128;
+    mcode_discovered_repo *all = calloc((size_t)cap, sizeof *all);
+    if (!all) return 0;
+
+    int count = 0;
+    for (int r = 0; r < root_count; ++r) {
+        DIR *d = opendir(roots[r]);
+        if (!d) continue;
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            if (ent->d_name[0] == '.') continue;
+            char full[MCODE_PATH_MAX];
+            int n = snprintf(full, sizeof full, "%s/%s", roots[r], ent->d_name);
+            if (n <= 0 || (size_t)n >= sizeof full) continue;
+
+            char git_marker[MCODE_PATH_MAX + 16];
+            snprintf(git_marker, sizeof git_marker, "%s/.git", full);
+            struct stat gst;
+            if (stat(git_marker, &gst) != 0) continue;
+
+            bool dup = false;
+            for (int k = 0; k < count; ++k) {
+                if (strcmp(all[k].path, full) == 0) { dup = true; break; }
+            }
+            if (dup) continue;
+
+            if (count >= cap) {
+                if (cap >= 1024) break;
+                int ncap = cap * 2;
+                mcode_discovered_repo *grown = realloc(all, (size_t)ncap * sizeof *all);
+                if (!grown) break;
+                all = grown;
+                cap = ncap;
+            }
+
+            struct stat dst;
+            int64_t mtime = (int64_t)gst.st_mtime;
+            if (stat(full, &dst) == 0 && (int64_t)dst.st_mtime > mtime) {
+                mtime = (int64_t)dst.st_mtime;
+            }
+
+            snprintf(all[count].name, sizeof all[count].name, "%s", ent->d_name);
+            snprintf(all[count].path, sizeof all[count].path, "%s", full);
+            all[count].mtime = mtime;
+            ++count;
+        }
+        closedir(d);
+    }
+
+    if (count > 1) {
+        qsort(all, (size_t)count, sizeof all[0], compare_discovered_repos);
+    }
+    int ret = count < max_count ? count : max_count;
+    if (ret > 0) {
+        memcpy(out, all, (size_t)ret * sizeof out[0]);
+    }
+    free(all);
+    return ret;
+#endif
 }
 
 bool mcode_git_create_worktree(const char *repo_path, const char *project_name,

@@ -16,6 +16,7 @@ typedef struct {
 
     char selected_project_id[MCODE_ID_MAX]; /* "" = All Projects */
     char selected_thread_id[MCODE_ID_MAX];
+    char default_project_dir[MCODE_PATH_MAX];
 
     /* Persisted UI layout state */
     float sidebar_ratio;

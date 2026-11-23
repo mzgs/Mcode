@@ -45,6 +45,7 @@ typedef struct {
     char default_branch[MCODE_BRANCH_MAX];
     char remote_url[512];
     bool is_git_repo;
+    bool collapsed;
     mcode_quick_action actions[MCODE_MAX_QUICK_ACTIONS];
     int action_count;
 } mcode_project;

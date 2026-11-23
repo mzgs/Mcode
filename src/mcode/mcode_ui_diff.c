@@ -52,20 +52,7 @@ void mcode_ui_draw_diff(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
                     cui_muted(ui, "Initialize Git to track agent edits, inspect diffs, and use worktrees.");
                     if (cui_button(ui, "Initialize Git Repo", .variant = CUI_BUTTON_PRIMARY,
                                    .size = CUI_SIZE_SM, .icon = CUI_ICON_GIT_BRANCH)) {
-                        char err[256] = "";
-                        if (mcode_git_init_repo(proj->path, err, sizeof err)) {
-                            mcode_git_inspect_repo(proj->path, &proj->is_git_repo,
-                                                   proj->default_branch, sizeof proj->default_branch,
-                                                   proj->remote_url, sizeof proj->remote_url);
-                            if (thread->branch[0] == '\0' && proj->default_branch[0]) {
-                                snprintf(thread->branch, sizeof thread->branch, "%s", proj->default_branch);
-                            }
-                            mcode_ui_refresh_thread_diff(thread);
-                            mcode_ui_mark_dirty(app);
-                            app_chrome_notify(app->chrome, ui, "Initialized Git repository.", CUI_TONE_SUCCESS);
-                        } else {
-                            app_chrome_notify(app->chrome, ui, err[0] ? err : "git init failed.", CUI_TONE_DANGER);
-                        }
+                        mcode_ui_init_project_git(app, ui, proj);
                     }
                 } else {
                     cui_icon(ui, CUI_ICON_CHECK_CHECK, 24, CUI_COLOR_TEXT_MUTED);

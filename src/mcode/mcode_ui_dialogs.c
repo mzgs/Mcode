@@ -1,11 +1,373 @@
 #include "mcode_ui_internal.h"
 #include "mcode_git.h"
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 
+static bool dialog_contains_icase(const char *hay, const char *needle) {
+    if (!needle || !needle[0]) return true;
+    if (!hay || !hay[0]) return false;
+    for (; *hay; ++hay) {
+        const char *a = hay, *b = needle;
+        while (*a && *b && tolower((unsigned char)*a) == tolower((unsigned char)*b)) {
+            ++a;
+            ++b;
+        }
+        if (!*b) return true;
+    }
+    return false;
+}
+
+static void format_join_preview(const char *parent, const char *leaf, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    char short_parent[MCODE_PATH_MAX];
+    mcode_git_shorten_home_path(parent ? parent : "", short_parent, sizeof short_parent);
+    size_t plen = strlen(short_parent);
+    while (plen > 1 && (short_parent[plen - 1] == '/' || short_parent[plen - 1] == '\\')) {
+        short_parent[--plen] = '\0';
+    }
+    const char *name = (leaf && leaf[0]) ? leaf : "<project-name>";
+    if (short_parent[0]) {
+        snprintf(out, cap, "%s/%s", short_parent, name);
+    } else {
+        snprintf(out, cap, "%s", name);
+    }
+}
+
+static void try_create_project(mcode_app *app, cui_ctx *ui) {
+    char created_path[MCODE_PATH_MAX] = "";
+    char err[256] = "";
+    if (!mcode_git_create_project_dir(app->new_proj_parent, app->new_proj_name,
+                                      app->new_proj_init_git,
+                                      created_path, sizeof created_path,
+                                      err, sizeof err)) {
+        snprintf(app->project_dialog_err, sizeof app->project_dialog_err, "%s",
+                 err[0] ? err : "Could not create project folder.");
+        return;
+    }
+    app->project_dialog_err[0] = '\0';
+    mcode_ui_add_project_and_open(app, ui, created_path, app->new_proj_name);
+    app->project_dialog_open = false;
+}
+
+static void draw_project_dialog(mcode_app *app, cui_ctx *ui) {
+    bool was_open = app->project_dialog_open;
+    bool cloning = (app->clone_proc != NULL);
+
+    cui_dialog(ui, "Add Project", &app->project_dialog_open,
+               .description = "Open an existing folder, create a new project, or clone from Git.",
+               .width = 520) {
+        static const char *const mode_labels[3] = {
+            "Open Folder", "New Project", "Clone URL"
+        };
+        static const char *const mode_icons[3] = {
+            CUI_ICON_FOLDER_OPEN, CUI_ICON_PLUS, CUI_ICON_DOWNLOAD
+        };
+        int seg_mode = app->project_dialog_mode;
+        if (cui_segmented(ui, "proj-dialog-mode", mode_labels, 3, &seg_mode,
+                          .icons = mode_icons, .full_width = true)) {
+            if (!cloning && seg_mode != app->project_dialog_mode) {
+                app->project_dialog_mode = seg_mode;
+                app->project_dialog_err[0] = '\0';
+                if (app->project_dialog_mode == MCODE_PROJ_DIALOG_OPEN) {
+                    mcode_ui_refresh_discovered_repos(app);
+                }
+            }
+        }
+
+        if (app->project_dialog_mode == MCODE_PROJ_DIALOG_OPEN) {
+            if (cui_button(ui, "Choose Folder...", .variant = CUI_BUTTON_PRIMARY,
+                           .icon = CUI_ICON_FOLDER_OPEN, .full_width = true)) {
+                char path[MCODE_PATH_MAX] = "";
+                if (cui_app_file_dialog(NULL, &(cui_file_dialog_opts){
+                        .kind = CUI_FILE_FOLDER,
+                        .title = "Select Project Folder",
+                    }, path, sizeof path)) {
+                    mcode_ui_add_project_and_open(app, ui, path, NULL);
+                    app->project_dialog_open = false;
+                }
+            }
+
+            cui_separator(ui);
+
+            /* Quick-add list of discovered local Git repositories */
+            int avail_count = 0;
+            for (int i = 0; i < app->discovered_repo_count; ++i) {
+                if (!mcode_store_find_project_by_path(&app->store, app->discovered_repos[i].path)) {
+                    ++avail_count;
+                }
+            }
+
+            cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
+                cui_text(ui, "Detected local repositories", .font = CUI_FONT_MEDIUM, .size = 12.5f);
+                if (avail_count > 0) {
+                    char cnt[16];
+                    snprintf(cnt, sizeof cnt, "%d", avail_count);
+                    cui_badge(ui, cnt, .size = CUI_SIZE_SM);
+                }
+                cui_spacer(ui);
+                if (cui_icon_button(ui, CUI_ICON_REFRESH_CW, .size = CUI_SIZE_SM,
+                                    .variant = CUI_BUTTON_GHOST,
+                                    .tooltip = "Rescan local developer folders")) {
+                    mcode_ui_refresh_discovered_repos(app);
+                }
+            }
+
+            if (avail_count > 5) {
+                cui_search(ui, "disc-filter", app->discovered_filter, sizeof app->discovered_filter,
+                           .placeholder = "Filter detected repositories...",
+                           .size = CUI_SIZE_SM, .width = CUI_FILL);
+            }
+
+            if (avail_count == 0) {
+                cui_box(ui, .pad_y = 14, .width = CUI_FILL) {
+                    cui_muted(ui, "No additional Git repositories found in ~/Developer or ~/Projects. "
+                                  "Use Choose Folder... above to open any directory.");
+                }
+            } else {
+                float list_h = avail_count <= 4 ? (float)avail_count * 46.0f + 8.0f : 210.0f;
+                cui_scroll(ui, .id = "disc-repo-list", .width = CUI_FILL,
+                           .height = CUI_PX(list_h), .gap = 4) {
+                    int shown = 0;
+                    for (int i = 0; i < app->discovered_repo_count; ++i) {
+                        const mcode_discovered_repo *r = &app->discovered_repos[i];
+                        if (mcode_store_find_project_by_path(&app->store, r->path)) continue;
+                        if (!dialog_contains_icase(r->name, app->discovered_filter) &&
+                            !dialog_contains_icase(r->path, app->discovered_filter)) {
+                            continue;
+                        }
+                        ++shown;
+                        cui_push_id_int(ui, i);
+                        bool clicked = cui_card_begin(ui, &(cui_card_opts){
+                            .id = "drepo",
+                            .dir = CUI_ROW,
+                            .align = CUI_ALIGN_CENTER,
+                            .width = CUI_FILL,
+                            .pad_x = 10,
+                            .pad_y = 7,
+                            .gap = 8,
+                            .hoverable = true,
+                            .muted = true,
+                            .radius = 7,
+                        });
+                        cui_icon(ui, CUI_ICON_FOLDER, 15, CUI_COLOR_TEXT_SECONDARY);
+                        cui_column(ui, .width = CUI_FILL, .gap = 1) {
+                            cui_text(ui, r->name, .font = CUI_FONT_MEDIUM, .size = 13,
+                                     .nowrap = true);
+                            char short_p[MCODE_PATH_MAX];
+                            mcode_git_shorten_home_path(r->path, short_p, sizeof short_p);
+                            cui_text(ui, short_p, .font = CUI_FONT_MONO, .size = 11,
+                                     .color = CUI_COLOR_TEXT_MUTED, .nowrap = true);
+                        }
+                        cui_icon(ui, CUI_ICON_PLUS, 14, CUI_COLOR_ACCENT);
+                        cui_card_end(ui);
+                        cui_pop_id(ui);
+
+                        if (clicked) {
+                            mcode_ui_add_project_and_open(app, ui, r->path, r->name);
+                            app->project_dialog_open = false;
+                            break;
+                        }
+                    }
+                    if (shown == 0) {
+                        cui_box(ui, .pad = 8) {
+                            cui_muted(ui, "No repositories match your filter.");
+                        }
+                    }
+                }
+            }
+        } else if (app->project_dialog_mode == MCODE_PROJ_DIALOG_CREATE) {
+            int nf = cui_input(ui, "new-proj-name", app->new_proj_name, sizeof app->new_proj_name,
+                               .label = "Project name",
+                               .placeholder = "e.g. my-app",
+                               .width = CUI_FILL);
+            if (nf & CUI_CHANGED) app->project_dialog_err[0] = '\0';
+
+            cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_END) {
+                int lf = cui_input(ui, "new-proj-parent", app->new_proj_parent,
+                                   sizeof app->new_proj_parent,
+                                   .label = "Location",
+                                   .placeholder = "~/Developer",
+                                   .width = CUI_FILL);
+                if (lf & CUI_CHANGED) app->project_dialog_err[0] = '\0';
+                if (cui_button(ui, "Browse...", .variant = CUI_BUTTON_OUTLINE,
+                               .icon = CUI_ICON_FOLDER_OPEN)) {
+                    char dir[MCODE_PATH_MAX] = "";
+                    if (cui_app_file_dialog(NULL, &(cui_file_dialog_opts){
+                            .kind = CUI_FILE_FOLDER,
+                            .title = "Choose Parent Folder",
+                        }, dir, sizeof dir)) {
+                        snprintf(app->new_proj_parent, sizeof app->new_proj_parent, "%s", dir);
+                        app->project_dialog_err[0] = '\0';
+                    }
+                }
+            }
+
+            char preview[MCODE_PATH_MAX + MCODE_NAME_MAX + 32];
+            format_join_preview(app->new_proj_parent, app->new_proj_name, preview, sizeof preview);
+            cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
+                cui_icon(ui, CUI_ICON_FOLDER, 13, CUI_COLOR_TEXT_MUTED);
+                cui_text(ui, preview, .font = CUI_FONT_MONO, .size = 11.5f,
+                         .color = CUI_COLOR_TEXT_MUTED, .width = CUI_FILL, .nowrap = true);
+            }
+
+            cui_switch(ui, "Initialize Git repository", &app->new_proj_init_git,
+                       .description = "Runs git init so diffs, commits, and worktrees work immediately");
+
+            if ((nf & CUI_SUBMITTED) && app->new_proj_name[0] && app->new_proj_parent[0]) {
+                try_create_project(app, ui);
+            }
+        } else {
+            int uf = cui_input(ui, "clone-url", app->clone_url, sizeof app->clone_url,
+                               .label = "Git repository URL",
+                               .placeholder = "https://github.com/owner/repo.git",
+                               .disabled = cloning,
+                               .width = CUI_FILL);
+            if (uf & CUI_CHANGED) {
+                app->project_dialog_err[0] = '\0';
+                if (!app->clone_folder_edited) {
+                    mcode_git_repo_name_from_url(app->clone_url, app->clone_folder,
+                                                 sizeof app->clone_folder);
+                }
+            }
+
+            int ff = cui_input(ui, "clone-folder", app->clone_folder, sizeof app->clone_folder,
+                               .label = "Folder name",
+                               .placeholder = "Derived automatically from URL",
+                               .disabled = cloning,
+                               .width = CUI_FILL);
+            if (ff & CUI_CHANGED) {
+                app->clone_folder_edited = (app->clone_folder[0] != '\0');
+                app->project_dialog_err[0] = '\0';
+            }
+
+            cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_END) {
+                int lf = cui_input(ui, "clone-parent", app->new_proj_parent,
+                                   sizeof app->new_proj_parent,
+                                   .label = "Location",
+                                   .placeholder = "~/Developer",
+                                   .disabled = cloning,
+                                   .width = CUI_FILL);
+                if (lf & CUI_CHANGED) app->project_dialog_err[0] = '\0';
+                if (cui_button(ui, "Browse...", .variant = CUI_BUTTON_OUTLINE,
+                               .icon = CUI_ICON_FOLDER_OPEN, .disabled = cloning)) {
+                    char dir[MCODE_PATH_MAX] = "";
+                    if (cui_app_file_dialog(NULL, &(cui_file_dialog_opts){
+                            .kind = CUI_FILE_FOLDER,
+                            .title = "Choose Parent Folder",
+                        }, dir, sizeof dir)) {
+                        snprintf(app->new_proj_parent, sizeof app->new_proj_parent, "%s", dir);
+                        app->project_dialog_err[0] = '\0';
+                    }
+                }
+            }
+
+            char preview[MCODE_PATH_MAX + MCODE_NAME_MAX + 32];
+            format_join_preview(app->new_proj_parent, app->clone_folder, preview, sizeof preview);
+            cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
+                cui_icon(ui, CUI_ICON_FOLDER, 13, CUI_COLOR_TEXT_MUTED);
+                cui_text(ui, preview, .font = CUI_FONT_MONO, .size = 11.5f,
+                         .color = CUI_COLOR_TEXT_MUTED, .width = CUI_FILL, .nowrap = true);
+            }
+
+            if (cloning) {
+                char status[256] = "";
+                pthread_mutex_lock(&app->clone_mu);
+                snprintf(status, sizeof status, "%s",
+                         app->clone_status[0] ? app->clone_status : "Cloning repository...");
+                pthread_mutex_unlock(&app->clone_mu);
+                cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
+                    cui_spinner(ui, 14);
+                    cui_text(ui, status, .font = CUI_FONT_MONO, .size = 12,
+                             .color = CUI_COLOR_TEXT_SECONDARY, .width = CUI_FILL, .nowrap = true);
+                }
+            }
+
+            if (!cloning && ((uf & CUI_SUBMITTED) || (ff & CUI_SUBMITTED)) &&
+                app->clone_url[0] && app->new_proj_parent[0] && app->clone_folder[0]) {
+                mcode_ui_start_clone(app, ui, app->clone_url, app->new_proj_parent,
+                                     app->clone_folder);
+            }
+        }
+
+        if (app->project_dialog_err[0]) {
+            cui_alert(ui, app->project_dialog_err, .tone = CUI_TONE_DANGER);
+        }
+
+        cui_dialog_footer(ui) {
+            if (cloning) {
+                if (cui_button(ui, "Stop Clone", .variant = CUI_BUTTON_DANGER,
+                               .icon = CUI_ICON_SQUARE)) {
+                    mcode_ui_cancel_clone(app);
+                }
+            } else {
+                if (cui_button(ui, app->project_dialog_mode == MCODE_PROJ_DIALOG_OPEN ? "Close" : "Cancel")) {
+                    app->project_dialog_open = false;
+                }
+            }
+
+            if (app->project_dialog_mode == MCODE_PROJ_DIALOG_CREATE) {
+                if (cui_button(ui, "Create Project", .variant = CUI_BUTTON_PRIMARY,
+                               .icon = CUI_ICON_PLUS,
+                               .disabled = !app->new_proj_name[0] || !app->new_proj_parent[0])) {
+                    try_create_project(app, ui);
+                }
+            } else if (app->project_dialog_mode == MCODE_PROJ_DIALOG_CLONE) {
+                if (cui_button(ui, "Clone Project", .variant = CUI_BUTTON_PRIMARY,
+                               .icon = CUI_ICON_DOWNLOAD,
+                               .loading = cloning,
+                               .disabled = !app->clone_url[0] || !app->new_proj_parent[0] ||
+                                           !app->clone_folder[0])) {
+                    mcode_ui_start_clone(app, ui, app->clone_url, app->new_proj_parent,
+                                         app->clone_folder);
+                }
+            }
+        }
+    }
+
+    /* If dialog was dismissed via Esc/backdrop while cloning, stop clone cleanly */
+    if (was_open && !app->project_dialog_open && app->clone_proc) {
+        mcode_ui_cancel_clone(app);
+    }
+}
+
+static void draw_rename_project_dialog(mcode_app *app, cui_ctx *ui) {
+    mcode_project *proj = mcode_store_find_project(&app->store, app->rename_project_id);
+    if (!proj) {
+        app->rename_project_open = false;
+        return;
+    }
+
+    cui_dialog(ui, "Rename Project", &app->rename_project_open,
+               .description = "Updates the display name in Mcode without renaming the folder on disk.",
+               .width = 400) {
+        int f = cui_input(ui, "rename-proj-input", app->rename_project_buf,
+                          sizeof app->rename_project_buf,
+                          .label = "Display name",
+                          .width = CUI_FILL);
+        bool save = (f & CUI_SUBMITTED) && app->rename_project_buf[0];
+
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "Cancel")) {
+                app->rename_project_open = false;
+            }
+            if (cui_button(ui, "Save", .variant = CUI_BUTTON_PRIMARY,
+                           .disabled = !app->rename_project_buf[0])) {
+                save = true;
+            }
+        }
+
+        if (save) {
+            snprintf(proj->name, sizeof proj->name, "%s", app->rename_project_buf);
+            mcode_ui_mark_dirty(app);
+            app->rename_project_open = false;
+        }
+    }
+}
+
 static void draw_new_thread_dialog(mcode_app *app, cui_ctx *ui) {
     cui_dialog(ui, "New Thread", &app->new_thread_open,
-               .description = "Launch an isolated AI coding thread for a project.",
+               .description = "Launch an AI coding thread with custom options.",
                .width = 480) {
         if (app->store.project_count > 0) {
             const char *proj_names[64];
@@ -111,6 +473,7 @@ static void draw_new_thread_dialog(mcode_app *app, cui_ctx *ui) {
             if (cui_button(ui, "Create Thread", .variant = CUI_BUTTON_PRIMARY,
                            .icon = CUI_ICON_PLUS, .disabled = app->store.project_count == 0)) {
                 mcode_project *p = &app->store.projects[app->new_thread_project_idx];
+                p->collapsed = false;
                 mcode_ui_create_thread(app, ui, p,
                                        app->new_thread_title,
                                        (app_agent_kind)app->new_thread_agent,
@@ -217,8 +580,12 @@ static void draw_git_dialog(mcode_app *app, cui_ctx *ui) {
 }
 
 static void draw_project_actions_dialog(mcode_app *app, cui_ctx *ui) {
-    mcode_thread *sel = mcode_store_selected_thread(&app->store);
-    mcode_project *proj = sel ? mcode_store_find_project(&app->store, sel->project_id) : NULL;
+    mcode_project *proj = app->actions_project_id[0]
+        ? mcode_store_find_project(&app->store, app->actions_project_id) : NULL;
+    if (!proj) {
+        mcode_thread *sel = mcode_store_selected_thread(&app->store);
+        proj = sel ? mcode_store_find_project(&app->store, sel->project_id) : NULL;
+    }
     if (!proj && app->store.selected_project_id[0]) {
         proj = mcode_store_find_project(&app->store, app->store.selected_project_id);
     }
@@ -228,6 +595,24 @@ static void draw_project_actions_dialog(mcode_app *app, cui_ctx *ui) {
                .description = proj ? proj->name : NULL,
                .width = 520) {
         if (proj) {
+            char short_p[MCODE_PATH_MAX];
+            mcode_git_shorten_home_path(proj->path, short_p, sizeof short_p);
+            cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
+                cui_icon(ui, CUI_ICON_FOLDER, 14, CUI_COLOR_TEXT_MUTED);
+                cui_text(ui, short_p, .font = CUI_FONT_MONO, .size = 12,
+                         .color = CUI_COLOR_TEXT_SECONDARY, .width = CUI_FILL, .nowrap = true);
+                if (proj->is_git_repo) {
+                    cui_badge(ui, proj->default_branch[0] ? proj->default_branch : "Git",
+                              .icon = CUI_ICON_GIT_BRANCH, .tone = CUI_TONE_SUCCESS,
+                              .size = CUI_SIZE_SM);
+                } else {
+                    if (cui_button(ui, "Init Git", .variant = CUI_BUTTON_OUTLINE,
+                                   .size = CUI_SIZE_SM, .icon = CUI_ICON_GIT_BRANCH)) {
+                        mcode_ui_init_project_git(app, ui, proj);
+                    }
+                }
+            }
+
             int f = cui_input(ui, "proj-setup-script", proj->setup_script, sizeof proj->setup_script,
                               .label = "Worktree setup script (auto-runs on new worktrees)",
                               .placeholder = "e.g. npm install  or  cmake -S . -B build",
@@ -287,6 +672,8 @@ static void draw_project_actions_dialog(mcode_app *app, cui_ctx *ui) {
 }
 
 void mcode_ui_draw_dialogs(mcode_app *app, cui_ctx *ui) {
+    draw_project_dialog(app, ui);
+    draw_rename_project_dialog(app, ui);
     draw_new_thread_dialog(app, ui);
     draw_git_dialog(app, ui);
     draw_project_actions_dialog(app, ui);

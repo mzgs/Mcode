@@ -29,7 +29,7 @@ int main(int argc, char **argv) {
         },
         {
             .id = "add_project",
-            .title = "Add Project Folder...",
+            .title = "Add or Create Project...",
             .icon = CUI_ICON_FOLDER_OPEN,
             .group = "Projects",
             .menu = APP_MENU_FILE,
