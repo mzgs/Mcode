@@ -899,10 +899,14 @@ static void load_claude_default_models(mcode_model_catalog *cat) {
         { "haiku",  "Claude Haiku",  "Fast, lightweight model for quick edits and questions" },
         { "fable",  "Claude Fable",  "Latest Claude Fable alias" },
     };
+    static const char *const k_claude_efforts[] = { "low", "medium", "high", "xhigh", "max" };
     int n = 0;
     for (size_t i = 0; i < sizeof k_claude / sizeof k_claude[0] && n < MCODE_MAX_MODELS_PER_AGENT; ++i) {
-        set_model_opt(&cat->items[APP_AGENT_CLAUDE][n++],
-                      k_claude[i].id, k_claude[i].label, k_claude[i].detail);
+        mcode_model_option *opt = &cat->items[APP_AGENT_CLAUDE][n++];
+        set_model_opt(opt, k_claude[i].id, k_claude[i].label, k_claude[i].detail);
+        for (size_t j = 0; j < sizeof k_claude_efforts / sizeof k_claude_efforts[0]; ++j) {
+            snprintf(opt->efforts[opt->effort_count++], sizeof opt->efforts[0], "%s", k_claude_efforts[j]);
+        }
     }
     cat->count[APP_AGENT_CLAUDE] = n;
 }
@@ -914,23 +918,44 @@ static void load_codex_fallback_models(mcode_model_catalog *cat) {
         { "o3",            "o3",            "Deep reasoning model" },
         { "o4-mini",       "o4-mini",       "Fast, affordable reasoning model" },
     };
+    static const char *const k_codex_efforts[] = { "low", "medium", "high", "xhigh" };
     int n = 0;
     for (size_t i = 0; i < sizeof k_codex / sizeof k_codex[0] && n < MCODE_MAX_MODELS_PER_AGENT; ++i) {
-        set_model_opt(&cat->items[APP_AGENT_CODEX][n++],
-                      k_codex[i].id, k_codex[i].label, k_codex[i].detail);
+        mcode_model_option *opt = &cat->items[APP_AGENT_CODEX][n++];
+        set_model_opt(opt, k_codex[i].id, k_codex[i].label, k_codex[i].detail);
+        snprintf(opt->default_effort, sizeof opt->default_effort, "medium");
+        for (size_t j = 0; j < sizeof k_codex_efforts / sizeof k_codex_efforts[0]; ++j) {
+            snprintf(opt->efforts[opt->effort_count++], sizeof opt->efforts[0], "%s", k_codex_efforts[j]);
+        }
     }
     cat->count[APP_AGENT_CODEX] = n;
 }
 
 static void load_agy_fallback_models(mcode_model_catalog *cat) {
     static const struct { const char *id, *label, *detail; } k_agy[] = {
-        { "gemini-4-neon-high",       "Gemini 4 Neon (High)",       "gemini-4-neon-high" },
-        { "gemini-4-neon-medium",     "Gemini 4 Neon (Medium)",     "gemini-4-neon-medium" },
-        { "gemini-4-carbon-high",     "Gemini 4 Carbon (High)",     "gemini-4-carbon-high" },
-        { "gemini-4-argon-high",      "Gemini 4 Argon (High)",      "gemini-4-argon-high" },
-        { "gemini-3.8-flash-high",    "Gemini 3.8 Flash (High)",    "gemini-3.8-flash-high" },
-        { "claude-opus-5-5-high",     "Claude Opus 5.5 (High)",     "claude-opus-5-5-high" },
-        { "claude-sonnet-5-5-high",   "Claude Sonnet 5.5 (High)",   "claude-sonnet-5-5-high" },
+        { "gemini-4-neon-low",         "Gemini 4 Neon (Low)",         "gemini-4-neon-low" },
+        { "gemini-4-neon-medium",      "Gemini 4 Neon (Medium)",      "gemini-4-neon-medium" },
+        { "gemini-4-neon-high",        "Gemini 4 Neon (High)",        "gemini-4-neon-high" },
+        { "gemini-4-neon-xhigh",       "Gemini 4 Neon (XHigh)",       "gemini-4-neon-xhigh" },
+        { "gemini-4-carbon-low",       "Gemini 4 Carbon (Low)",       "gemini-4-carbon-low" },
+        { "gemini-4-carbon-medium",    "Gemini 4 Carbon (Medium)",    "gemini-4-carbon-medium" },
+        { "gemini-4-carbon-high",      "Gemini 4 Carbon (High)",      "gemini-4-carbon-high" },
+        { "gemini-4-argon-low",        "Gemini 4 Argon (Low)",        "gemini-4-argon-low" },
+        { "gemini-4-argon-medium",     "Gemini 4 Argon (Medium)",     "gemini-4-argon-medium" },
+        { "gemini-4-argon-high",       "Gemini 4 Argon (High)",       "gemini-4-argon-high" },
+        { "gemini-4-hydrogen-low",     "Gemini 4 Hydrogen (Low)",     "gemini-4-hydrogen-low" },
+        { "gemini-4-hydrogen-medium",  "Gemini 4 Hydrogen (Medium)",  "gemini-4-hydrogen-medium" },
+        { "gemini-4-hydrogen-high",    "Gemini 4 Hydrogen (High)",    "gemini-4-hydrogen-high" },
+        { "gemini-4-hydrogen-xhigh",   "Gemini 4 Hydrogen (XHigh)",   "gemini-4-hydrogen-xhigh" },
+        { "gemini-3.8-flash-low",      "Gemini 3.8 Flash (Low)",      "gemini-3.8-flash-low" },
+        { "gemini-3.8-flash-medium",   "Gemini 3.8 Flash (Medium)",   "gemini-3.8-flash-medium" },
+        { "gemini-3.8-flash-high",     "Gemini 3.8 Flash (High)",     "gemini-3.8-flash-high" },
+        { "claude-opus-5-5-low",       "Claude Opus 5.5 (Low)",       "claude-opus-5-5-low" },
+        { "claude-opus-5-5-medium",    "Claude Opus 5.5 (Medium)",    "claude-opus-5-5-medium" },
+        { "claude-opus-5-5-high",      "Claude Opus 5.5 (High)",      "claude-opus-5-5-high" },
+        { "claude-sonnet-5-5-low",     "Claude Sonnet 5.5 (Low)",     "claude-sonnet-5-5-low" },
+        { "claude-sonnet-5-5-medium",  "Claude Sonnet 5.5 (Medium)",  "claude-sonnet-5-5-medium" },
+        { "claude-sonnet-5-5-high",    "Claude Sonnet 5.5 (High)",    "claude-sonnet-5-5-high" },
     };
     int n = 0;
     for (size_t i = 0; i < sizeof k_agy / sizeof k_agy[0] && n < MCODE_MAX_MODELS_PER_AGENT; ++i) {
@@ -960,7 +985,24 @@ int mcode_agent_parse_codex_models_json(const char *json, size_t len,
             if (vis && strcmp(vis, "hide") == 0) continue;
             const char *disp = jstr(m, "display_name");
             const char *desc = jstr(m, "description");
-            set_model_opt(&out[count++], slug, (disp && disp[0]) ? disp : slug, desc ? desc : "");
+            mcode_model_option *opt = &out[count++];
+            set_model_opt(opt, slug, (disp && disp[0]) ? disp : slug, desc ? desc : "");
+            const char *def_eff = jstr(m, "default_reasoning_level");
+            if (def_eff && def_eff[0]) {
+                snprintf(opt->default_effort, sizeof opt->default_effort, "%s", def_eff);
+            }
+            yyjson_val *levels = yyjson_obj_get(m, "supported_reasoning_levels");
+            if (yyjson_is_arr(levels)) {
+                size_t li, lmax;
+                yyjson_val *lv;
+                yyjson_arr_foreach(levels, li, lmax, lv) {
+                    if (opt->effort_count >= MCODE_MAX_EFFORTS_PER_MODEL) break;
+                    const char *eff = jstr(lv, "effort");
+                    if (eff && eff[0]) {
+                        snprintf(opt->efforts[opt->effort_count++], sizeof opt->efforts[0], "%s", eff);
+                    }
+                }
+            }
         }
     }
     yyjson_doc_free(doc);
@@ -1020,11 +1062,13 @@ int mcode_agent_parse_agy_models_text(const char *text,
             for (size_t i = 0; valid_id && i < id_len; ++i) {
                 if (!is_model_slug_char((unsigned char)s[i])) valid_id = false;
             }
-            /* Skip prose lines such as "Fetching available models..." or "Error: ..." */
-            if (valid_id && strchr(s, '-') != NULL && *sp != '\0') {
+            /* Skip prose lines such as "Fetching available models..." or "Error: ...".
+             * Piped `agy models` separates ID and label with a single '\t'; TTY uses 2+ spaces. */
+            if (valid_id && memchr(s, '-', id_len) != NULL && *sp != '\0') {
+                bool has_tab = (*sp == '\t');
                 char *lbl = sp;
                 while (*lbl && isspace((unsigned char)*lbl)) ++lbl;
-                if (*lbl && (lbl - sp) >= 2) {
+                if (*lbl && (has_tab || (lbl - sp) >= 2)) {
                     char id_buf[APP_MODEL_NAME_MAX];
                     snprintf(id_buf, sizeof id_buf, "%.*s", (int)id_len, s);
                     set_model_opt(&out[count++], id_buf, lbl, id_buf);
@@ -1037,23 +1081,138 @@ int mcode_agent_parse_agy_models_text(const char *text,
     return count;
 }
 
-static bool load_codex_models_from_cache(mcode_model_catalog *cat) {
+static void parse_toml_string_val(const char *raw, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (!raw) return;
+    while (*raw && (*raw == ' ' || *raw == '\t')) ++raw;
+    if (*raw == '"' || *raw == '\'') {
+        char q = *raw++;
+        size_t w = 0;
+        while (*raw && *raw != q && *raw != '\r' && *raw != '\n') {
+            if (q == '"' && *raw == '\\' && raw[1]) ++raw;
+            if (w + 1 < cap) out[w++] = *raw;
+            ++raw;
+        }
+        out[w] = '\0';
+    } else {
+        size_t w = 0;
+        while (*raw && *raw != '#' && *raw != '\r' && *raw != '\n') {
+            if (w + 1 < cap) out[w++] = *raw;
+            ++raw;
+        }
+        while (w > 0 && (out[w - 1] == ' ' || out[w - 1] == '\t')) --w;
+        out[w] = '\0';
+    }
+}
+
+void mcode_agent_parse_codex_config_toml(const char *toml,
+                                         char *model_out, size_t model_cap,
+                                         char *effort_out, size_t effort_cap) {
+    if (model_out && model_cap > 0) model_out[0] = '\0';
+    if (effort_out && effort_cap > 0) effort_out[0] = '\0';
+    if (!toml || !toml[0]) return;
+
+    const char *p = toml;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        while (len > 0 && (p[len - 1] == '\r' || p[len - 1] == ' ' || p[len - 1] == '\t')) --len;
+        const char *s = p;
+        while (len > 0 && (*s == ' ' || *s == '\t')) { ++s; --len; }
+
+        if (len > 0 && s[0] == '[') {
+            /* Only inspect top-level keys before the first [section]. */
+            break;
+        }
+        if (len > 0 && s[0] != '#') {
+            const char *eq = memchr(s, '=', len);
+            if (eq) {
+                size_t klen = (size_t)(eq - s);
+                while (klen > 0 && (s[klen - 1] == ' ' || s[klen - 1] == '\t')) --klen;
+                char val_line[256];
+                size_t vlen = len - (size_t)((eq + 1) - s);
+                if (vlen >= sizeof val_line) vlen = sizeof val_line - 1;
+                memcpy(val_line, eq + 1, vlen);
+                val_line[vlen] = '\0';
+
+                if (klen == 5 && memcmp(s, "model", 5) == 0 && model_out && model_cap > 0) {
+                    parse_toml_string_val(val_line, model_out, model_cap);
+                } else if (klen == 22 && memcmp(s, "model_reasoning_effort", 22) == 0 &&
+                           effort_out && effort_cap > 0) {
+                    parse_toml_string_val(val_line, effort_out, effort_cap);
+                }
+            }
+        }
+
+        if (!nl) break;
+        p = nl + 1;
+    }
+}
+
+void mcode_agent_parse_claude_settings_json(const char *json, size_t len,
+                                            char *model_out, size_t model_cap,
+                                            char *effort_out, size_t effort_cap) {
+    if (model_out && model_cap > 0) model_out[0] = '\0';
+    if (effort_out && effort_cap > 0) effort_out[0] = '\0';
+    if (!json || len == 0) return;
+    yyjson_doc *doc = yyjson_read(json, len, 0);
+    if (!doc) return;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    if (yyjson_is_obj(root)) {
+        const char *m = jstr(root, "model");
+        const char *e = jstr(root, "effortLevel");
+        if (m && m[0] && model_out && model_cap > 0) snprintf(model_out, model_cap, "%s", m);
+        if (e && e[0] && effort_out && effort_cap > 0) snprintf(effort_out, effort_cap, "%s", e);
+    }
+    yyjson_doc_free(doc);
+}
+
+static char *read_home_file(const char *rel_path, size_t *out_len) {
+    if (out_len) *out_len = 0;
     const char *home = getenv("HOME");
-    if (!home || !home[0]) return false;
+    if (!home || !home[0] || !rel_path || !rel_path[0]) return NULL;
     char path[MCODE_PATH_MAX];
-    int n = snprintf(path, sizeof path, "%s/.codex/models_cache.json", home);
-    if (n <= 0 || (size_t)n >= sizeof path) return false;
+    int n = snprintf(path, sizeof path, "%s/%s", home, rel_path);
+    if (n <= 0 || (size_t)n >= sizeof path) return NULL;
     FILE *f = fopen(path, "rb");
-    if (!f) return false;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
     long sz = ftell(f);
-    if (sz <= 0 || sz > 8 * 1024 * 1024) { fclose(f); return false; }
+    if (sz <= 0 || sz > 8 * 1024 * 1024) { fclose(f); return NULL; }
     rewind(f);
     char *buf = malloc((size_t)sz + 1);
-    if (!buf) { fclose(f); return false; }
+    if (!buf) { fclose(f); return NULL; }
     size_t got = fread(buf, 1, (size_t)sz, f);
     fclose(f);
     buf[got] = '\0';
+    if (out_len) *out_len = got;
+    return buf;
+}
+
+static void load_cli_config_defaults(mcode_model_catalog *cat) {
+    if (!cat) return;
+    size_t len = 0;
+    char *toml = read_home_file(".codex/config.toml", &len);
+    if (toml) {
+        mcode_agent_parse_codex_config_toml(toml,
+            cat->cli_default_model[APP_AGENT_CODEX], sizeof cat->cli_default_model[APP_AGENT_CODEX],
+            cat->cli_default_effort[APP_AGENT_CODEX], sizeof cat->cli_default_effort[APP_AGENT_CODEX]);
+        free(toml);
+    }
+    char *claude_json = read_home_file(".claude/settings.json", &len);
+    if (claude_json) {
+        mcode_agent_parse_claude_settings_json(claude_json, len,
+            cat->cli_default_model[APP_AGENT_CLAUDE], sizeof cat->cli_default_model[APP_AGENT_CLAUDE],
+            cat->cli_default_effort[APP_AGENT_CLAUDE], sizeof cat->cli_default_effort[APP_AGENT_CLAUDE]);
+        free(claude_json);
+    }
+}
+
+static bool load_codex_models_from_cache(mcode_model_catalog *cat) {
+    size_t got = 0;
+    char *buf = read_home_file(".codex/models_cache.json", &got);
+    if (!buf) return false;
 
     mcode_model_option parsed[MCODE_MAX_MODELS_PER_AGENT];
     int cnt = mcode_agent_parse_codex_models_json(buf, got, parsed, MCODE_MAX_MODELS_PER_AGENT);
@@ -1102,10 +1261,12 @@ void mcode_model_catalog_init(mcode_model_catalog *cat) {
         load_codex_fallback_models(cat);
     }
     load_agy_fallback_models(cat);
+    load_cli_config_defaults(cat);
 }
 
 void mcode_model_catalog_refresh(mcode_model_catalog *cat, const mcode_cli_status *clis) {
     if (!cat) return;
+    load_cli_config_defaults(cat);
     if (!load_codex_models_from_cache(cat) && cat->count[APP_AGENT_CODEX] == 0) {
         load_codex_fallback_models(cat);
     }
@@ -1184,17 +1345,114 @@ const char *mcode_agent_effective_model(const mcode_thread *thread, const app_se
     return mcode_agent_default_model(settings, thread->agent);
 }
 
+const mcode_model_option *mcode_model_find(const mcode_model_catalog *cat, app_agent_kind agent,
+                                           const char *model_id) {
+    if (!cat || !model_id || !model_id[0] || agent < 0 || agent >= APP_AGENT_COUNT) return NULL;
+    for (int i = 0; i < cat->count[agent]; ++i) {
+        if (strcmp(cat->items[agent][i].id, model_id) == 0) {
+            return &cat->items[agent][i];
+        }
+    }
+    return NULL;
+}
+
 const char *mcode_model_display_label(const mcode_model_catalog *cat, app_agent_kind agent,
                                       const char *model_id) {
     if (!model_id || !model_id[0]) return "Default";
-    if (cat && agent >= 0 && agent < APP_AGENT_COUNT) {
-        for (int i = 0; i < cat->count[agent]; ++i) {
-            if (strcmp(cat->items[agent][i].id, model_id) == 0) {
-                return cat->items[agent][i].label[0] ? cat->items[agent][i].label : model_id;
+    const mcode_model_option *opt = mcode_model_find(cat, agent, model_id);
+    if (opt && opt->label[0]) return opt->label;
+    return model_id;
+}
+
+const char *mcode_effort_display_label(const char *effort) {
+    if (!effort || !effort[0]) return "";
+    if (strcmp(effort, "minimal") == 0 || strcmp(effort, "Minimal") == 0) return "Minimal";
+    if (strcmp(effort, "low") == 0 || strcmp(effort, "Low") == 0) return "Low";
+    if (strcmp(effort, "medium") == 0 || strcmp(effort, "Medium") == 0) return "Medium";
+    if (strcmp(effort, "high") == 0 || strcmp(effort, "High") == 0) return "High";
+    if (strcmp(effort, "xhigh") == 0 || strcmp(effort, "XHigh") == 0) return "XHigh";
+    if (strcmp(effort, "max") == 0 || strcmp(effort, "Max") == 0) return "Max";
+    if (strcmp(effort, "ultra") == 0 || strcmp(effort, "Ultra") == 0) return "Ultra";
+    return effort;
+}
+
+static void prettify_model_display_name(const char *src, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (!src || !src[0]) return;
+    size_t w = 0;
+    for (size_t i = 0; src[i] && w + 1 < cap; ++i) {
+        char ch = src[i];
+        if (ch == '-' && i > 0 && isdigit((unsigned char)src[i - 1]) &&
+            isupper((unsigned char)src[i + 1])) {
+            ch = ' ';
+        }
+        out[w++] = ch;
+    }
+    out[w] = '\0';
+}
+
+void mcode_model_format_display(const mcode_model_catalog *cat, const mcode_thread *thread,
+                                const app_settings *settings,
+                                char *name_out, size_t name_cap,
+                                char *effort_out, size_t effort_cap) {
+    if (name_out && name_cap > 0) name_out[0] = '\0';
+    if (effort_out && effort_cap > 0) effort_out[0] = '\0';
+    if (!thread) return;
+
+    app_agent_kind ag = thread->agent;
+    const char *model_id = mcode_agent_effective_model(thread, settings);
+    if (!model_id[0] && cat && ag >= 0 && ag < APP_AGENT_COUNT) {
+        model_id = cat->cli_default_model[ag];
+    }
+
+    const mcode_model_option *opt = mcode_model_find(cat, ag, model_id);
+    const char *raw_label = (opt && opt->label[0]) ? opt->label : model_id;
+
+    char base_buf[128] = "";
+    char paren_tag[32] = "";
+    if (raw_label && raw_label[0]) {
+        size_t len = strlen(raw_label);
+        if (len >= 4 && raw_label[len - 1] == ')') {
+            const char *lp = strrchr(raw_label, '(');
+            if (lp && lp > raw_label && lp[-1] == ' ') {
+                size_t tag_len = (size_t)((raw_label + len - 1) - (lp + 1));
+                size_t base_len = (size_t)((lp - 1) - raw_label);
+                if (tag_len > 0 && tag_len < sizeof paren_tag && base_len > 0) {
+                    memcpy(paren_tag, lp + 1, tag_len);
+                    paren_tag[tag_len] = '\0';
+                    if (base_len >= sizeof base_buf) base_len = sizeof base_buf - 1;
+                    memcpy(base_buf, raw_label, base_len);
+                    base_buf[base_len] = '\0';
+                }
             }
         }
+        if (!base_buf[0]) {
+            snprintf(base_buf, sizeof base_buf, "%s", raw_label);
+        }
     }
-    return model_id;
+
+    if (name_out && name_cap > 0) {
+        if (base_buf[0]) {
+            prettify_model_display_name(base_buf, name_out, name_cap);
+        } else {
+            snprintf(name_out, name_cap, "Default model");
+        }
+    }
+
+    if (effort_out && effort_cap > 0) {
+        const char *eff = "";
+        if (thread->reasoning_effort[0]) {
+            eff = mcode_effort_display_label(thread->reasoning_effort);
+        } else if (paren_tag[0]) {
+            eff = mcode_effort_display_label(paren_tag);
+        } else if (cat && ag >= 0 && ag < APP_AGENT_COUNT && cat->cli_default_effort[ag][0]) {
+            eff = mcode_effort_display_label(cat->cli_default_effort[ag]);
+        } else if (opt && opt->default_effort[0]) {
+            eff = mcode_effort_display_label(opt->default_effort);
+        }
+        snprintf(effort_out, effort_cap, "%s", eff);
+    }
 }
 
 const char *mcode_agent_label(app_agent_kind kind) {
@@ -1241,6 +1499,11 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
 
     const char *bin = status.resolved_path[thread->agent];
     const char *model = mcode_agent_effective_model(thread, settings);
+    char codex_effort_cfg[64] = "";
+    if (thread->reasoning_effort[0]) {
+        snprintf(codex_effort_cfg, sizeof codex_effort_cfg,
+                 "model_reasoning_effort=\"%s\"", thread->reasoning_effort);
+    }
     const char *argv[32];
     int n = 0;
 
@@ -1260,6 +1523,10 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
             argv[n++] = "--model";
             argv[n++] = model;
         }
+        if (thread->reasoning_effort[0]) {
+            argv[n++] = "--effort";
+            argv[n++] = thread->reasoning_effort;
+        }
         if (thread->auto_approve) {
             argv[n++] = "--dangerously-skip-permissions";
         }
@@ -1273,6 +1540,10 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
             if (model[0]) {
                 argv[n++] = "-m";
                 argv[n++] = model;
+            }
+            if (codex_effort_cfg[0]) {
+                argv[n++] = "-c";
+                argv[n++] = codex_effort_cfg;
             }
             if (thread->auto_approve) {
                 argv[n++] = "--dangerously-bypass-approvals-and-sandbox";
@@ -1292,6 +1563,10 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
             if (model[0]) {
                 argv[n++] = "-m";
                 argv[n++] = model;
+            }
+            if (codex_effort_cfg[0]) {
+                argv[n++] = "-c";
+                argv[n++] = codex_effort_cfg;
             }
             if (thread->auto_approve) {
                 argv[n++] = "--dangerously-bypass-approvals-and-sandbox";

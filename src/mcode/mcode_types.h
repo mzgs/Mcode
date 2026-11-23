@@ -114,6 +114,7 @@ typedef struct {
     char title[MCODE_NAME_MAX];
     app_agent_kind agent;
     char model[APP_MODEL_NAME_MAX];
+    char reasoning_effort[32];
     bool use_worktree;
     bool auto_approve;
     char workdir[MCODE_PATH_MAX];

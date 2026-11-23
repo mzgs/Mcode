@@ -177,6 +177,7 @@ static void test_store_roundtrip(void) {
     mcode_thread *t = mcode_store_add_thread(&s, p, "Implement login", APP_AGENT_CODEX,
                                              "o3", true, false, "/tmp/wt-demo", "mcode/login");
     CHECK(t != NULL);
+    snprintf(t->reasoning_effort, sizeof t->reasoning_effort, "high");
     mcode_turn *tr = mcode_thread_add_turn(t, "Build login flow");
     mcode_block *b = mcode_turn_add_block(tr, MCODE_BLOCK_TEXT);
     mcode_str_set(&b->text, "Done implementing login.");
@@ -194,6 +195,7 @@ static void test_store_roundtrip(void) {
     CHECK(loaded.thread_count == 1);
     CHECK(strcmp(loaded.threads[0].title, "Implement login") == 0);
     CHECK(loaded.threads[0].agent == APP_AGENT_CODEX);
+    CHECK(strcmp(loaded.threads[0].reasoning_effort, "high") == 0);
     CHECK(loaded.threads[0].use_worktree);
     CHECK(loaded.threads[0].turn_count == 1);
     CHECK(strcmp(mcode_str_cstr(&loaded.threads[0].turns[0].blocks[0].text), "Done implementing login.") == 0);
@@ -276,7 +278,7 @@ static void test_git_worktree_and_diff(void) {
 static void test_model_catalog(void) {
     const char *codex_json =
         "{\"models\":["
-        "{\"slug\":\"gpt-6.2-sol\",\"display_name\":\"GPT-6.2-Sol\",\"visibility\":\"list\",\"description\":\"Fast go-to model.\"},"
+        "{\"slug\":\"gpt-6.2-sol\",\"display_name\":\"GPT-6.2-Sol\",\"visibility\":\"list\",\"description\":\"Fast go-to model.\",\"default_reasoning_level\":\"low\",\"supported_reasoning_levels\":[{\"effort\":\"low\"},{\"effort\":\"medium\"},{\"effort\":\"high\"},{\"effort\":\"xhigh\"}]},"
         "{\"slug\":\"gpt-hidden\",\"display_name\":\"Hidden\",\"visibility\":\"hide\",\"description\":\"Internal.\"},"
         "{\"slug\":\"gpt-6.2-astra\",\"display_name\":\"GPT-6.2-Astra\",\"visibility\":\"list\",\"description\":\"Complex coding.\"}"
         "]}";
@@ -286,18 +288,45 @@ static void test_model_catalog(void) {
     CHECK(strcmp(opts[0].id, "gpt-6.2-sol") == 0);
     CHECK(strcmp(opts[0].label, "GPT-6.2-Sol") == 0);
     CHECK(strcmp(opts[0].detail, "Fast go-to model.") == 0);
+    CHECK(strcmp(opts[0].default_effort, "low") == 0);
+    CHECK(opts[0].effort_count == 4);
+    CHECK(strcmp(opts[0].efforts[2], "high") == 0);
     CHECK(strcmp(opts[1].id, "gpt-6.2-astra") == 0);
+
+    char cfg_model[APP_MODEL_NAME_MAX] = "";
+    char cfg_effort[24] = "";
+    const char *codex_toml =
+        "# comment\n"
+        "model = \"gpt-6.2-sol\"\n"
+        "model_reasoning_effort = \"high\"\n"
+        "[features]\n"
+        "model = \"ignored-section-model\"\n";
+    mcode_agent_parse_codex_config_toml(codex_toml, cfg_model, sizeof cfg_model, cfg_effort, sizeof cfg_effort);
+    CHECK(strcmp(cfg_model, "gpt-6.2-sol") == 0);
+    CHECK(strcmp(cfg_effort, "high") == 0);
+
+    const char *claude_json = "{\"model\":\"opus\",\"effortLevel\":\"xhigh\"}";
+    mcode_agent_parse_claude_settings_json(claude_json, strlen(claude_json),
+                                           cfg_model, sizeof cfg_model, cfg_effort, sizeof cfg_effort);
+    CHECK(strcmp(cfg_model, "opus") == 0);
+    CHECK(strcmp(cfg_effort, "xhigh") == 0);
 
     const char *agy_text =
         "\r\xe2\xa0\x8b Fetching available models...\rgemini-4-neon-high             Gemini 4 Neon (High)\n"
+        "gemini-4-neon-xhigh\tGemini 4 Neon (XHigh)\n"
+        "gemini-4-neon-medium\tGemini 4 Neon (Medium)\n"
+        "gemini-4-neon-low\tGemini 4 Neon (Low)\n"
         "claude-opus-5-5-high           Claude Opus 5.5 (High)\n"
         "Not a model line\n";
     n = mcode_agent_parse_agy_models_text(agy_text, opts, 8);
-    CHECK(n == 2);
+    CHECK(n == 5);
     CHECK(strcmp(opts[0].id, "gemini-4-neon-high") == 0);
     CHECK(strcmp(opts[0].label, "Gemini 4 Neon (High)") == 0);
-    CHECK(strcmp(opts[1].id, "claude-opus-5-5-high") == 0);
-    CHECK(strcmp(opts[1].label, "Claude Opus 5.5 (High)") == 0);
+    CHECK(strcmp(opts[1].id, "gemini-4-neon-xhigh") == 0);
+    CHECK(strcmp(opts[1].label, "Gemini 4 Neon (XHigh)") == 0);
+    CHECK(strcmp(opts[3].id, "gemini-4-neon-low") == 0);
+    CHECK(strcmp(opts[4].id, "claude-opus-5-5-high") == 0);
+    CHECK(strcmp(opts[4].label, "Claude Opus 5.5 (High)") == 0);
 
     mcode_model_catalog cat;
     mcode_model_catalog_init(&cat);
@@ -308,12 +337,42 @@ static void test_model_catalog(void) {
     CHECK(strcmp(mcode_model_display_label(&cat, APP_AGENT_CLAUDE, "custom-id"), "custom-id") == 0);
     CHECK(strcmp(mcode_model_display_label(&cat, APP_AGENT_CLAUDE, ""), "Default") == 0);
 
+    /* Display formatting: Codex GPT-6.2-Sol + high -> "GPT-6.2 Sol" / "High" */
+    mcode_model_catalog mock;
+    memset(&mock, 0, sizeof mock);
+    mock.count[APP_AGENT_CODEX] = mcode_agent_parse_codex_models_json(
+        codex_json, strlen(codex_json), mock.items[APP_AGENT_CODEX], MCODE_MAX_MODELS_PER_AGENT);
+    mock.count[APP_AGENT_AGY] = mcode_agent_parse_agy_models_text(
+        agy_text, mock.items[APP_AGENT_AGY], MCODE_MAX_MODELS_PER_AGENT);
+    snprintf(mock.cli_default_model[APP_AGENT_CODEX], sizeof mock.cli_default_model[APP_AGENT_CODEX], "gpt-6.2-sol");
+    snprintf(mock.cli_default_effort[APP_AGENT_CODEX], sizeof mock.cli_default_effort[APP_AGENT_CODEX], "high");
+
     app_settings s;
     memset(&s, 0, sizeof s);
-    snprintf(s.mcode.default_codex_model, sizeof s.mcode.default_codex_model, "gpt-6.2-sol");
     mcode_thread t;
     memset(&t, 0, sizeof t);
     t.agent = APP_AGENT_CODEX;
+    char dname[128] = "", deff[32] = "";
+    mcode_model_format_display(&mock, &t, &s, dname, sizeof dname, deff, sizeof deff);
+    CHECK(strcmp(dname, "GPT-6.2 Sol") == 0);
+    CHECK(strcmp(deff, "High") == 0);
+
+    snprintf(t.reasoning_effort, sizeof t.reasoning_effort, "xhigh");
+    mcode_model_format_display(&mock, &t, &s, dname, sizeof dname, deff, sizeof deff);
+    CHECK(strcmp(dname, "GPT-6.2 Sol") == 0);
+    CHECK(strcmp(deff, "XHigh") == 0);
+
+    /* Display formatting: Agy "Gemini 4 Neon (High)" -> "Gemini 4 Neon" / "High" */
+    memset(&t, 0, sizeof t);
+    t.agent = APP_AGENT_AGY;
+    snprintf(t.model, sizeof t.model, "gemini-4-neon-high");
+    mcode_model_format_display(&mock, &t, &s, dname, sizeof dname, deff, sizeof deff);
+    CHECK(strcmp(dname, "Gemini 4 Neon") == 0);
+    CHECK(strcmp(deff, "High") == 0);
+
+    memset(&t, 0, sizeof t);
+    t.agent = APP_AGENT_CODEX;
+    snprintf(s.mcode.default_codex_model, sizeof s.mcode.default_codex_model, "gpt-6.2-sol");
     CHECK(strcmp(mcode_agent_effective_model(&t, &s), "gpt-6.2-sol") == 0);
     snprintf(t.model, sizeof t.model, "gpt-6.2-astra");
     CHECK(strcmp(mcode_agent_effective_model(&t, &s), "gpt-6.2-astra") == 0);

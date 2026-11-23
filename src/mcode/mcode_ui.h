@@ -21,7 +21,10 @@ typedef struct {
 
     /* Model picker popover state */
     char model_search[128];
-    char model_custom_input[APP_MODEL_NAME_MAX];
+
+    /* Cached real provider icon textures (Claude, Codex, Antigravity) */
+    cui_texture provider_icons[APP_AGENT_COUNT];
+    bool provider_icons_loaded;
 
     /* Sidebar search & filter */
     char thread_search[128];

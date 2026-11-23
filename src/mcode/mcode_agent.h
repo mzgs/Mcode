@@ -14,12 +14,16 @@ typedef struct {
 
 enum {
     MCODE_MAX_MODELS_PER_AGENT = 64,
+    MCODE_MAX_EFFORTS_PER_MODEL = 8,
 };
 
 typedef struct {
     char id[APP_MODEL_NAME_MAX];
     char label[96];
     char detail[160];
+    char default_effort[24];
+    char efforts[MCODE_MAX_EFFORTS_PER_MODEL][24];
+    int effort_count;
 } mcode_model_option;
 
 typedef struct mcode_model_fetch mcode_model_fetch;
@@ -27,6 +31,8 @@ typedef struct mcode_model_fetch mcode_model_fetch;
 typedef struct {
     mcode_model_option items[APP_AGENT_COUNT][MCODE_MAX_MODELS_PER_AGENT];
     int count[APP_AGENT_COUNT];
+    char cli_default_model[APP_AGENT_COUNT][APP_MODEL_NAME_MAX];
+    char cli_default_effort[APP_AGENT_COUNT][24];
     bool loading_agy;
     bool loaded_agy;
     mcode_model_fetch *agy_fetch;
@@ -50,12 +56,29 @@ const char *mcode_agent_effective_model(const mcode_thread *thread, const app_se
 /* Human-readable display name for `model_id` (falls back to `model_id` or "Default"). */
 const char *mcode_model_display_label(const mcode_model_catalog *cat, app_agent_kind agent,
                                       const char *model_id);
+/* Human-readable label for a reasoning effort slug (e.g. "high" -> "High", "xhigh" -> "XHigh"). */
+const char *mcode_effort_display_label(const char *effort);
+/* Find a catalog model entry by ID, or NULL if not found. */
+const mcode_model_option *mcode_model_find(const mcode_model_catalog *cat, app_agent_kind agent,
+                                           const char *model_id);
+/* Format the active model's display name and muted effort/tier tag for the chat box.
+ * Examples: ("GPT-6.2 Sol", "High"), ("Gemini 4 Neon", "High"), ("Claude Opus", "High"). */
+void mcode_model_format_display(const mcode_model_catalog *cat, const mcode_thread *thread,
+                                const app_settings *settings,
+                                char *name_out, size_t name_cap,
+                                char *effort_out, size_t effort_cap);
 
 /* Pure parsers exposed for unit tests. */
 int mcode_agent_parse_codex_models_json(const char *json, size_t len,
                                         mcode_model_option *out, int max_out);
 int mcode_agent_parse_agy_models_text(const char *text,
                                       mcode_model_option *out, int max_out);
+void mcode_agent_parse_codex_config_toml(const char *toml,
+                                         char *model_out, size_t model_cap,
+                                         char *effort_out, size_t effort_cap);
+void mcode_agent_parse_claude_settings_json(const char *json, size_t len,
+                                            char *model_out, size_t model_cap,
+                                            char *effort_out, size_t effort_cap);
 
 /* Human-readable display name & short badge for an agent kind. */
 const char *mcode_agent_label(app_agent_kind kind);

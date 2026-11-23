@@ -4,6 +4,7 @@
 
 #include "mcode_ui_internal.h"
 #include "mcode_git.h"
+#include "mcode_provider_icons.h"
 #include "app_log.h"
 
 #include <ctype.h>
@@ -33,6 +34,36 @@ void mcode_ui_mark_dirty(mcode_app *app) {
     if (!app) return;
     app->state_dirty = true;
     app->state_dirty_since = mcode_now_mono();
+}
+
+void mcode_ui_draw_provider_icon(mcode_app *app, cui_ctx *ui, app_agent_kind agent,
+                                 float size, cui_color tint) {
+    if (!ui) return;
+    if (agent < 0 || agent >= APP_AGENT_COUNT) {
+        cui_icon(ui, CUI_ICON_CPU, size, tint);
+        return;
+    }
+    if (app && !app->provider_icons_loaded) {
+        app->provider_icons_loaded = true;
+        uint8_t rgba[MCODE_PROVIDER_ICON_SIZE * MCODE_PROVIDER_ICON_SIZE * 4];
+        for (int i = 0; i < APP_AGENT_COUNT; ++i) {
+            const uint8_t *alpha = k_mcode_provider_icon_alpha[i];
+            for (int p = 0; p < MCODE_PROVIDER_ICON_SIZE * MCODE_PROVIDER_ICON_SIZE; ++p) {
+                rgba[p * 4 + 0] = 255;
+                rgba[p * 4 + 1] = 255;
+                rgba[p * 4 + 2] = 255;
+                rgba[p * 4 + 3] = alpha[p];
+            }
+            app->provider_icons[i] = cui_image_create(
+                ui, MCODE_PROVIDER_ICON_SIZE, MCODE_PROVIDER_ICON_SIZE, rgba);
+        }
+    }
+    if (app && app->provider_icons[agent]) {
+        cui_image(ui, app->provider_icons[agent],
+                  .width = CUI_PX(size), .height = CUI_PX(size), .tint = tint);
+    } else {
+        cui_icon(ui, mcode_agent_icon(agent), size, tint);
+    }
 }
 
 void mcode_ui_load_selected_diff(mcode_thread *thread) {

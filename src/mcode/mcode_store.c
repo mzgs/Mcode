@@ -359,6 +359,8 @@ bool mcode_store_load(mcode_store *store, const char *path) {
             if (ag < 0 || ag >= APP_AGENT_COUNT) ag = APP_AGENT_CLAUDE;
             t->agent = (app_agent_kind)ag;
             snprintf(t->model, sizeof t->model, "%s", jstr_or(tv, "model", ""));
+            snprintf(t->reasoning_effort, sizeof t->reasoning_effort, "%s",
+                     jstr_or(tv, "reasoning_effort", ""));
             t->use_worktree = jbool_or(tv, "use_worktree", false);
             t->auto_approve = jbool_or(tv, "auto_approve", false);
             snprintf(t->workdir, sizeof t->workdir, "%s", jstr_or(tv, "workdir", ""));
@@ -471,6 +473,9 @@ bool mcode_store_save(const mcode_store *store, const char *path) {
         yyjson_mut_obj_add_str(doc, to, "title", t->title);
         yyjson_mut_obj_add_int(doc, to, "agent", (int)t->agent);
         yyjson_mut_obj_add_str(doc, to, "model", t->model);
+        if (t->reasoning_effort[0]) {
+            yyjson_mut_obj_add_str(doc, to, "reasoning_effort", t->reasoning_effort);
+        }
         yyjson_mut_obj_add_bool(doc, to, "use_worktree", t->use_worktree);
         yyjson_mut_obj_add_bool(doc, to, "auto_approve", t->auto_approve);
         yyjson_mut_obj_add_str(doc, to, "workdir", t->workdir);
