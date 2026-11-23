@@ -113,6 +113,23 @@ typedef enum {
     MCODE_SPEED_FAST,
 } mcode_speed_mode;
 
+typedef enum {
+    MCODE_APPROVAL_NONE = 0,
+    MCODE_APPROVAL_ALLOW_ONCE,
+    MCODE_APPROVAL_ALLOW_SESSION,
+    MCODE_APPROVAL_DENY,
+} mcode_approval_decision;
+
+typedef struct {
+    bool active;
+    char title[160];
+    char tool_name[96];
+    char command[512];
+    char reason[512];
+    char details[2048];
+    bool can_allow_session;
+} mcode_pending_approval;
+
 struct mcode_agent_run;
 struct mcode_title_run;
 
@@ -144,6 +161,7 @@ typedef struct {
     char title_auto_fallback[MCODE_NAME_MAX];
     char status_text[160];
     double run_started_mono;
+    mcode_pending_approval pending_approval;
 
     mcode_diff_file *diff_files;
     int diff_file_count;

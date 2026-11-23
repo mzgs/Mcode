@@ -13,6 +13,7 @@ typedef struct {
     const char *const *argv;   /* NULL-terminated argument vector */
     const char *cwd;           /* Optional working directory */
     bool merge_stderr;         /* Redirect stderr to stdout pipe */
+    bool open_stdin;           /* Keep a writable stdin pipe open instead of /dev/null */
     mcode_proc_bytes_fn on_bytes;
     mcode_proc_exit_fn on_exit;
     void *user;
@@ -20,6 +21,12 @@ typedef struct {
 
 /* Spawn an asynchronous subprocess. Callbacks fire on a reader thread. */
 mcode_proc *mcode_proc_spawn(const mcode_proc_desc *desc);
+
+/* Write bytes to the subprocess's stdin (requires open_stdin=true). Thread-safe. */
+bool mcode_proc_write(mcode_proc *proc, const char *data, size_t len);
+
+/* Close the subprocess's stdin pipe (signals EOF). Thread-safe. */
+void mcode_proc_close_stdin(mcode_proc *proc);
 
 /* Spawn an interactive shell command (`sh -c <cmd>`) with merged output. */
 mcode_proc *mcode_proc_spawn_shell(const char *command, const char *cwd,

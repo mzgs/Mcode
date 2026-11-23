@@ -22,11 +22,29 @@ typedef enum {
     EV_TOOL_START,
     EV_TOOL_INPUT_DELTA,
     EV_TOOL_RESULT,
+    EV_APPROVAL_REQUEST,
+    EV_APPROVAL_CLEAR,
     EV_STATUS,
     EV_USAGE,
     EV_ERROR,
     EV_DONE,
 } agent_ev_kind;
+
+typedef enum {
+    AGENT_PROTO_STREAM = 0,
+    AGENT_PROTO_CLAUDE_CTL,
+    AGENT_PROTO_CODEX_RPC,
+    AGENT_PROTO_AGY_ACP,
+} agent_proto_kind;
+
+typedef enum {
+    APPROVAL_KIND_NONE = 0,
+    APPROVAL_KIND_AGY_ACP,
+    APPROVAL_KIND_CLAUDE_TOOL,
+    APPROVAL_KIND_CODEX_CMD,
+    APPROVAL_KIND_CODEX_FILE,
+    APPROVAL_KIND_CODEX_PERMS,
+} approval_rpc_kind;
 
 typedef struct agent_ev {
     agent_ev_kind kind;
@@ -34,7 +52,9 @@ typedef struct agent_ev {
     char *tool_id;
     char *tool_name;
     char *tool_detail;
-    bool flag; /* failed / killed */
+    char *extra_a; /* approval reason */
+    char *extra_b; /* approval raw details */
+    bool flag; /* failed / killed / can_allow_session */
     int int_a; /* exit_code or input_tokens */
     int int_b; /* output_tokens */
     double dbl_a; /* cost_usd */
@@ -43,7 +63,35 @@ typedef struct agent_ev {
 
 struct mcode_agent_run {
     app_agent_kind agent;
+    agent_proto_kind proto;
     mcode_proc *proc;
+
+    /* Bidirectional RPC handshake / turn state */
+    char *init_prompt;
+    char init_cwd[MCODE_PATH_MAX];
+    char init_model[APP_MODEL_NAME_MAX];
+    char init_effort[32];
+    mcode_speed_mode init_speed;
+    char init_session_id[MCODE_SESSION_MAX];
+    char active_session_id[MCODE_SESSION_MAX];
+    bool rpc_prompt_sent;
+    bool rpc_turn_done;
+    bool has_emitted_text;
+    bool need_text_sep;
+    int codex_turn_in_tokens;
+    int codex_turn_out_tokens;
+
+    /* Pending approval RPC metadata (protected by mu) */
+    bool approval_pending;
+    approval_rpc_kind approval_kind;
+    bool approval_rpc_id_is_str;
+    char approval_rpc_id_str[128];
+    int64_t approval_rpc_id_num;
+    char approval_allow_opt[64];
+    char approval_allow_always_opt[64];
+    char approval_deny_opt[64];
+    bool approval_codex_use_amendment;
+    char *approval_payload_json;
 
     /* Background line assembly */
     mcode_str out_line;
@@ -66,6 +114,8 @@ static void ev_free(agent_ev *ev) {
     free(ev->tool_id);
     free(ev->tool_name);
     free(ev->tool_detail);
+    free(ev->extra_a);
+    free(ev->extra_b);
     free(ev);
 }
 
@@ -117,6 +167,65 @@ static void emit_tool_result_code(mcode_agent_run *run, const char *id, const ch
 
 static void emit_tool_result(mcode_agent_run *run, const char *id, const char *output, bool failed) {
     emit_tool_result_code(run, id, output, failed, -1);
+}
+
+static void emit_approval_request(mcode_agent_run *run, const char *title, const char *tool_name,
+                                  const char *command, const char *reason, const char *details,
+                                  bool can_allow_session) {
+    agent_ev *ev = calloc(1, sizeof *ev);
+    if (!ev) return;
+    ev->kind = EV_APPROVAL_REQUEST;
+    ev->text = dup_or_null(title);
+    ev->tool_name = dup_or_null(tool_name);
+    ev->tool_detail = dup_or_null(command);
+    ev->extra_a = dup_or_null(reason);
+    ev->extra_b = dup_or_null(details);
+    ev->flag = can_allow_session;
+    push_ev(run, ev);
+    emit_simple(run, EV_STATUS, "Waiting for approval...");
+}
+
+static bool send_json_doc(mcode_proc *proc, yyjson_mut_doc *doc) {
+    if (!proc || !doc) return false;
+    size_t len = 0;
+    char *s = yyjson_mut_write(doc, 0, &len);
+    if (!s) return false;
+    char *line = malloc(len + 2);
+    if (!line) {
+        free(s);
+        return false;
+    }
+    memcpy(line, s, len);
+    line[len] = '\n';
+    line[len + 1] = '\0';
+    free(s);
+    bool ok = mcode_proc_write(proc, line, len + 1);
+    free(line);
+    return ok;
+}
+
+static void rpc_save_id(mcode_agent_run *run, yyjson_val *id_val) {
+    run->approval_rpc_id_is_str = false;
+    run->approval_rpc_id_str[0] = '\0';
+    run->approval_rpc_id_num = 0;
+    if (yyjson_is_str(id_val)) {
+        run->approval_rpc_id_is_str = true;
+        snprintf(run->approval_rpc_id_str, sizeof run->approval_rpc_id_str, "%s",
+                 yyjson_get_str(id_val));
+    } else if (yyjson_is_int(id_val)) {
+        run->approval_rpc_id_num = yyjson_get_sint(id_val);
+    } else if (yyjson_is_num(id_val)) {
+        run->approval_rpc_id_num = (int64_t)yyjson_get_num(id_val);
+    }
+}
+
+static void rpc_add_saved_id(yyjson_mut_doc *doc, yyjson_mut_val *obj,
+                             bool is_str, const char *id_str, int64_t id_num) {
+    if (is_str) {
+        yyjson_mut_obj_add_strcpy(doc, obj, "id", id_str ? id_str : "");
+    } else {
+        yyjson_mut_obj_add_sint(doc, obj, "id", id_num);
+    }
 }
 
 static const char *jstr(yyjson_val *obj, const char *key) {
@@ -204,6 +313,47 @@ static void parse_claude_json(mcode_agent_run *run, yyjson_val *root) {
     if (!type) return;
 
     if (strcmp(type, "system") == 0) {
+        return;
+    }
+
+    if (strcmp(type, "control_request") == 0 && run->proto == AGENT_PROTO_CLAUDE_CTL) {
+        const char *rid = jstr(root, "request_id");
+        yyjson_val *req = yyjson_obj_get(root, "request");
+        const char *subtype = jstr(req, "subtype");
+        if (rid && rid[0] && subtype && strcmp(subtype, "can_use_tool") == 0) {
+            const char *tname = jstr(req, "tool_name");
+            if (!tname || !tname[0]) tname = "tool";
+            yyjson_val *inp = yyjson_obj_get(req, "input");
+            const char *reason = jstr(req, "decision_reason");
+            const char *blocked = jstr(req, "blocked_path");
+            char detail[256] = "";
+            summarize_tool_input(inp, detail, sizeof detail);
+            char *compact_inp = inp ? yyjson_val_write(inp, 0, NULL) : strdup("{}");
+            char *pretty_inp = stringify_json_val(inp);
+
+            pthread_mutex_lock(&run->mu);
+            run->approval_pending = true;
+            run->approval_kind = APPROVAL_KIND_CLAUDE_TOOL;
+            run->approval_rpc_id_is_str = true;
+            snprintf(run->approval_rpc_id_str, sizeof run->approval_rpc_id_str, "%s", rid);
+            free(run->approval_payload_json);
+            run->approval_payload_json = compact_inp ? compact_inp : strdup("{}");
+            pthread_mutex_unlock(&run->mu);
+
+            char title[160];
+            snprintf(title, sizeof title, "Allow %s?", tname);
+            char full_reason[512] = "";
+            if (reason && reason[0] && blocked && blocked[0]) {
+                snprintf(full_reason, sizeof full_reason, "%s (%s)", reason, blocked);
+            } else if (reason && reason[0]) {
+                snprintf(full_reason, sizeof full_reason, "%s", reason);
+            } else if (blocked && blocked[0]) {
+                snprintf(full_reason, sizeof full_reason, "Path: %s", blocked);
+            }
+            emit_approval_request(run, title, tname, detail, full_reason,
+                                  pretty_inp ? pretty_inp : "", false);
+            free(pretty_inp);
+        }
         return;
     }
 
@@ -367,6 +517,12 @@ static void parse_claude_json(mcode_agent_run *run, yyjson_val *root) {
                 if (yyjson_is_num(cost)) uev->dbl_a = yyjson_get_num(cost);
                 push_ev(run, uev);
             }
+        }
+        if (run->proto == AGENT_PROTO_CLAUDE_CTL) {
+            pthread_mutex_lock(&run->mu);
+            run->rpc_turn_done = true;
+            pthread_mutex_unlock(&run->mu);
+            mcode_proc_close_stdin(run->proc);
         }
     }
 }
@@ -1350,6 +1506,792 @@ static void parse_agy_json(mcode_agent_run *run, yyjson_val *root) {
     emit_agy_usage(run, yyjson_obj_get(root, "usage"));
 }
 
+/* ---- Codex `app-server` JSON-RPC parser & handshake ---- */
+static void codex_rpc_send_initialize(mcode_agent_run *run) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
+    yyjson_mut_obj_add_int(doc, root, "id", 1);
+    yyjson_mut_obj_add_str(doc, root, "method", "initialize");
+    yyjson_mut_val *params = yyjson_mut_obj(doc);
+    yyjson_mut_val *ci = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, ci, "name", "mcode");
+    yyjson_mut_obj_add_str(doc, ci, "version", "0.1.0");
+    yyjson_mut_obj_add_val(doc, params, "clientInfo", ci);
+    yyjson_mut_obj_add_val(doc, root, "params", params);
+    send_json_doc(run->proc, doc);
+    yyjson_mut_doc_free(doc);
+}
+
+static void codex_rpc_send_thread_open(mcode_agent_run *run, bool resume, int rpc_id) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
+    yyjson_mut_obj_add_int(doc, root, "id", rpc_id);
+    yyjson_mut_obj_add_str(doc, root, "method", resume ? "thread/resume" : "thread/start");
+    yyjson_mut_val *params = yyjson_mut_obj(doc);
+    if (resume) {
+        yyjson_mut_obj_add_strcpy(doc, params, "threadId", run->init_session_id);
+    }
+    if (run->init_cwd[0]) {
+        yyjson_mut_obj_add_strcpy(doc, params, "cwd", run->init_cwd);
+    }
+    yyjson_mut_obj_add_str(doc, params, "approvalPolicy", "on-request");
+    yyjson_mut_obj_add_str(doc, params, "sandbox", "workspace-write");
+    if (run->init_model[0]) {
+        yyjson_mut_obj_add_strcpy(doc, params, "model", run->init_model);
+    }
+    if (run->init_speed == MCODE_SPEED_FAST) {
+        yyjson_mut_obj_add_str(doc, params, "serviceTier", "fast");
+    } else if (run->init_speed == MCODE_SPEED_STANDARD) {
+        yyjson_mut_obj_add_str(doc, params, "serviceTier", "default");
+    }
+    yyjson_mut_obj_add_val(doc, root, "params", params);
+    send_json_doc(run->proc, doc);
+    yyjson_mut_doc_free(doc);
+}
+
+static void codex_rpc_send_turn_start(mcode_agent_run *run) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
+    yyjson_mut_obj_add_int(doc, root, "id", 3);
+    yyjson_mut_obj_add_str(doc, root, "method", "turn/start");
+    yyjson_mut_val *params = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_strcpy(doc, params, "threadId", run->active_session_id);
+    yyjson_mut_val *inp = yyjson_mut_arr(doc);
+    yyjson_mut_val *part = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, part, "type", "text");
+    yyjson_mut_obj_add_strcpy(doc, part, "text", run->init_prompt ? run->init_prompt : "");
+    yyjson_mut_arr_append(inp, part);
+    yyjson_mut_obj_add_val(doc, params, "input", inp);
+    if (run->init_cwd[0]) {
+        yyjson_mut_obj_add_strcpy(doc, params, "cwd", run->init_cwd);
+    }
+    yyjson_mut_obj_add_str(doc, params, "approvalPolicy", "on-request");
+    if (run->init_model[0]) {
+        yyjson_mut_obj_add_strcpy(doc, params, "model", run->init_model);
+    }
+    if (run->init_effort[0]) {
+        yyjson_mut_obj_add_strcpy(doc, params, "effort", run->init_effort);
+    }
+    if (run->init_speed == MCODE_SPEED_FAST) {
+        yyjson_mut_obj_add_str(doc, params, "serviceTier", "fast");
+    } else if (run->init_speed == MCODE_SPEED_STANDARD) {
+        yyjson_mut_obj_add_str(doc, params, "serviceTier", "default");
+    }
+    yyjson_mut_obj_add_val(doc, root, "params", params);
+    run->rpc_prompt_sent = true;
+    send_json_doc(run->proc, doc);
+    yyjson_mut_doc_free(doc);
+}
+
+static void codex_rpc_finish_turn(mcode_agent_run *run) {
+    if (run->codex_turn_in_tokens > 0 || run->codex_turn_out_tokens > 0) {
+        agent_ev *uev = calloc(1, sizeof *uev);
+        if (uev) {
+            uev->kind = EV_USAGE;
+            uev->int_a = run->codex_turn_in_tokens;
+            uev->int_b = run->codex_turn_out_tokens;
+            push_ev(run, uev);
+        }
+    }
+    pthread_mutex_lock(&run->mu);
+    run->rpc_turn_done = true;
+    run->approval_pending = false;
+    pthread_mutex_unlock(&run->mu);
+    emit_simple(run, EV_APPROVAL_CLEAR, NULL);
+    mcode_proc_stop(run->proc);
+}
+
+static void parse_codex_rpc_json(mcode_agent_run *run, yyjson_val *root) {
+    const char *method = jstr(root, "method");
+    yyjson_val *id_val = yyjson_obj_get(root, "id");
+
+    /* Responses to our outgoing JSON-RPC requests */
+    if (!method && id_val && yyjson_is_int(id_val)) {
+        int64_t rid = yyjson_get_sint(id_val);
+        yyjson_val *err_v = yyjson_obj_get(root, "error");
+        yyjson_val *res_v = yyjson_obj_get(root, "result");
+
+        if (rid == 1) {
+            if (err_v) {
+                const char *emsg = jstr(err_v, "message");
+                emit_simple(run, EV_ERROR, emsg ? emsg : "Codex app-server initialize failed.");
+                codex_rpc_finish_turn(run);
+                return;
+            }
+            yyjson_mut_doc *ndoc = yyjson_mut_doc_new(NULL);
+            if (ndoc) {
+                yyjson_mut_val *nroot = yyjson_mut_obj(ndoc);
+                yyjson_mut_doc_set_root(ndoc, nroot);
+                yyjson_mut_obj_add_str(ndoc, nroot, "jsonrpc", "2.0");
+                yyjson_mut_obj_add_str(ndoc, nroot, "method", "initialized");
+                send_json_doc(run->proc, ndoc);
+                yyjson_mut_doc_free(ndoc);
+            }
+            codex_rpc_send_thread_open(run, run->init_session_id[0] != '\0', 2);
+            return;
+        }
+
+        if (rid == 2 || rid == 20) {
+            if (err_v) {
+                if (rid == 2 && run->init_session_id[0]) {
+                    /* Stale/unknown session ID: start a fresh thread cleanly */
+                    run->init_session_id[0] = '\0';
+                    codex_rpc_send_thread_open(run, false, 20);
+                    return;
+                }
+                const char *emsg = jstr(err_v, "message");
+                emit_simple(run, EV_ERROR, emsg ? emsg : "Codex failed to open thread.");
+                codex_rpc_finish_turn(run);
+                return;
+            }
+            yyjson_val *thr = yyjson_is_obj(res_v) ? yyjson_obj_get(res_v, "thread") : NULL;
+            const char *tid = jstr(thr, "id");
+            if (tid && tid[0]) {
+                snprintf(run->active_session_id, sizeof run->active_session_id, "%s", tid);
+                emit_simple(run, EV_SESSION, tid);
+                codex_rpc_send_turn_start(run);
+            } else {
+                emit_simple(run, EV_ERROR, "Codex did not return a thread ID.");
+                codex_rpc_finish_turn(run);
+            }
+            return;
+        }
+
+        if (rid == 3 && err_v) {
+            const char *emsg = jstr(err_v, "message");
+            emit_simple(run, EV_ERROR, emsg ? emsg : "Codex turn/start failed.");
+            codex_rpc_finish_turn(run);
+        }
+        return;
+    }
+
+    if (!method) return;
+    yyjson_val *params = yyjson_obj_get(root, "params");
+
+    /* Server-initiated approval requests (have both id and method) */
+    if (id_val && !yyjson_is_null(id_val)) {
+        if (strcmp(method, "item/commandExecution/requestApproval") == 0) {
+            const char *cmd = jstr(params, "command");
+            const char *reason = jstr(params, "reason");
+            const char *cwd = jstr(params, "cwd");
+            char short_cmd[512] = "";
+            summarize_command_detail(cmd, short_cmd, sizeof short_cmd);
+
+            bool has_session = false;
+            bool use_amend = false;
+            char *amend_json = NULL;
+            yyjson_val *avail = yyjson_is_obj(params) ? yyjson_obj_get(params, "availableDecisions") : NULL;
+            if (yyjson_is_arr(avail)) {
+                size_t idx, max;
+                yyjson_val *dv;
+                yyjson_arr_foreach(avail, idx, max, dv) {
+                    if (yyjson_is_str(dv) && strcmp(yyjson_get_str(dv), "acceptForSession") == 0) {
+                        has_session = true;
+                        use_amend = false;
+                        break;
+                    } else if (yyjson_is_obj(dv) && yyjson_obj_get(dv, "acceptWithExecpolicyAmendment") && !amend_json) {
+                        amend_json = yyjson_val_write(dv, 0, NULL);
+                        if (amend_json) {
+                            has_session = true;
+                            use_amend = true;
+                        }
+                    }
+                }
+            } else {
+                has_session = true;
+            }
+
+            pthread_mutex_lock(&run->mu);
+            run->approval_pending = true;
+            run->approval_kind = APPROVAL_KIND_CODEX_CMD;
+            rpc_save_id(run, id_val);
+            run->approval_codex_use_amendment = use_amend;
+            free(run->approval_payload_json);
+            run->approval_payload_json = use_amend ? amend_json : NULL;
+            if (!use_amend) free(amend_json);
+            pthread_mutex_unlock(&run->mu);
+
+            char details[1024] = "";
+            if (cmd && cmd[0] && cwd && cwd[0]) {
+                snprintf(details, sizeof details, "%s\n(cwd: %s)", cmd, cwd);
+            } else if (cmd && cmd[0]) {
+                snprintf(details, sizeof details, "%s", cmd);
+            }
+            emit_approval_request(run, "Approve command?", "command",
+                                  short_cmd[0] ? short_cmd : (cmd ? cmd : ""),
+                                  reason ? reason : "", details, has_session);
+            return;
+        }
+
+        if (strcmp(method, "item/fileChange/requestApproval") == 0) {
+            const char *reason = jstr(params, "reason");
+            const char *grant_root = jstr(params, "grantRoot");
+
+            pthread_mutex_lock(&run->mu);
+            run->approval_pending = true;
+            run->approval_kind = APPROVAL_KIND_CODEX_FILE;
+            rpc_save_id(run, id_val);
+            free(run->approval_payload_json);
+            run->approval_payload_json = NULL;
+            pthread_mutex_unlock(&run->mu);
+
+            emit_approval_request(run, "Approve file changes?", "file_change",
+                                  grant_root ? grant_root : "",
+                                  reason ? reason : "", "", true);
+            return;
+        }
+
+        if (strcmp(method, "item/permissions/requestApproval") == 0) {
+            const char *reason = jstr(params, "reason");
+            yyjson_val *perms = yyjson_is_obj(params) ? yyjson_obj_get(params, "permissions") : NULL;
+            char *compact_perms = perms ? yyjson_val_write(perms, 0, NULL) : strdup("{}");
+            char *pretty_perms = stringify_json_val(perms);
+
+            pthread_mutex_lock(&run->mu);
+            run->approval_pending = true;
+            run->approval_kind = APPROVAL_KIND_CODEX_PERMS;
+            rpc_save_id(run, id_val);
+            free(run->approval_payload_json);
+            run->approval_payload_json = compact_perms ? compact_perms : strdup("{}");
+            pthread_mutex_unlock(&run->mu);
+
+            emit_approval_request(run, "Grant extra permissions?", "permissions",
+                                  "", reason ? reason : "",
+                                  pretty_perms ? pretty_perms : "", true);
+            free(pretty_perms);
+            return;
+        }
+
+        /* Unknown server request: return JSON-RPC Method not found so server never hangs */
+        yyjson_mut_doc *edoc = yyjson_mut_doc_new(NULL);
+        if (edoc) {
+            yyjson_mut_val *eroot = yyjson_mut_obj(edoc);
+            yyjson_mut_doc_set_root(edoc, eroot);
+            yyjson_mut_obj_add_str(edoc, eroot, "jsonrpc", "2.0");
+            if (yyjson_is_str(id_val)) yyjson_mut_obj_add_strcpy(edoc, eroot, "id", yyjson_get_str(id_val));
+            else if (yyjson_is_int(id_val)) yyjson_mut_obj_add_sint(edoc, eroot, "id", yyjson_get_sint(id_val));
+            yyjson_mut_val *eobj = yyjson_mut_obj(edoc);
+            yyjson_mut_obj_add_int(edoc, eobj, "code", -32601);
+            yyjson_mut_obj_add_str(edoc, eobj, "message", "Unsupported client request");
+            yyjson_mut_obj_add_val(edoc, eroot, "error", eobj);
+            send_json_doc(run->proc, edoc);
+            yyjson_mut_doc_free(edoc);
+        }
+        return;
+    }
+
+    if (!run->rpc_prompt_sent) return;
+
+    if (strcmp(method, "serverRequest/resolved") == 0) {
+        emit_simple(run, EV_APPROVAL_CLEAR, NULL);
+        return;
+    }
+
+    if (strcmp(method, "item/agentMessage/delta") == 0) {
+        const char *delta = jstr(params, "delta");
+        if (delta && delta[0]) {
+            if (run->need_text_sep) {
+                emit_simple(run, EV_TEXT_DELTA, "\n\n");
+                run->need_text_sep = false;
+            }
+            run->streamed_text_deltas = true;
+            run->has_emitted_text = true;
+            emit_simple(run, EV_REASONING_DONE, NULL);
+            emit_simple(run, EV_TEXT_DELTA, delta);
+            emit_simple(run, EV_STATUS, "Responding...");
+        }
+        return;
+    }
+
+    if (strcmp(method, "item/reasoning/textDelta") == 0 ||
+        strcmp(method, "item/reasoning/summaryTextDelta") == 0) {
+        const char *delta = jstr(params, "delta");
+        if (delta && delta[0]) {
+            run->streamed_thinking_deltas = true;
+            emit_simple(run, EV_REASONING_DELTA, delta);
+            emit_simple(run, EV_STATUS, "Reasoning...");
+        }
+        return;
+    }
+
+    if (strcmp(method, "item/started") == 0 || strcmp(method, "item/completed") == 0) {
+        bool is_done = (strcmp(method, "item/completed") == 0);
+        yyjson_val *item = yyjson_is_obj(params) ? yyjson_obj_get(params, "item") : NULL;
+        if (!yyjson_is_obj(item)) return;
+        const char *itype = jstr(item, "type");
+        const char *iid = jstr(item, "id");
+        if (!itype) return;
+
+        if (strcmp(itype, "agentMessage") == 0) {
+            if (!is_done) {
+                run->streamed_text_deltas = false;
+                run->need_text_sep = run->has_emitted_text;
+            } else {
+                const char *txt = jstr(item, "text");
+                if (txt && txt[0] && !run->streamed_text_deltas) {
+                    if (run->need_text_sep) {
+                        emit_simple(run, EV_TEXT_DELTA, "\n\n");
+                        run->need_text_sep = false;
+                    }
+                    run->has_emitted_text = true;
+                    emit_simple(run, EV_REASONING_DONE, NULL);
+                    emit_simple(run, EV_TEXT_DELTA, txt);
+                }
+                run->streamed_text_deltas = false;
+            }
+        } else if (strcmp(itype, "reasoning") == 0) {
+            if (!is_done) {
+                emit_simple(run, EV_STATUS, "Reasoning...");
+            } else {
+                emit_simple(run, EV_REASONING_DONE, NULL);
+            }
+        } else if (strcmp(itype, "commandExecution") == 0) {
+            run->has_emitted_text = false;
+            const char *cmd = jstr(item, "command");
+            const char *out = jstr(item, "aggregatedOutput");
+            yyjson_val *ec = yyjson_obj_get(item, "exitCode");
+            bool has_ec = yyjson_is_num(ec);
+            int exit_code = has_ec ? (int)yyjson_get_num(ec) : -1;
+            const char *status = jstr(item, "status");
+            bool failed = (has_ec && exit_code != 0) ||
+                          (status && (strcmp(status, "failed") == 0 || strcmp(status, "declined") == 0));
+            if (failed && !(status && strcmp(status, "declined") == 0) &&
+                mcode_command_is_benign_probe_exit(cmd, out, exit_code)) {
+                failed = false;
+            }
+            char short_cmd[128] = "";
+            summarize_command_detail(cmd, short_cmd, sizeof short_cmd);
+            if (!is_done) {
+                emit_tool_start(run, iid ? iid : "cmd", "bash", short_cmd, cmd ? cmd : "");
+                char st[160];
+                snprintf(st, sizeof st, "Running: %s", short_cmd[0] ? short_cmd : "command");
+                emit_simple(run, EV_STATUS, st);
+            } else {
+                emit_tool_start(run, iid ? iid : "cmd", "bash", short_cmd, cmd ? cmd : "");
+                const char *res_out = out;
+                if ((!res_out || !res_out[0]) && status && strcmp(status, "declined") == 0) {
+                    res_out = "Permission denied by user.";
+                }
+                emit_tool_result_code(run, iid ? iid : "cmd", res_out ? res_out : "", failed, exit_code);
+            }
+        } else if (strcmp(itype, "fileChange") == 0) {
+            run->has_emitted_text = false;
+            yyjson_val *changes = yyjson_obj_get(item, "changes");
+            mcode_str summary;
+            mcode_str_init(&summary);
+            char first_path[256] = "";
+            if (yyjson_is_arr(changes)) {
+                size_t idx, max;
+                yyjson_val *c;
+                yyjson_arr_foreach(changes, idx, max, c) {
+                    const char *p = jstr(c, "path");
+                    const char *k = jstr(c, "kind");
+                    if (p) {
+                        if (!first_path[0]) snprintf(first_path, sizeof first_path, "%s", p);
+                        if (summary.len > 0) mcode_str_append_cstr(&summary, "\n");
+                        mcode_str_append_cstr(&summary, k ? k : "edit");
+                        mcode_str_append_cstr(&summary, " ");
+                        mcode_str_append_cstr(&summary, p);
+                    }
+                }
+            }
+            const char *status = jstr(item, "status");
+            bool failed = status && (strcmp(status, "failed") == 0 || strcmp(status, "declined") == 0);
+            emit_tool_start(run, iid ? iid : "file", "file_change", first_path, mcode_str_cstr(&summary));
+            if (is_done) {
+                emit_tool_result(run, iid ? iid : "file",
+                                 (failed && summary.len == 0) ? "File change declined or failed."
+                                                              : mcode_str_cstr(&summary),
+                                 failed);
+            }
+            mcode_str_free(&summary);
+        } else if (strcmp(itype, "mcpToolCall") == 0 || strcmp(itype, "webSearch") == 0) {
+            run->has_emitted_text = false;
+            const char *tool = jstr(item, "tool");
+            const char *query = jstr(item, "query");
+            char *args_json = stringify_json_val(yyjson_obj_get(item, "arguments"));
+            emit_tool_start(run, iid ? iid : itype, tool ? tool : itype,
+                            query ? query : "", args_json ? args_json : "");
+            free(args_json);
+            if (is_done) {
+                char *res_json = stringify_json_val(yyjson_obj_get(item, "result"));
+                const char *err_s = jstr(item, "error");
+                emit_tool_result(run, iid ? iid : itype,
+                                 err_s ? err_s : (res_json ? res_json : ""),
+                                 err_s != NULL);
+                free(res_json);
+            }
+        }
+        return;
+    }
+
+    if (strcmp(method, "thread/tokenUsage/updated") == 0) {
+        yyjson_val *tu = yyjson_is_obj(params) ? yyjson_obj_get(params, "tokenUsage") : NULL;
+        yyjson_val *tot = yyjson_is_obj(tu) ? yyjson_obj_get(tu, "total") : NULL;
+        if (yyjson_is_obj(tot)) {
+            yyjson_val *in_v = yyjson_obj_get(tot, "inputTokens");
+            yyjson_val *out_v = yyjson_obj_get(tot, "outputTokens");
+            if (yyjson_is_num(in_v)) run->codex_turn_in_tokens = (int)yyjson_get_num(in_v);
+            if (yyjson_is_num(out_v)) run->codex_turn_out_tokens = (int)yyjson_get_num(out_v);
+        }
+        return;
+    }
+
+    if (strcmp(method, "turn/completed") == 0) {
+        yyjson_val *turn = yyjson_is_obj(params) ? yyjson_obj_get(params, "turn") : NULL;
+        yyjson_val *err_v = yyjson_is_obj(turn) ? yyjson_obj_get(turn, "error") : NULL;
+        if (err_v && !yyjson_is_null(err_v)) {
+            const char *emsg = yyjson_is_obj(err_v) ? jstr(err_v, "message") : NULL;
+            char *s = emsg ? strdup(emsg) : stringify_json_val(err_v);
+            if (s && s[0]) emit_simple(run, EV_ERROR, s);
+            free(s);
+        }
+        codex_rpc_finish_turn(run);
+    }
+}
+
+/* ---- Antigravity `agy acp` JSON-RPC parser & handshake ---- */
+static void agy_acp_send_initialize(mcode_agent_run *run) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
+    yyjson_mut_obj_add_int(doc, root, "id", 1);
+    yyjson_mut_obj_add_str(doc, root, "method", "initialize");
+    yyjson_mut_val *params = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_int(doc, params, "protocolVersion", 1);
+    yyjson_mut_obj_add_val(doc, params, "clientCapabilities", yyjson_mut_obj(doc));
+    yyjson_mut_obj_add_val(doc, root, "params", params);
+    send_json_doc(run->proc, doc);
+    yyjson_mut_doc_free(doc);
+}
+
+static void agy_acp_send_session_open(mcode_agent_run *run, bool load, int rpc_id) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
+    yyjson_mut_obj_add_int(doc, root, "id", rpc_id);
+    yyjson_mut_obj_add_str(doc, root, "method", load ? "session/load" : "session/new");
+    yyjson_mut_val *params = yyjson_mut_obj(doc);
+    if (load) {
+        yyjson_mut_obj_add_strcpy(doc, params, "sessionId", run->init_session_id);
+    }
+    yyjson_mut_obj_add_strcpy(doc, params, "cwd", run->init_cwd[0] ? run->init_cwd : ".");
+    yyjson_mut_obj_add_val(doc, params, "mcpServers", yyjson_mut_arr(doc));
+    yyjson_mut_obj_add_val(doc, root, "params", params);
+    send_json_doc(run->proc, doc);
+    yyjson_mut_doc_free(doc);
+}
+
+static void agy_acp_send_configure_and_prompt(mcode_agent_run *run) {
+    /* 1. Accept workspace file edits automatically; prompt interactively for commands / unsandboxed actions */
+    {
+        yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+        if (doc) {
+            yyjson_mut_val *root = yyjson_mut_obj(doc);
+            yyjson_mut_doc_set_root(doc, root);
+            yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
+            yyjson_mut_obj_add_int(doc, root, "id", 3);
+            yyjson_mut_obj_add_str(doc, root, "method", "session/set_mode");
+            yyjson_mut_val *params = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, params, "sessionId", run->active_session_id);
+            yyjson_mut_obj_add_str(doc, params, "modeId", "accept-edits");
+            yyjson_mut_obj_add_val(doc, root, "params", params);
+            send_json_doc(run->proc, doc);
+            yyjson_mut_doc_free(doc);
+        }
+    }
+    /* 2. Apply selected model if configured */
+    if (run->init_model[0]) {
+        yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+        if (doc) {
+            yyjson_mut_val *root = yyjson_mut_obj(doc);
+            yyjson_mut_doc_set_root(doc, root);
+            yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
+            yyjson_mut_obj_add_int(doc, root, "id", 4);
+            yyjson_mut_obj_add_str(doc, root, "method", "session/set_model");
+            yyjson_mut_val *params = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, params, "sessionId", run->active_session_id);
+            yyjson_mut_obj_add_strcpy(doc, params, "modelId", run->init_model);
+            yyjson_mut_obj_add_val(doc, root, "params", params);
+            send_json_doc(run->proc, doc);
+            yyjson_mut_doc_free(doc);
+        }
+    }
+    /* 3. Send the prompt */
+    {
+        yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+        if (doc) {
+            yyjson_mut_val *root = yyjson_mut_obj(doc);
+            yyjson_mut_doc_set_root(doc, root);
+            yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
+            yyjson_mut_obj_add_int(doc, root, "id", 5);
+            yyjson_mut_obj_add_str(doc, root, "method", "session/prompt");
+            yyjson_mut_val *params = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, params, "sessionId", run->active_session_id);
+            yyjson_mut_val *prompt_arr = yyjson_mut_arr(doc);
+            yyjson_mut_val *part = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_str(doc, part, "type", "text");
+            yyjson_mut_obj_add_strcpy(doc, part, "text", run->init_prompt ? run->init_prompt : "");
+            yyjson_mut_arr_append(prompt_arr, part);
+            yyjson_mut_obj_add_val(doc, params, "prompt", prompt_arr);
+            yyjson_mut_obj_add_val(doc, root, "params", params);
+            run->rpc_prompt_sent = true;
+            send_json_doc(run->proc, doc);
+            yyjson_mut_doc_free(doc);
+        }
+    }
+}
+
+static void agy_acp_finish_turn(mcode_agent_run *run) {
+    pthread_mutex_lock(&run->mu);
+    run->rpc_turn_done = true;
+    run->approval_pending = false;
+    pthread_mutex_unlock(&run->mu);
+    emit_simple(run, EV_APPROVAL_CLEAR, NULL);
+    emit_simple(run, EV_REASONING_DONE, NULL);
+    mcode_proc_stop(run->proc);
+}
+
+static char *extract_acp_tool_output(yyjson_val *upd) {
+    yyjson_val *raw_out = yyjson_obj_get(upd, "rawOutput");
+    if (raw_out && !yyjson_is_null(raw_out)) {
+        char *s = stringify_json_val(raw_out);
+        if (s && s[0]) return s;
+        free(s);
+    }
+    yyjson_val *content = yyjson_obj_get(upd, "content");
+    if (yyjson_is_arr(content)) {
+        mcode_str joined;
+        mcode_str_init(&joined);
+        size_t i, max;
+        yyjson_val *item;
+        yyjson_arr_foreach(content, i, max, item) {
+            const char *txt = jstr(item, "text");
+            if (!txt) {
+                yyjson_val *inner = yyjson_obj_get(item, "content");
+                txt = jstr(inner, "text");
+            }
+            if (txt && txt[0]) {
+                if (joined.len > 0) mcode_str_append_cstr(&joined, "\n");
+                mcode_str_append_cstr(&joined, txt);
+            }
+        }
+        if (joined.len > 0) return joined.data;
+        mcode_str_free(&joined);
+    }
+    return NULL;
+}
+
+static void parse_agy_acp_json(mcode_agent_run *run, yyjson_val *root) {
+    const char *method = jstr(root, "method");
+    yyjson_val *id_val = yyjson_obj_get(root, "id");
+
+    /* Responses to our outgoing JSON-RPC requests */
+    if (!method && id_val && yyjson_is_int(id_val)) {
+        int64_t rid = yyjson_get_sint(id_val);
+        yyjson_val *err_v = yyjson_obj_get(root, "error");
+        yyjson_val *res_v = yyjson_obj_get(root, "result");
+
+        if (rid == 1) {
+            if (err_v) {
+                const char *emsg = jstr(err_v, "message");
+                emit_simple(run, EV_ERROR, emsg ? emsg : "Antigravity ACP initialize failed.");
+                agy_acp_finish_turn(run);
+                return;
+            }
+            agy_acp_send_session_open(run, run->init_session_id[0] != '\0', 2);
+            return;
+        }
+
+        if (rid == 2 || rid == 20) {
+            if (err_v) {
+                if (rid == 2 && run->init_session_id[0]) {
+                    /* Session could not be loaded: fall back to a fresh session */
+                    run->init_session_id[0] = '\0';
+                    agy_acp_send_session_open(run, false, 20);
+                    return;
+                }
+                const char *emsg = jstr(err_v, "message");
+                emit_simple(run, EV_ERROR, emsg ? emsg : "Antigravity ACP session open failed.");
+                agy_acp_finish_turn(run);
+                return;
+            }
+            const char *sid = jstr(res_v, "sessionId");
+            if (!sid || !sid[0]) sid = run->init_session_id;
+            if (sid && sid[0]) {
+                snprintf(run->active_session_id, sizeof run->active_session_id, "%s", sid);
+                emit_simple(run, EV_SESSION, sid);
+                agy_acp_send_configure_and_prompt(run);
+            } else {
+                emit_simple(run, EV_ERROR, "Antigravity ACP did not return a session ID.");
+                agy_acp_finish_turn(run);
+            }
+            return;
+        }
+
+        if (rid == 5) {
+            if (err_v) {
+                const char *emsg = jstr(err_v, "message");
+                emit_simple(run, EV_ERROR, emsg ? emsg : "Antigravity ACP prompt failed.");
+            } else if (yyjson_is_obj(res_v)) {
+                yyjson_val *usage = yyjson_obj_get(res_v, "usage");
+                if (yyjson_is_obj(usage)) {
+                    agent_ev *uev = calloc(1, sizeof *uev);
+                    if (uev) {
+                        uev->kind = EV_USAGE;
+                        yyjson_val *in_v = yyjson_obj_get(usage, "inputTokens");
+                        yyjson_val *out_v = yyjson_obj_get(usage, "outputTokens");
+                        if (yyjson_is_num(in_v)) uev->int_a = (int)yyjson_get_num(in_v);
+                        if (yyjson_is_num(out_v)) uev->int_b = (int)yyjson_get_num(out_v);
+                        push_ev(run, uev);
+                    }
+                }
+            }
+            agy_acp_finish_turn(run);
+        }
+        return;
+    }
+
+    if (!method) return;
+    yyjson_val *params = yyjson_obj_get(root, "params");
+
+    /* Interactive permission request from Antigravity ACP */
+    if (strcmp(method, "session/request_permission") == 0 && id_val && !yyjson_is_null(id_val)) {
+        yyjson_val *tc = yyjson_is_obj(params) ? yyjson_obj_get(params, "toolCall") : NULL;
+        const char *tname = jstr(tc, "name");
+        const char *tc_title = jstr(tc, "title");
+        if (!tname || !tname[0]) tname = "tool";
+        yyjson_val *raw_in = yyjson_is_obj(tc) ? yyjson_obj_get(tc, "rawInput") : NULL;
+        if (!raw_in && yyjson_is_obj(tc)) raw_in = yyjson_obj_get(tc, "args");
+
+        char detail[256] = "";
+        summarize_tool_input(raw_in, detail, sizeof detail);
+        if (!detail[0] && tc_title && tc_title[0]) {
+            snprintf(detail, sizeof detail, "%s", tc_title);
+        }
+        const char *summary = jstr(raw_in, "toolSummary");
+        char *pretty_in = stringify_json_val(raw_in);
+
+        char allow_opt[64] = "";
+        char allow_always_opt[64] = "";
+        char deny_opt[64] = "";
+        yyjson_val *opts = yyjson_is_obj(params) ? yyjson_obj_get(params, "options") : NULL;
+        if (yyjson_is_arr(opts)) {
+            size_t i, max;
+            yyjson_val *ov;
+            yyjson_arr_foreach(opts, i, max, ov) {
+                const char *oid = jstr(ov, "optionId");
+                const char *kind = jstr(ov, "kind");
+                if (!oid || !oid[0]) continue;
+                if (kind && strcmp(kind, "allow_always") == 0 && !allow_always_opt[0]) {
+                    snprintf(allow_always_opt, sizeof allow_always_opt, "%s", oid);
+                } else if (kind && strncmp(kind, "allow", 5) == 0 && !allow_opt[0]) {
+                    snprintf(allow_opt, sizeof allow_opt, "%s", oid);
+                } else if (kind && strncmp(kind, "reject", 6) == 0 && !deny_opt[0]) {
+                    snprintf(deny_opt, sizeof deny_opt, "%s", oid);
+                }
+            }
+        }
+        if (!allow_opt[0]) snprintf(allow_opt, sizeof allow_opt, "allow");
+        if (!deny_opt[0]) snprintf(deny_opt, sizeof deny_opt, "deny");
+
+        pthread_mutex_lock(&run->mu);
+        run->approval_pending = true;
+        run->approval_kind = APPROVAL_KIND_AGY_ACP;
+        rpc_save_id(run, id_val);
+        snprintf(run->approval_allow_opt, sizeof run->approval_allow_opt, "%s", allow_opt);
+        snprintf(run->approval_allow_always_opt, sizeof run->approval_allow_always_opt, "%s", allow_always_opt);
+        snprintf(run->approval_deny_opt, sizeof run->approval_deny_opt, "%s", deny_opt);
+        free(run->approval_payload_json);
+        run->approval_payload_json = NULL;
+        pthread_mutex_unlock(&run->mu);
+
+        char title[160];
+        if (strcmp(tname, "run_command") == 0) {
+            snprintf(title, sizeof title, "Approve command?");
+        } else {
+            snprintf(title, sizeof title, "Allow %s?", tname);
+        }
+        emit_approval_request(run, title, tname, detail,
+                              summary ? summary : "",
+                              pretty_in ? pretty_in : "",
+                              allow_always_opt[0] != '\0');
+        free(pretty_in);
+        return;
+    }
+
+    if (strcmp(method, "session/update") != 0 || !run->rpc_prompt_sent) return;
+    yyjson_val *upd = yyjson_is_obj(params) ? yyjson_obj_get(params, "update") : NULL;
+    if (!yyjson_is_obj(upd)) return;
+    const char *su = jstr(upd, "sessionUpdate");
+    if (!su) return;
+
+    if (strcmp(su, "agent_message_chunk") == 0) {
+        yyjson_val *content = yyjson_obj_get(upd, "content");
+        const char *txt = jstr(content, "text");
+        if (txt && txt[0]) {
+            run->streamed_text_deltas = true;
+            emit_simple(run, EV_REASONING_DONE, NULL);
+            emit_simple(run, EV_TEXT_DELTA, txt);
+            emit_simple(run, EV_STATUS, "Responding...");
+        }
+    } else if (strcmp(su, "agent_thought_chunk") == 0) {
+        yyjson_val *content = yyjson_obj_get(upd, "content");
+        const char *txt = jstr(content, "text");
+        if (txt && txt[0]) {
+            run->streamed_thinking_deltas = true;
+            emit_simple(run, EV_REASONING_DELTA, txt);
+            emit_simple(run, EV_STATUS, "Thinking...");
+        }
+    } else if (strcmp(su, "tool_call") == 0 || strcmp(su, "tool_call_update") == 0) {
+        const char *tid = jstr(upd, "toolCallId");
+        const char *tname = jstr(upd, "name");
+        const char *tc_title = jstr(upd, "title");
+        if (!tname || !tname[0]) tname = (tc_title && tc_title[0]) ? tc_title : "tool";
+        if (!tid || !tid[0]) tid = tname;
+        const char *status = jstr(upd, "status");
+        yyjson_val *raw_in = yyjson_obj_get(upd, "rawInput");
+        if (!raw_in) raw_in = yyjson_obj_get(upd, "args");
+
+        char detail[256] = "";
+        summarize_tool_input(raw_in, detail, sizeof detail);
+        if (!detail[0] && tc_title && tc_title[0] && strcmp(tc_title, tname) != 0) {
+            snprintf(detail, sizeof detail, "%s", tc_title);
+        }
+        char *inp_json = stringify_json_val(raw_in);
+        emit_tool_start(run, tid, tname, detail, inp_json ? inp_json : "");
+        free(inp_json);
+
+        bool done = status && (strcmp(status, "completed") == 0 || strcmp(status, "failed") == 0);
+        bool failed = status && strcmp(status, "failed") == 0;
+        if (done) {
+            char *out_s = extract_acp_tool_output(upd);
+            emit_tool_result(run, tid, out_s ? out_s : "", failed);
+            free(out_s);
+        } else if (status && strcmp(status, "pending") == 0) {
+            emit_simple(run, EV_STATUS, "Waiting for approval...");
+        } else {
+            char st[160];
+            if (detail[0]) snprintf(st, sizeof st, "%s: %s", tname, detail);
+            else snprintf(st, sizeof st, "Running %s...", tname);
+            emit_simple(run, EV_STATUS, st);
+        }
+    }
+}
+
 static void handle_line(mcode_agent_run *run, const char *line, bool is_stderr) {
     if (!run || !line) return;
     /* Trim trailing \r */
@@ -1371,8 +2313,12 @@ static void handle_line(mcode_agent_run *run, const char *line, bool is_stderr) 
                 if (run->stderr_tail.len > 0) mcode_str_append_cstr(&run->stderr_tail, "\n");
                 mcode_str_append_cstr(&run->stderr_tail, p);
             }
-            if (strstr(p, "Error") || strstr(p, "error") || strstr(p, "FATAL") || strstr(p, "not found")) {
-                emit_simple(run, EV_ERROR, p);
+            /* Structured RPC servers report errors via JSON-RPC; avoid surfacing
+             * internal tracing logs (e.g. Codex router rejection logs) as fatal turn errors. */
+            if (run->proto != AGENT_PROTO_CODEX_RPC && run->proto != AGENT_PROTO_AGY_ACP) {
+                if (strstr(p, "Error") || strstr(p, "error") || strstr(p, "FATAL") || strstr(p, "not found")) {
+                    emit_simple(run, EV_ERROR, p);
+                }
             }
         }
         free(copy);
@@ -1387,17 +2333,29 @@ static void handle_line(mcode_agent_run *run, const char *line, bool is_stderr) 
         if (doc) {
             yyjson_val *root = yyjson_doc_get_root(doc);
             if (yyjson_is_obj(root)) {
-                switch (run->agent) {
-                case APP_AGENT_CLAUDE: parse_claude_json(run, root); break;
-                case APP_AGENT_CODEX:  parse_codex_json(run, root); break;
-                case APP_AGENT_AGY:    parse_agy_json(run, root); break;
-                default: break;
+                if (run->proto == AGENT_PROTO_CODEX_RPC) {
+                    parse_codex_rpc_json(run, root);
+                } else if (run->proto == AGENT_PROTO_AGY_ACP) {
+                    parse_agy_acp_json(run, root);
+                } else {
+                    switch (run->agent) {
+                    case APP_AGENT_CLAUDE: parse_claude_json(run, root); break;
+                    case APP_AGENT_CODEX:  parse_codex_json(run, root); break;
+                    case APP_AGENT_AGY:    parse_agy_json(run, root); break;
+                    default: break;
+                    }
                 }
             }
             yyjson_doc_free(doc);
             free(copy);
             return;
         }
+    }
+
+    /* Ignore non-JSON chatter on stdout for structured JSON-RPC servers */
+    if (run->proto == AGENT_PROTO_CODEX_RPC || run->proto == AGENT_PROTO_AGY_ACP) {
+        free(copy);
+        return;
     }
 
     /* Plain text fallback */
@@ -1430,6 +2388,14 @@ static void on_proc_exit(int exit_code, bool killed, void *user) {
         handle_line(run, mcode_str_cstr(&run->err_line), true);
         mcode_str_clear(&run->err_line);
     }
+    pthread_mutex_lock(&run->mu);
+    bool clean_rpc_done = run->rpc_turn_done;
+    pthread_mutex_unlock(&run->mu);
+    if (clean_rpc_done) {
+        exit_code = 0;
+        killed = false;
+    }
+
     agent_ev *ev = calloc(1, sizeof *ev);
     if (ev) {
         ev->kind = EV_DONE;
@@ -1548,6 +2514,22 @@ static void apply_event(mcode_thread *thread, mcode_turn *turn, const agent_ev *
         }
         break;
     }
+    case EV_APPROVAL_REQUEST: {
+        mcode_pending_approval *pa = &thread->pending_approval;
+        memset(pa, 0, sizeof *pa);
+        pa->active = true;
+        if (ev->text) snprintf(pa->title, sizeof pa->title, "%s", ev->text);
+        if (ev->tool_name) snprintf(pa->tool_name, sizeof pa->tool_name, "%s", ev->tool_name);
+        if (ev->tool_detail) snprintf(pa->command, sizeof pa->command, "%s", ev->tool_detail);
+        if (ev->extra_a) snprintf(pa->reason, sizeof pa->reason, "%s", ev->extra_a);
+        if (ev->extra_b) snprintf(pa->details, sizeof pa->details, "%s", ev->extra_b);
+        pa->can_allow_session = ev->flag;
+        thread->scroll_to_bottom_frames = 3;
+        break;
+    }
+    case EV_APPROVAL_CLEAR:
+        memset(&thread->pending_approval, 0, sizeof thread->pending_approval);
+        break;
     case EV_STATUS:
         if (ev->text && ev->text[0]) {
             snprintf(thread->status_text, sizeof thread->status_text, "%s", ev->text);
@@ -1606,6 +2588,7 @@ static void apply_event(mcode_thread *thread, mcode_turn *turn, const agent_ev *
     }
     case EV_DONE: {
         turn->running = false;
+        memset(&thread->pending_approval, 0, sizeof thread->pending_approval);
         turn->duration_sec = (float)(mcode_now_mono() - turn->started_mono);
         /* Finalize any still-running blocks */
         for (int i = 0; i < turn->block_count; ++i) {
@@ -2357,11 +3340,18 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
     }
     const char *argv[32];
     int n = 0;
+    agent_proto_kind proto = AGENT_PROTO_STREAM;
 
     if (thread->agent == APP_AGENT_CLAUDE) {
         argv[n++] = bin;
         argv[n++] = "-p";
-        argv[n++] = prompt;
+        if (thread->auto_approve) {
+            argv[n++] = prompt;
+        } else {
+            proto = AGENT_PROTO_CLAUDE_CTL;
+            argv[n++] = "--input-format";
+            argv[n++] = "stream-json";
+        }
         argv[n++] = "--output-format";
         argv[n++] = "stream-json";
         argv[n++] = "--verbose";
@@ -2380,86 +3370,84 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
         }
         if (thread->auto_approve) {
             argv[n++] = "--dangerously-skip-permissions";
+        } else {
+            argv[n++] = "--permission-prompts";
+            argv[n++] = "host";
         }
     } else if (thread->agent == APP_AGENT_CODEX) {
-        argv[n++] = bin;
-        argv[n++] = "exec";
-        if (thread->session_id[0]) {
-            argv[n++] = "resume";
-            argv[n++] = "--json";
-            argv[n++] = "--skip-git-repo-check";
-            if (model[0]) {
-                argv[n++] = "-m";
-                argv[n++] = model;
-            }
-            if (codex_effort_cfg[0]) {
-                argv[n++] = "-c";
-                argv[n++] = codex_effort_cfg;
-            }
-            if (codex_speed_cfg) {
-                argv[n++] = "-c";
-                argv[n++] = codex_speed_cfg;
-            }
-            if (thread->auto_approve) {
-                argv[n++] = "--dangerously-bypass-approvals-and-sandbox";
-            } else {
-                argv[n++] = "-c";
-                argv[n++] = "sandbox_mode=\"workspace-write\"";
-            }
-            argv[n++] = thread->session_id;
-            argv[n++] = prompt;
+        if (!thread->auto_approve) {
+            proto = AGENT_PROTO_CODEX_RPC;
+            argv[n++] = bin;
+            argv[n++] = "app-server";
+            argv[n++] = "--listen";
+            argv[n++] = "stdio://";
         } else {
-            argv[n++] = "--json";
-            argv[n++] = "--skip-git-repo-check";
-            if (thread->workdir[0]) {
-                argv[n++] = "--cd";
-                argv[n++] = thread->workdir;
-            }
-            if (model[0]) {
-                argv[n++] = "-m";
-                argv[n++] = model;
-            }
-            if (codex_effort_cfg[0]) {
-                argv[n++] = "-c";
-                argv[n++] = codex_effort_cfg;
-            }
-            if (codex_speed_cfg) {
-                argv[n++] = "-c";
-                argv[n++] = codex_speed_cfg;
-            }
-            if (thread->auto_approve) {
+            argv[n++] = bin;
+            argv[n++] = "exec";
+            if (thread->session_id[0]) {
+                argv[n++] = "resume";
+                argv[n++] = "--json";
+                argv[n++] = "--skip-git-repo-check";
+                if (model[0]) {
+                    argv[n++] = "-m";
+                    argv[n++] = model;
+                }
+                if (codex_effort_cfg[0]) {
+                    argv[n++] = "-c";
+                    argv[n++] = codex_effort_cfg;
+                }
+                if (codex_speed_cfg) {
+                    argv[n++] = "-c";
+                    argv[n++] = codex_speed_cfg;
+                }
                 argv[n++] = "--dangerously-bypass-approvals-and-sandbox";
+                argv[n++] = thread->session_id;
+                argv[n++] = prompt;
             } else {
-                argv[n++] = "-s";
-                argv[n++] = "workspace-write";
+                argv[n++] = "--json";
+                argv[n++] = "--skip-git-repo-check";
+                if (thread->workdir[0]) {
+                    argv[n++] = "--cd";
+                    argv[n++] = thread->workdir;
+                }
+                if (model[0]) {
+                    argv[n++] = "-m";
+                    argv[n++] = model;
+                }
+                if (codex_effort_cfg[0]) {
+                    argv[n++] = "-c";
+                    argv[n++] = codex_effort_cfg;
+                }
+                if (codex_speed_cfg) {
+                    argv[n++] = "-c";
+                    argv[n++] = codex_speed_cfg;
+                }
+                argv[n++] = "--dangerously-bypass-approvals-and-sandbox";
+                argv[n++] = prompt;
             }
-            argv[n++] = prompt;
         }
     } else { /* APP_AGENT_AGY */
-        argv[n++] = bin;
-        argv[n++] = "-p";
-        argv[n++] = prompt;
-        argv[n++] = "--output-format";
-        argv[n++] = "stream-json";
-        if (thread->session_id[0]) {
-            argv[n++] = "--conversation";
-            argv[n++] = thread->session_id;
-        }
-        if (model[0]) {
-            argv[n++] = "--model";
-            argv[n++] = model;
-        }
-        if (thread->auto_approve) {
-            argv[n++] = "--dangerously-skip-permissions";
-        } else {
-            /* Headless `agy -p` cannot prompt interactively and auto-denies commands under
-             * request-review; run inside the OS terminal sandbox with proceed-in-sandbox
-             * (matching Codex's workspace-write sandbox) while keeping unsandboxed actions gated. */
+        if (!thread->auto_approve) {
+            proto = AGENT_PROTO_AGY_ACP;
+            argv[n++] = bin;
+            argv[n++] = "acp";
+            argv[n++] = "--stdio";
             argv[n++] = "--sandbox";
-            argv[n++] = "--mode";
-            argv[n++] = "accept-edits";
-            argv[n++] = "--settings";
-            argv[n++] = "{\"enableTerminalSandbox\":true,\"toolPermission\":\"proceed-in-sandbox\"}";
+        } else {
+            argv[n++] = bin;
+            argv[n++] = "-p";
+            argv[n++] = prompt;
+            argv[n++] = "--output-format";
+            argv[n++] = "stream-json";
+            if (thread->session_id[0]) {
+                argv[n++] = "--conversation";
+                argv[n++] = thread->session_id;
+            }
+            if (model[0]) {
+                argv[n++] = "--model";
+                argv[n++] = model;
+            }
+            argv[n++] = "--dangerously-skip-permissions";
         }
     }
     argv[n] = NULL;
@@ -2467,6 +3455,17 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
     mcode_agent_run *run = calloc(1, sizeof *run);
     if (!run) return NULL;
     run->agent = thread->agent;
+    run->proto = proto;
+    run->init_prompt = dup_or_null(prompt);
+    if (thread->workdir[0]) snprintf(run->init_cwd, sizeof run->init_cwd, "%s", thread->workdir);
+    if (model[0]) snprintf(run->init_model, sizeof run->init_model, "%s", model);
+    if (thread->reasoning_effort[0]) {
+        snprintf(run->init_effort, sizeof run->init_effort, "%s", thread->reasoning_effort);
+    }
+    run->init_speed = thread->speed_mode;
+    if (thread->session_id[0]) {
+        snprintf(run->init_session_id, sizeof run->init_session_id, "%s", thread->session_id);
+    }
     mcode_str_init(&run->out_line);
     mcode_str_init(&run->err_line);
     mcode_str_init(&run->stderr_tail);
@@ -2474,6 +3473,7 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
 
     mcode_turn *turn = mcode_thread_add_turn(thread, prompt);
     if (!turn) {
+        free(run->init_prompt);
         pthread_mutex_destroy(&run->mu);
         free(run);
         return NULL;
@@ -2484,11 +3484,13 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
     thread->updated_at = mcode_now_epoch();
     thread->scroll_to_bottom_frames = 2;
     thread->status_text[0] = '\0';
+    memset(&thread->pending_approval, 0, sizeof thread->pending_approval);
 
     run->proc = mcode_proc_spawn(&(mcode_proc_desc){
         .argv = argv,
         .cwd = thread->workdir[0] ? thread->workdir : NULL,
         .merge_stderr = false,
+        .open_stdin = (proto != AGENT_PROTO_STREAM),
         .on_bytes = on_proc_bytes,
         .on_exit = on_proc_exit,
         .user = run,
@@ -2498,9 +3500,29 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
         turn->failed = true;
         snprintf(thread->status_text, sizeof thread->status_text, "Launch failed");
         if (err && err_cap) snprintf(err, err_cap, "Failed to spawn %s.", bin);
+        free(run->init_prompt);
         pthread_mutex_destroy(&run->mu);
         free(run);
         return NULL;
+    }
+
+    if (proto == AGENT_PROTO_CLAUDE_CTL) {
+        yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+        if (doc) {
+            yyjson_mut_val *root = yyjson_mut_obj(doc);
+            yyjson_mut_doc_set_root(doc, root);
+            yyjson_mut_obj_add_str(doc, root, "type", "user");
+            yyjson_mut_val *msg = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_str(doc, msg, "role", "user");
+            yyjson_mut_obj_add_strcpy(doc, msg, "content", prompt);
+            yyjson_mut_obj_add_val(doc, root, "message", msg);
+            send_json_doc(run->proc, doc);
+            yyjson_mut_doc_free(doc);
+        }
+    } else if (proto == AGENT_PROTO_CODEX_RPC) {
+        codex_rpc_send_initialize(run);
+    } else if (proto == AGENT_PROTO_AGY_ACP) {
+        agy_acp_send_initialize(run);
     }
 
     thread->active_run = run;
@@ -2540,6 +3562,139 @@ void mcode_agent_stop(mcode_agent_run *run) {
     mcode_proc_stop(run->proc);
 }
 
+bool mcode_agent_respond_approval(mcode_agent_run *run, mcode_thread *thread,
+                                  mcode_approval_decision decision) {
+    if (thread) {
+        memset(&thread->pending_approval, 0, sizeof thread->pending_approval);
+    }
+    if (!run || !run->proc || decision == MCODE_APPROVAL_NONE) return false;
+
+    bool pending = false;
+    approval_rpc_kind kind = APPROVAL_KIND_NONE;
+    bool id_is_str = false;
+    char id_str[128] = "";
+    int64_t id_num = 0;
+    char allow_opt[64] = "";
+    char allow_always_opt[64] = "";
+    char deny_opt[64] = "";
+    bool codex_amend = false;
+    char *payload = NULL;
+
+    pthread_mutex_lock(&run->mu);
+    pending = run->approval_pending;
+    if (pending) {
+        run->approval_pending = false;
+        kind = run->approval_kind;
+        id_is_str = run->approval_rpc_id_is_str;
+        snprintf(id_str, sizeof id_str, "%s", run->approval_rpc_id_str);
+        id_num = run->approval_rpc_id_num;
+        snprintf(allow_opt, sizeof allow_opt, "%s", run->approval_allow_opt);
+        snprintf(allow_always_opt, sizeof allow_always_opt, "%s", run->approval_allow_always_opt);
+        snprintf(deny_opt, sizeof deny_opt, "%s", run->approval_deny_opt);
+        codex_amend = run->approval_codex_use_amendment;
+        payload = run->approval_payload_json;
+        run->approval_payload_json = NULL;
+    }
+    pthread_mutex_unlock(&run->mu);
+
+    if (!pending) {
+        free(payload);
+        return false;
+    }
+
+    bool ok = false;
+    bool allow = (decision == MCODE_APPROVAL_ALLOW_ONCE || decision == MCODE_APPROVAL_ALLOW_SESSION);
+    bool allow_sess = (decision == MCODE_APPROVAL_ALLOW_SESSION);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (doc) {
+        yyjson_mut_val *root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
+
+        if (kind == APPROVAL_KIND_AGY_ACP) {
+            const char *opt = deny_opt[0] ? deny_opt : "deny";
+            if (allow_sess && allow_always_opt[0]) opt = allow_always_opt;
+            else if (allow) opt = allow_opt[0] ? allow_opt : "allow";
+
+            yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
+            rpc_add_saved_id(doc, root, id_is_str, id_str, id_num);
+            yyjson_mut_val *res = yyjson_mut_obj(doc);
+            yyjson_mut_val *out = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_str(doc, out, "outcome", "selected");
+            yyjson_mut_obj_add_strcpy(doc, out, "optionId", opt);
+            yyjson_mut_obj_add_val(doc, res, "outcome", out);
+            yyjson_mut_obj_add_val(doc, root, "result", res);
+            ok = send_json_doc(run->proc, doc);
+        } else if (kind == APPROVAL_KIND_CLAUDE_TOOL) {
+            yyjson_mut_obj_add_str(doc, root, "type", "control_response");
+            yyjson_mut_val *resp = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_str(doc, resp, "subtype", "success");
+            yyjson_mut_obj_add_strcpy(doc, resp, "request_id", id_str);
+            yyjson_mut_val *inner = yyjson_mut_obj(doc);
+            if (allow) {
+                yyjson_mut_obj_add_str(doc, inner, "behavior", "allow");
+                yyjson_mut_val *raw = yyjson_mut_rawcpy(doc, (payload && payload[0]) ? payload : "{}");
+                if (raw) yyjson_mut_obj_add_val(doc, inner, "updatedInput", raw);
+            } else {
+                yyjson_mut_obj_add_str(doc, inner, "behavior", "deny");
+                yyjson_mut_obj_add_str(doc, inner, "message", "User denied permission.");
+            }
+            yyjson_mut_obj_add_val(doc, resp, "response", inner);
+            yyjson_mut_obj_add_val(doc, root, "response", resp);
+            ok = send_json_doc(run->proc, doc);
+        } else if (kind == APPROVAL_KIND_CODEX_CMD) {
+            yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
+            rpc_add_saved_id(doc, root, id_is_str, id_str, id_num);
+            yyjson_mut_val *res = yyjson_mut_obj(doc);
+            if (allow_sess && codex_amend && payload && payload[0]) {
+                yyjson_mut_val *raw = yyjson_mut_rawcpy(doc, payload);
+                if (raw) yyjson_mut_obj_add_val(doc, res, "decision", raw);
+                else yyjson_mut_obj_add_str(doc, res, "decision", "accept");
+            } else if (allow_sess) {
+                yyjson_mut_obj_add_str(doc, res, "decision", "acceptForSession");
+            } else if (allow) {
+                yyjson_mut_obj_add_str(doc, res, "decision", "accept");
+            } else {
+                yyjson_mut_obj_add_str(doc, res, "decision", "decline");
+            }
+            yyjson_mut_obj_add_val(doc, root, "result", res);
+            ok = send_json_doc(run->proc, doc);
+        } else if (kind == APPROVAL_KIND_CODEX_FILE) {
+            yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
+            rpc_add_saved_id(doc, root, id_is_str, id_str, id_num);
+            yyjson_mut_val *res = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_str(doc, res, "decision",
+                                   allow_sess ? "acceptForSession"
+                                              : (allow ? "accept" : "decline"));
+            yyjson_mut_obj_add_val(doc, root, "result", res);
+            ok = send_json_doc(run->proc, doc);
+        } else if (kind == APPROVAL_KIND_CODEX_PERMS) {
+            yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
+            rpc_add_saved_id(doc, root, id_is_str, id_str, id_num);
+            yyjson_mut_val *res = yyjson_mut_obj(doc);
+            if (allow && payload && payload[0]) {
+                yyjson_mut_val *raw = yyjson_mut_rawcpy(doc, payload);
+                if (raw) yyjson_mut_obj_add_val(doc, res, "permissions", raw);
+                else yyjson_mut_obj_add_val(doc, res, "permissions", yyjson_mut_obj(doc));
+            } else {
+                yyjson_mut_obj_add_val(doc, res, "permissions", yyjson_mut_obj(doc));
+            }
+            yyjson_mut_obj_add_str(doc, res, "scope", allow_sess ? "session" : "turn");
+            yyjson_mut_obj_add_val(doc, root, "result", res);
+            ok = send_json_doc(run->proc, doc);
+        }
+
+        yyjson_mut_doc_free(doc);
+    }
+
+    free(payload);
+    if (ok && thread) {
+        snprintf(thread->status_text, sizeof thread->status_text, "%s",
+                 allow ? "Approved — continuing..." : "Denied — continuing...");
+    }
+    return ok;
+}
+
 void mcode_agent_destroy(mcode_agent_run *run) {
     if (!run) return;
     if (run->proc) {
@@ -2549,12 +3704,15 @@ void mcode_agent_destroy(mcode_agent_run *run) {
     pthread_mutex_lock(&run->mu);
     agent_ev *cur = run->head;
     run->head = run->tail = NULL;
+    free(run->approval_payload_json);
+    run->approval_payload_json = NULL;
     pthread_mutex_unlock(&run->mu);
     while (cur) {
         agent_ev *next = cur->next;
         ev_free(cur);
         cur = next;
     }
+    free(run->init_prompt);
     mcode_str_free(&run->out_line);
     mcode_str_free(&run->err_line);
     mcode_str_free(&run->stderr_tail);

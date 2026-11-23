@@ -31,10 +31,11 @@ static bool draw_thread_card(mcode_app *app, cui_ctx *ui, int idx, bool show_pro
     const mcode_project *p = mcode_store_find_project(&app->store, t->project_id);
     bool is_selected = strcmp(app->store.selected_thread_id, t->id) == 0;
     bool running = (t->active_run != NULL);
+    bool needs_review = (running && t->pending_approval.active);
     bool last_failed = (t->turn_count > 0 && t->turns[t->turn_count - 1].failed);
 
     cui_push_id(ui, t->id);
-    bool clicked = cui_card_begin(ui, &(cui_card_opts){
+    cui_card_opts card_opts = {
         .id = "tcard",
         .width = CUI_FILL,
         .pad_x = 9,
@@ -43,11 +44,17 @@ static bool draw_thread_card(mcode_app *app, cui_ctx *ui, int idx, bool show_pro
         .hoverable = true,
         .selected = is_selected,
         .radius = 8,
-    });
+    };
+    if (needs_review && !is_selected) {
+        card_opts.bg = cui_alpha(cui_color_of(ui, CUI_COLOR_WARNING), 0.08f);
+    }
+    bool clicked = cui_card_begin(ui, &card_opts);
 
     /* Top row: live status indicator + title + timer/diff */
     cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
-        if (running) {
+        if (needs_review) {
+            cui_icon(ui, CUI_ICON_SHIELD, 13, CUI_COLOR_WARNING);
+        } else if (running) {
             cui_spinner(ui, 12);
         } else if (last_failed) {
             cui_icon(ui, CUI_ICON_CIRCLE_ALERT, 13, CUI_COLOR_DANGER);
@@ -65,7 +72,9 @@ static bool draw_thread_card(mcode_app *app, cui_ctx *ui, int idx, bool show_pro
                  .color = (t->state == MCODE_THREAD_SNOOZED) ? CUI_COLOR_TEXT_SECONDARY : CUI_COLOR_FOREGROUND,
                  .width = CUI_FILL, .nowrap = true);
 
-        if (running) {
+        if (needs_review) {
+            cui_badge(ui, "Review", .tone = CUI_TONE_WARNING, .dot = true, .size = CUI_SIZE_SM);
+        } else if (running) {
             char elapsed[24];
             float secs = (float)(mcode_now_mono() - t->run_started_mono);
             mcode_ui_format_elapsed(secs, elapsed, sizeof elapsed);
@@ -169,13 +178,17 @@ static bool draw_project_section(mcode_app *app, cui_ctx *ui, int proj_idx) {
     int open_count = 0;
     int matching_open_count = 0;
     int running_count = 0;
+    int review_count = 0;
     bool has_selected_thread = false;
     for (int i = 0; i < app->store.thread_count; ++i) {
         const mcode_thread *t = &app->store.threads[i];
         if (strcmp(t->project_id, proj_id) != 0) continue;
         if (t->state == MCODE_THREAD_SETTLED) continue;
         ++open_count;
-        if (t->active_run) ++running_count;
+        if (t->active_run) {
+            ++running_count;
+            if (t->pending_approval.active) ++review_count;
+        }
         if (strcmp(app->store.selected_thread_id, t->id) == 0) has_selected_thread = true;
         if (proj_name_matches || thread_matches_query(app, t, p)) ++matching_open_count;
     }
@@ -222,7 +235,12 @@ static bool draw_project_section(mcode_app *app, cui_ctx *ui, int proj_idx) {
                      14, is_active_proj ? CUI_COLOR_ACCENT : CUI_COLOR_TEXT_SECONDARY);
             cui_text(ui, p->name, .font = CUI_FONT_MEDIUM, .size = 13,
                      .color = CUI_COLOR_FOREGROUND, .width = CUI_FILL, .nowrap = true);
-            if (running_count > 0) {
+            if (review_count > 0) {
+                char rlbl[24];
+                if (review_count == 1) snprintf(rlbl, sizeof rlbl, "Review");
+                else snprintf(rlbl, sizeof rlbl, "Review (%d)", review_count);
+                cui_badge(ui, rlbl, .tone = CUI_TONE_WARNING, .dot = true, .size = CUI_SIZE_SM);
+            } else if (running_count > 0) {
                 cui_spinner(ui, 12);
             } else if (!expanded && open_count > 0) {
                 char cnt[16];

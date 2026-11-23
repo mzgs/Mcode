@@ -17,6 +17,10 @@ struct mcode_proc {
     int dummy;
 };
 mcode_proc *mcode_proc_spawn(const mcode_proc_desc *desc) { (void)desc; return NULL; }
+bool mcode_proc_write(mcode_proc *proc, const char *data, size_t len) {
+    (void)proc; (void)data; (void)len; return false;
+}
+void mcode_proc_close_stdin(mcode_proc *proc) { (void)proc; }
 mcode_proc *mcode_proc_spawn_shell(const char *command, const char *cwd,
                                    mcode_proc_bytes_fn on_bytes,
                                    mcode_proc_exit_fn on_exit, void *user) {
@@ -48,6 +52,7 @@ bool mcode_find_executable(const char *name_or_path, char *out, size_t cap) {
 
 struct mcode_proc {
     pid_t pid;
+    int stdin_fd;
     int stdout_fd;
     int stderr_fd;
     mcode_proc_bytes_fn on_bytes;
@@ -57,6 +62,7 @@ struct mcode_proc {
     pthread_t thread;
     bool thread_started;
     pthread_mutex_t mu;
+    pthread_mutex_t write_mu;
     bool running;
     bool stop_requested;
 };
@@ -249,17 +255,31 @@ static void *proc_reader_main(void *arg) {
 mcode_proc *mcode_proc_spawn(const mcode_proc_desc *desc) {
     if (!desc || !desc->argv || !desc->argv[0] || !desc->argv[0][0]) return NULL;
 
+    int in_pipe[2] = { -1, -1 };
     int out_pipe[2] = { -1, -1 };
     int err_pipe[2] = { -1, -1 };
-    if (pipe(out_pipe) != 0) return NULL;
+    if (desc->open_stdin) {
+        if (pipe(in_pipe) != 0) return NULL;
+    }
+    if (pipe(out_pipe) != 0) {
+        if (in_pipe[0] >= 0) { close(in_pipe[0]); close(in_pipe[1]); }
+        return NULL;
+    }
     if (!desc->merge_stderr) {
         if (pipe(err_pipe) != 0) {
+            if (in_pipe[0] >= 0) { close(in_pipe[0]); close(in_pipe[1]); }
             close(out_pipe[0]);
             close(out_pipe[1]);
             return NULL;
         }
     }
 
+    if (in_pipe[1] >= 0) {
+        set_cloexec(in_pipe[1]);
+#ifdef F_SETNOSIGPIPE
+        (void)fcntl(in_pipe[1], F_SETNOSIGPIPE, 1);
+#endif
+    }
     set_cloexec(out_pipe[0]);
     if (err_pipe[0] >= 0) set_cloexec(err_pipe[0]);
 
@@ -268,6 +288,7 @@ mcode_proc *mcode_proc_spawn(const mcode_proc_desc *desc) {
     while (desc->argv[argc]) ++argc;
     char **child_argv = calloc(argc + 1, sizeof(char *));
     if (!child_argv) {
+        if (in_pipe[0] >= 0) { close(in_pipe[0]); close(in_pipe[1]); }
         close(out_pipe[0]); close(out_pipe[1]);
         if (err_pipe[0] >= 0) { close(err_pipe[0]); close(err_pipe[1]); }
         return NULL;
@@ -282,6 +303,7 @@ mcode_proc *mcode_proc_spawn(const mcode_proc_desc *desc) {
         for (size_t i = 0; i < argc; ++i) free(child_argv[i]);
         free(child_argv);
         free(child_cwd);
+        if (in_pipe[0] >= 0) { close(in_pipe[0]); close(in_pipe[1]); }
         close(out_pipe[0]); close(out_pipe[1]);
         if (err_pipe[0] >= 0) { close(err_pipe[0]); close(err_pipe[1]); }
         return NULL;
@@ -290,10 +312,16 @@ mcode_proc *mcode_proc_spawn(const mcode_proc_desc *desc) {
     if (pid == 0) {
         /* Child process */
         setpgid(0, 0);
-        int devnull = open("/dev/null", O_RDONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDIN_FILENO);
-            if (devnull > 2) close(devnull);
+        if (in_pipe[0] >= 0) {
+            dup2(in_pipe[0], STDIN_FILENO);
+            close(in_pipe[0]);
+            close(in_pipe[1]);
+        } else {
+            int devnull = open("/dev/null", O_RDONLY);
+            if (devnull >= 0) {
+                dup2(devnull, STDIN_FILENO);
+                if (devnull > 2) close(devnull);
+            }
         }
         dup2(out_pipe[1], STDOUT_FILENO);
         if (desc->merge_stderr) {
@@ -320,11 +348,13 @@ mcode_proc *mcode_proc_spawn(const mcode_proc_desc *desc) {
     free(child_argv);
     free(child_cwd);
 
+    if (in_pipe[0] >= 0) close(in_pipe[0]);
     close(out_pipe[1]);
     if (err_pipe[1] >= 0) close(err_pipe[1]);
 
     mcode_proc *proc = calloc(1, sizeof *proc);
     if (!proc) {
+        if (in_pipe[1] >= 0) close(in_pipe[1]);
         close(out_pipe[0]);
         if (err_pipe[0] >= 0) close(err_pipe[0]);
         kill(-pid, SIGKILL);
@@ -332,6 +362,7 @@ mcode_proc *mcode_proc_spawn(const mcode_proc_desc *desc) {
         return NULL;
     }
     proc->pid = pid;
+    proc->stdin_fd = in_pipe[1];
     proc->stdout_fd = out_pipe[0];
     proc->stderr_fd = err_pipe[0];
     proc->on_bytes = desc->on_bytes;
@@ -339,18 +370,58 @@ mcode_proc *mcode_proc_spawn(const mcode_proc_desc *desc) {
     proc->user = desc->user;
     proc->running = true;
     pthread_mutex_init(&proc->mu, NULL);
+    pthread_mutex_init(&proc->write_mu, NULL);
 
     if (pthread_create(&proc->thread, NULL, proc_reader_main, proc) != 0) {
+        if (proc->stdin_fd >= 0) close(proc->stdin_fd);
         close(proc->stdout_fd);
         if (proc->stderr_fd >= 0) close(proc->stderr_fd);
         kill(-pid, SIGKILL);
         waitpid(pid, NULL, 0);
+        pthread_mutex_destroy(&proc->write_mu);
         pthread_mutex_destroy(&proc->mu);
         free(proc);
         return NULL;
     }
     proc->thread_started = true;
     return proc;
+}
+
+bool mcode_proc_write(mcode_proc *proc, const char *data, size_t len) {
+    if (!proc || !data || len == 0) return false;
+    pthread_mutex_lock(&proc->write_mu);
+    int fd = proc->stdin_fd;
+    if (fd < 0) {
+        pthread_mutex_unlock(&proc->write_mu);
+        return false;
+    }
+    const char *p = data;
+    size_t rem = len;
+    bool ok = true;
+    while (rem > 0) {
+        ssize_t n = write(fd, p, rem);
+        if (n > 0) {
+            p += (size_t)n;
+            rem -= (size_t)n;
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            ok = false;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&proc->write_mu);
+    return ok;
+}
+
+void mcode_proc_close_stdin(mcode_proc *proc) {
+    if (!proc) return;
+    pthread_mutex_lock(&proc->write_mu);
+    if (proc->stdin_fd >= 0) {
+        close(proc->stdin_fd);
+        proc->stdin_fd = -1;
+    }
+    pthread_mutex_unlock(&proc->write_mu);
 }
 
 mcode_proc *mcode_proc_spawn_shell(const char *command, const char *cwd,
@@ -373,6 +444,7 @@ mcode_proc *mcode_proc_spawn_shell(const char *command, const char *cwd,
 
 void mcode_proc_stop(mcode_proc *proc) {
     if (!proc) return;
+    mcode_proc_close_stdin(proc);
     pthread_mutex_lock(&proc->mu);
     bool running = proc->running;
     proc->stop_requested = true;
@@ -395,6 +467,7 @@ bool mcode_proc_is_running(const mcode_proc *proc) {
 
 void mcode_proc_destroy(mcode_proc *proc) {
     if (!proc) return;
+    mcode_proc_close_stdin(proc);
     if (mcode_proc_is_running(proc)) {
         mcode_proc_stop(proc);
         /* Give graceful SIGTERM a brief chance before escalating */
@@ -409,6 +482,7 @@ void mcode_proc_destroy(mcode_proc *proc) {
     if (proc->thread_started) {
         pthread_join(proc->thread, NULL);
     }
+    pthread_mutex_destroy(&proc->write_mu);
     pthread_mutex_destroy(&proc->mu);
     free(proc);
 }
@@ -465,6 +539,8 @@ bool mcode_proc_run_capture(const char *const *argv, const char *cwd,
         pthread_join(proc->thread, NULL);
         proc->thread_started = false;
     }
+    mcode_proc_close_stdin(proc);
+    pthread_mutex_destroy(&proc->write_mu);
     pthread_mutex_destroy(&proc->mu);
     free(proc);
     pthread_mutex_destroy(&ctx.mu);

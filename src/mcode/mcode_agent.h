@@ -110,6 +110,10 @@ bool mcode_agent_poll(mcode_agent_run *run, mcode_thread *thread, bool *out_fini
 /* Request stopping an active agent run. */
 void mcode_agent_stop(mcode_agent_run *run);
 
+/* Respond to the active interactive tool approval prompt (if any) and clear it on `thread`. */
+bool mcode_agent_respond_approval(mcode_agent_run *run, mcode_thread *thread,
+                                  mcode_approval_decision decision);
+
 /* Destroy an agent run (stops and joins background thread if still active). */
 void mcode_agent_destroy(mcode_agent_run *run);
 

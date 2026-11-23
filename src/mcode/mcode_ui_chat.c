@@ -831,6 +831,60 @@ static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int tur
             }
         }
 
+        if (is_last_turn && turn->running && thread->pending_approval.active) {
+            const mcode_pending_approval *pa = &thread->pending_approval;
+            bool can_allow_session = pa->can_allow_session;
+            cui_column(ui, .width = CUI_FILL, .pad = 14, .gap = 10, .radius = 10,
+                       .border = 1,
+                       .border_color = cui_alpha(cui_color_of(ui, CUI_COLOR_WARNING), 0.55f),
+                       .bg = cui_alpha(cui_color_of(ui, CUI_COLOR_WARNING), 0.08f)) {
+                cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
+                    cui_icon(ui, CUI_ICON_SHIELD, 16, CUI_COLOR_WARNING);
+                    cui_text(ui, pa->title[0] ? pa->title : "Approval required",
+                             .font = CUI_FONT_MEDIUM, .size = 13.5f);
+                    if (pa->tool_name[0]) {
+                        cui_badge(ui, pa->tool_name, .tone = CUI_TONE_WARNING, .size = CUI_SIZE_SM);
+                    }
+                }
+                if (pa->reason[0]) {
+                    cui_text(ui, pa->reason, .size = 12.5f,
+                             .color = CUI_COLOR_TEXT_SECONDARY, .width = CUI_FILL);
+                }
+                const char *preview = pa->command[0] ? pa->command
+                                    : (pa->details[0] ? pa->details : NULL);
+                if (preview) {
+                    cui_column(ui, .id = "approval-preview", .width = CUI_FILL,
+                               .max_height = 140, .scroll_y = true,
+                               .pad_x = 10, .pad_y = 8, .radius = 7, .border = 1,
+                               .border_color = CUI_COLOR_BORDER,
+                               .bg = CUI_COLOR_SURFACE) {
+                        cui_text(ui, preview, .font = CUI_FONT_MONO, .size = 12,
+                                 .color = CUI_COLOR_FOREGROUND, .selectable = true,
+                                 .width = CUI_FILL);
+                    }
+                }
+                cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER, .wrap = true) {
+                    if (cui_button(ui, "Approve", .variant = CUI_BUTTON_PRIMARY,
+                                   .size = CUI_SIZE_SM, .icon = CUI_ICON_CHECK)) {
+                        mcode_agent_respond_approval(thread->active_run, thread,
+                                                     MCODE_APPROVAL_ALLOW_ONCE);
+                    }
+                    if (can_allow_session) {
+                        if (cui_button(ui, "Allow for session", .variant = CUI_BUTTON_SECONDARY,
+                                       .size = CUI_SIZE_SM, .icon = CUI_ICON_CHECK)) {
+                            mcode_agent_respond_approval(thread->active_run, thread,
+                                                         MCODE_APPROVAL_ALLOW_SESSION);
+                        }
+                    }
+                    if (cui_button(ui, "Deny", .variant = CUI_BUTTON_OUTLINE,
+                                   .size = CUI_SIZE_SM, .icon = CUI_ICON_X)) {
+                        mcode_agent_respond_approval(thread->active_run, thread,
+                                                     MCODE_APPROVAL_DENY);
+                    }
+                }
+            }
+        }
+
         if (turn->running) {
             float live_secs = (turn->started_mono > 0.0)
                 ? (float)(mcode_now_mono() - turn->started_mono)
@@ -1527,7 +1581,7 @@ static void draw_composer_options_strip(mcode_app *app, cui_ctx *ui, mcode_threa
         }
         cui_tooltip(ui, thread->auto_approve
             ? "Auto-approve enabled: bypasses sandbox and permission prompts"
-            : "Sandboxed execution: click to auto-approve unsandboxed commands and actions");
+            : "Interactive approval: prompts you to Approve or Deny restricted actions");
     }
 }
 
