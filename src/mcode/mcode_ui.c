@@ -641,7 +641,14 @@ void mcode_ui_send_prompt(mcode_app *app, cui_ctx *ui, mcode_thread *thread, con
                 mcode_agent_title_destroy(thread->title_run);
                 thread->title_run = NULL;
             }
-            thread->title_run = mcode_agent_start_title(thread, settings, prompt);
+            thread->title_pending = false;
+            if (thread->agent == APP_AGENT_AGY) {
+                /* Defer agy title generation until the turn completes so two concurrent
+                 * `agy -p` processes do not race on agy's local trajectory database. */
+                thread->title_pending = true;
+            } else {
+                thread->title_run = mcode_agent_start_title(thread, settings, prompt);
+            }
         }
         mcode_ui_mark_dirty(app);
     }
@@ -790,6 +797,34 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
             app_chrome_notify(app->chrome, ui, msg, CUI_TONE_SUCCESS);
         } else {
             ++running;
+        }
+    }
+
+    /* Launch at most one deferred Antigravity title request once no `agy` turn/title is active. */
+    bool agy_busy = false;
+    for (int i = 0; i < app->store.thread_count; ++i) {
+        const mcode_thread *t = &app->store.threads[i];
+        if (t->agent == APP_AGENT_AGY && (t->active_run || t->title_run)) {
+            agy_busy = true;
+            break;
+        }
+    }
+    if (!agy_busy) {
+        const app_settings *settings = app_chrome_settings(app->chrome);
+        for (int i = 0; i < app->store.thread_count; ++i) {
+            mcode_thread *t = &app->store.threads[i];
+            if (!t->title_pending || t->active_run || t->title_run) continue;
+            t->title_pending = false;
+            if (t->turn_count > 0 && !t->turns[0].failed &&
+                t->title_auto_fallback[0] &&
+                strcmp(t->title, t->title_auto_fallback) == 0 &&
+                t->turns[0].prompt.len > 0) {
+                t->title_run = mcode_agent_start_title(t, settings, mcode_str_cstr(&t->turns[0].prompt));
+                if (t->title_run) {
+                    ++title_running;
+                    break;
+                }
+            }
         }
     }
 

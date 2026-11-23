@@ -177,7 +177,9 @@ static void summarize_tool_input(yyjson_val *input, char *detail, size_t cap) {
     detail[0] = '\0';
     if (!yyjson_is_obj(input)) return;
     static const char *const keys[] = {
-        "file_path", "path", "command", "cmd", "pattern", "query", "url", "description", "prompt"
+        "file_path", "path", "Path", "AbsolutePath", "TargetFile", "DirectoryPath", "SearchPath",
+        "command", "cmd", "CommandLine",
+        "pattern", "Pattern", "query", "Query", "url", "Url", "description", "prompt", "Prompt"
     };
     for (size_t i = 0; i < sizeof keys / sizeof keys[0]; ++i) {
         const char *v = jstr(input, keys[i]);
@@ -901,6 +903,7 @@ bool mcode_tool_is_benign_probe_failure(const char *tool_name, const char *input
             yyjson_val *root = yyjson_doc_get_root(doc);
             const char *jcmd = jstr(root, "command");
             if (!jcmd) jcmd = jstr(root, "cmd");
+            if (!jcmd) jcmd = jstr(root, "CommandLine");
             bool res = jcmd ? mcode_command_is_benign_probe_exit(jcmd, output, exit_code) : false;
             yyjson_doc_free(doc);
             return res;
@@ -1042,14 +1045,206 @@ static void parse_codex_json(mcode_agent_run *run, yyjson_val *root) {
 }
 
 /* ---- Antigravity CLI (`agy`) stream-json parser ---- */
+static void emit_agy_usage(mcode_agent_run *run, yyjson_val *usage) {
+    if (!yyjson_is_obj(usage)) return;
+    agent_ev *uev = calloc(1, sizeof *uev);
+    if (!uev) return;
+    uev->kind = EV_USAGE;
+    yyjson_val *in_v = yyjson_obj_get(usage, "input_tokens");
+    yyjson_val *out_v = yyjson_obj_get(usage, "output_tokens");
+    if (yyjson_is_num(in_v)) uev->int_a = (int)yyjson_get_num(in_v);
+    if (yyjson_is_num(out_v)) uev->int_b = (int)yyjson_get_num(out_v);
+    push_ev(run, uev);
+}
+
+static void parse_agy_result_obj(mcode_agent_run *run, yyjson_val *res) {
+    if (!yyjson_is_obj(res)) return;
+    const char *cid = jstr(res, "conversation_id");
+    if (!cid) cid = jstr(res, "session_id");
+    if (cid && cid[0]) emit_simple(run, EV_SESSION, cid);
+
+    emit_simple(run, EV_REASONING_DONE, NULL);
+
+    const char *status = jstr(res, "status");
+    const char *err_s = jstr(res, "error");
+    const char *resp = jstr(res, "response");
+
+    bool is_err = (err_s && err_s[0]) ||
+                  (status && status[0] &&
+                   strcmp(status, "SUCCESS") != 0 &&
+                   strcmp(status, "CANCELED") != 0);
+    if (is_err) {
+        if (err_s && err_s[0]) {
+            emit_simple(run, EV_ERROR, err_s);
+        } else {
+            char msg[128];
+            snprintf(msg, sizeof msg, "Antigravity CLI ended with status: %s",
+                     (status && status[0]) ? status : "ERROR");
+            emit_simple(run, EV_ERROR, msg);
+        }
+    } else if (resp && resp[0]) {
+        emit_simple(run, EV_TEXT_FALLBACK, resp);
+    }
+
+    emit_agy_usage(run, yyjson_obj_get(res, "usage"));
+}
+
 static void parse_agy_json(mcode_agent_run *run, yyjson_val *root) {
     const char *cid = jstr(root, "conversation_id");
     if (!cid) cid = jstr(root, "session_id");
     if (!cid) cid = jstr(root, "conversationId");
     if (cid && cid[0]) emit_simple(run, EV_SESSION, cid);
 
+    const char *event = jstr(root, "event");
+
+    /* Official `agy --output-format stream-json` envelope:
+     *   {"event":"init","conversation_id":"...","init":{...}}
+     *   {"event":"step_update","step_update":{...}}
+     *   {"event":"result","result":{...}} */
+    if (event) {
+        if (strcmp(event, "init") == 0) {
+            return;
+        }
+
+        if (strcmp(event, "step_update") == 0) {
+            yyjson_val *su = yyjson_obj_get(root, "step_update");
+            if (!yyjson_is_obj(su)) return;
+
+            const char *scid = jstr(su, "conversation_id");
+            if (scid && scid[0]) emit_simple(run, EV_SESSION, scid);
+
+            const char *step_type = jstr(su, "step_type");
+            const char *state = jstr(su, "state");
+            bool is_done = state && (strcmp(state, "DONE") == 0 ||
+                                     strcmp(state, "ERROR") == 0 ||
+                                     strcmp(state, "FAILED") == 0);
+            bool state_err = state && (strcmp(state, "ERROR") == 0 ||
+                                       strcmp(state, "FAILED") == 0);
+
+            char step_id[64] = "";
+            yyjson_val *si_v = yyjson_obj_get(su, "step_index");
+            if (yyjson_is_int(si_v)) {
+                snprintf(step_id, sizeof step_id, "agy-step-%lld",
+                         (long long)yyjson_get_sint(si_v));
+            } else if (yyjson_is_num(si_v)) {
+                snprintf(step_id, sizeof step_id, "agy-step-%lld",
+                         (long long)yyjson_get_num(si_v));
+            }
+
+            if (step_type && (strcmp(step_type, "user_input") == 0 ||
+                              strcmp(step_type, "checkpoint") == 0)) {
+                return;
+            }
+
+            if (step_type && strcmp(step_type, "agent_response") == 0) {
+                const char *th = jstr(su, "thinking_delta");
+                if (!th) th = jstr(su, "reasoning_delta");
+                if (!th) th = jstr(su, "thought_delta");
+                if (th && th[0]) {
+                    run->streamed_thinking_deltas = true;
+                    emit_simple(run, EV_REASONING_DELTA, th);
+                    emit_simple(run, EV_STATUS, "Thinking...");
+                }
+
+                const char *td = jstr(su, "text_delta");
+                if (!td) td = jstr(su, "delta");
+                if (!td) td = jstr(su, "text");
+                if (td && td[0]) {
+                    run->streamed_text_deltas = true;
+                    emit_simple(run, EV_REASONING_DONE, NULL);
+                    emit_simple(run, EV_TEXT_DELTA, td);
+                    emit_simple(run, EV_STATUS, "Responding...");
+                } else if (is_done) {
+                    emit_simple(run, EV_REASONING_DONE, NULL);
+                } else if (state && strcmp(state, "ACTIVE") == 0) {
+                    emit_simple(run, EV_STATUS, "Thinking...");
+                }
+                return;
+            }
+
+            yyjson_val *ti = yyjson_obj_get(su, "tool_info");
+            if ((step_type && strcmp(step_type, "tool") == 0) || yyjson_is_obj(ti)) {
+                const char *tname = jstr(su, "tool_name");
+                if (!tname && yyjson_is_obj(ti)) tname = jstr(ti, "name");
+                if (!tname || !tname[0]) tname = "tool";
+                const char *tid = step_id[0] ? step_id : tname;
+
+                yyjson_val *params = yyjson_is_obj(ti) ? yyjson_obj_get(ti, "parameters") : NULL;
+                char detail[256] = "";
+                summarize_tool_input(params, detail, sizeof detail);
+                char *inp_json = stringify_json_val(params);
+                emit_tool_start(run, tid, tname, detail, inp_json ? inp_json : "");
+                free(inp_json);
+
+                if (!is_done) {
+                    char st[160];
+                    if (detail[0]) snprintf(st, sizeof st, "%s: %s", tname, detail);
+                    else snprintf(st, sizeof st, "Running %s...", tname);
+                    emit_simple(run, EV_STATUS, st);
+                } else {
+                    yyjson_val *err_v = yyjson_is_obj(ti) ? yyjson_obj_get(ti, "error") : NULL;
+                    yyjson_val *out_v = yyjson_is_obj(ti) ? yyjson_obj_get(ti, "output") : NULL;
+                    bool failed = state_err || (err_v != NULL && !yyjson_is_null(err_v));
+
+                    char *out_s = NULL;
+                    if (err_v && !yyjson_is_null(err_v)) {
+                        const char *emsg = yyjson_is_obj(err_v) ? jstr(err_v, "message") : NULL;
+                        if (emsg && emsg[0]) out_s = strdup(emsg);
+                        else out_s = stringify_json_val(err_v);
+                    }
+                    if ((!out_s || !out_s[0]) && out_v && !yyjson_is_null(out_v)) {
+                        free(out_s);
+                        out_s = stringify_json_val(out_v);
+                    }
+                    emit_tool_result(run, tid, out_s ? out_s : "", failed);
+                    free(out_s);
+                }
+                return;
+            }
+
+            yyjson_val *sub_info = yyjson_obj_get(su, "subagent_info");
+            if (yyjson_is_obj(sub_info)) {
+                const char *tid = step_id[0] ? step_id : "subagent";
+                char detail[256] = "";
+                yyjson_val *subs = yyjson_obj_get(sub_info, "subagents");
+                if (yyjson_is_arr(subs) && yyjson_arr_size(subs) > 0) {
+                    yyjson_val *first = yyjson_arr_get_first(subs);
+                    const char *role = jstr(first, "role");
+                    if (!role || !role[0]) role = jstr(first, "type_name");
+                    if (role && role[0]) snprintf(detail, sizeof detail, "%s", role);
+                }
+                char *sub_json = stringify_json_val(sub_info);
+                emit_tool_start(run, tid, "subagent", detail, sub_json ? sub_json : "");
+                if (is_done) {
+                    emit_tool_result(run, tid, sub_json ? sub_json : "", state_err);
+                } else {
+                    char st[160];
+                    if (detail[0]) snprintf(st, sizeof st, "Subagent: %s", detail);
+                    else snprintf(st, sizeof st, "Running subagent...");
+                    emit_simple(run, EV_STATUS, st);
+                }
+                free(sub_json);
+            }
+            return;
+        }
+
+        if (strcmp(event, "result") == 0) {
+            yyjson_val *res = yyjson_obj_get(root, "result");
+            if (yyjson_is_obj(res)) {
+                parse_agy_result_obj(run, res);
+                return;
+            }
+        }
+    }
+
     const char *type = jstr(root, "type");
-    if (!type) type = jstr(root, "event");
+    if (!type) type = event;
+
+    /* Single `--output-format json` result envelope at top level */
+    if (!type && (yyjson_obj_get(root, "response") || yyjson_obj_get(root, "status"))) {
+        parse_agy_result_obj(run, root);
+        return;
+    }
 
     if (type && (strcmp(type, "error") == 0 || strcmp(type, "failed") == 0)) {
         const char *msg = jstr(root, "message");
@@ -1104,29 +1299,19 @@ static void parse_agy_json(mcode_agent_run *run, yyjson_val *root) {
         return;
     }
 
-    /* Text delta or final text */
+    /* Flat text delta or final text fallback */
     const char *txt = jstr(root, "delta");
     if (!txt) txt = jstr(root, "text");
     if (!txt) txt = jstr(root, "content");
     if (!txt) txt = jstr(root, "result");
+    if (!txt) txt = jstr(root, "response");
     if (txt && txt[0]) {
         emit_simple(run, EV_REASONING_DONE, NULL);
         emit_simple(run, EV_TEXT_DELTA, txt);
         emit_simple(run, EV_STATUS, "Responding...");
     }
 
-    yyjson_val *usage = yyjson_obj_get(root, "usage");
-    if (yyjson_is_obj(usage)) {
-        agent_ev *uev = calloc(1, sizeof *uev);
-        if (uev) {
-            uev->kind = EV_USAGE;
-            yyjson_val *in_v = yyjson_obj_get(usage, "input_tokens");
-            yyjson_val *out_v = yyjson_obj_get(usage, "output_tokens");
-            if (yyjson_is_num(in_v)) uev->int_a = (int)yyjson_get_num(in_v);
-            if (yyjson_is_num(out_v)) uev->int_b = (int)yyjson_get_num(out_v);
-            push_ev(run, uev);
-        }
-    }
+    emit_agy_usage(run, yyjson_obj_get(root, "usage"));
 }
 
 static void handle_line(mcode_agent_run *run, const char *line, bool is_stderr) {
@@ -1339,8 +1524,45 @@ static void apply_event(mcode_thread *thread, mcode_turn *turn, const agent_ev *
         break;
     case EV_ERROR: {
         if (ev->text && ev->text[0]) {
-            mcode_block *b = mcode_turn_add_block(turn, MCODE_BLOCK_ERROR);
-            if (b) mcode_str_set(&b->text, ev->text);
+            const char *new_norm = ev->text;
+            while (*new_norm == ' ' || *new_norm == '\t') ++new_norm;
+            bool new_has_prefix = false;
+            if ((strncmp(new_norm, "error:", 6) == 0 || strncmp(new_norm, "Error:", 6) == 0)) {
+                new_has_prefix = true;
+                new_norm += 6;
+                while (*new_norm == ' ' || *new_norm == '\t') ++new_norm;
+            }
+            size_t new_nlen = strlen(new_norm);
+
+            /* Deduplicate when both stderr ("error: ...") and stdout JSON report the same error. */
+            mcode_block *dup = NULL;
+            for (int i = turn->block_count - 1; i >= 0; --i) {
+                if (turn->blocks[i].kind != MCODE_BLOCK_ERROR) continue;
+                const char *old_s = mcode_str_cstr(&turn->blocks[i].text);
+                const char *old_norm = old_s;
+                while (*old_norm == ' ' || *old_norm == '\t') ++old_norm;
+                bool old_has_prefix = false;
+                if ((strncmp(old_norm, "error:", 6) == 0 || strncmp(old_norm, "Error:", 6) == 0)) {
+                    old_has_prefix = true;
+                    old_norm += 6;
+                    while (*old_norm == ' ' || *old_norm == '\t') ++old_norm;
+                }
+                size_t old_nlen = strlen(old_norm);
+                if (old_nlen > 0 && new_nlen > 0 &&
+                    (strcmp(old_norm, new_norm) == 0 ||
+                     (new_nlen > old_nlen && strncmp(new_norm, old_norm, old_nlen) == 0) ||
+                     (old_nlen > new_nlen && strncmp(old_norm, new_norm, new_nlen) == 0))) {
+                    dup = &turn->blocks[i];
+                    if (new_nlen > old_nlen || (new_nlen == old_nlen && old_has_prefix && !new_has_prefix)) {
+                        mcode_str_set(&dup->text, ev->text);
+                    }
+                }
+                break;
+            }
+            if (!dup) {
+                mcode_block *b = mcode_turn_add_block(turn, MCODE_BLOCK_ERROR);
+                if (b) mcode_str_set(&b->text, ev->text);
+            }
             turn->failed = true;
             thread->scroll_to_bottom_frames = 2;
         }
@@ -2531,37 +2753,74 @@ bool mcode_agent_parse_title_response(app_agent_kind agent, const char *raw, siz
                             }
                         }
                     } else { /* APP_AGENT_AGY */
+                        const char *event = jstr(root, "event");
                         const char *type = jstr(root, "type");
-                        if (!type) type = jstr(root, "event");
-                        yyjson_val *err_v = yyjson_obj_get(root, "is_error");
-                        bool is_err = yyjson_is_bool(err_v) && yyjson_get_bool(err_v);
-                        if (is_err || (type && (strcmp(type, "error") == 0 || strcmp(type, "failed") == 0))) {
-                            saw_error = true;
-                        } else if (type && (strcmp(type, "thinking") == 0 ||
-                                            strcmp(type, "reasoning") == 0 ||
-                                            strcmp(type, "thought") == 0 ||
-                                            strcmp(type, "tool_use") == 0 ||
-                                            strcmp(type, "tool_call") == 0 ||
-                                            strcmp(type, "function_call") == 0 ||
-                                            strcmp(type, "tool_result") == 0 ||
-                                            strcmp(type, "function_response") == 0 ||
-                                            strcmp(type, "system") == 0)) {
-                            /* Ignore non-text events */
+                        if (event && strcmp(event, "init") == 0) {
+                            /* Ignore stream init envelope */
+                        } else if (event && strcmp(event, "step_update") == 0) {
+                            yyjson_val *su = yyjson_obj_get(root, "step_update");
+                            const char *stype = jstr(su, "step_type");
+                            if (stype && strcmp(stype, "agent_response") == 0) {
+                                const char *td = jstr(su, "text_delta");
+                                if (td && td[0]) mcode_str_append_cstr(&extracted, td);
+                            }
+                        } else if (event && strcmp(event, "result") == 0 &&
+                                   yyjson_is_obj(yyjson_obj_get(root, "result"))) {
+                            yyjson_val *res_obj = yyjson_obj_get(root, "result");
+                            const char *status = jstr(res_obj, "status");
+                            const char *err_s = jstr(res_obj, "error");
+                            if ((err_s && err_s[0]) ||
+                                (status && status[0] && strcmp(status, "SUCCESS") != 0)) {
+                                saw_error = true;
+                                mcode_str_clear(&extracted);
+                            } else {
+                                const char *resp = jstr(res_obj, "response");
+                                if (resp && resp[0]) mcode_str_set(&extracted, resp);
+                            }
+                        } else if (!event && !type &&
+                                   (yyjson_obj_get(root, "response") || yyjson_obj_get(root, "status"))) {
+                            const char *status = jstr(root, "status");
+                            const char *err_s = jstr(root, "error");
+                            if ((err_s && err_s[0]) ||
+                                (status && status[0] && strcmp(status, "SUCCESS") != 0)) {
+                                saw_error = true;
+                                mcode_str_clear(&extracted);
+                            } else {
+                                const char *resp = jstr(root, "response");
+                                if (resp && resp[0]) mcode_str_set(&extracted, resp);
+                            }
                         } else {
-                            const char *delta = jstr(root, "delta");
-                            const char *txt = jstr(root, "text");
-                            const char *content = jstr(root, "content");
-                            const char *res = jstr(root, "result");
-                            if (delta && delta[0]) {
-                                mcode_str_append_cstr(&extracted, delta);
-                            } else if (txt && txt[0]) {
-                                mcode_str_append_cstr(&extracted, txt);
-                            } else if (content && content[0]) {
-                                mcode_str_append_cstr(&extracted, content);
-                            } else if (res && res[0] && extracted.len == 0) {
-                                mcode_str_set(&extracted, res);
-                            } else if (extracted.len == 0) {
-                                extract_content_text_blocks(yyjson_obj_get(root, "message"), &extracted);
+                            if (!type) type = event;
+                            yyjson_val *err_v = yyjson_obj_get(root, "is_error");
+                            bool is_err = yyjson_is_bool(err_v) && yyjson_get_bool(err_v);
+                            if (is_err || (type && (strcmp(type, "error") == 0 || strcmp(type, "failed") == 0))) {
+                                saw_error = true;
+                            } else if (type && (strcmp(type, "thinking") == 0 ||
+                                                strcmp(type, "reasoning") == 0 ||
+                                                strcmp(type, "thought") == 0 ||
+                                                strcmp(type, "tool_use") == 0 ||
+                                                strcmp(type, "tool_call") == 0 ||
+                                                strcmp(type, "function_call") == 0 ||
+                                                strcmp(type, "tool_result") == 0 ||
+                                                strcmp(type, "function_response") == 0 ||
+                                                strcmp(type, "system") == 0)) {
+                                /* Ignore non-text events */
+                            } else {
+                                const char *delta = jstr(root, "delta");
+                                const char *txt = jstr(root, "text");
+                                const char *content = jstr(root, "content");
+                                const char *res = jstr(root, "result");
+                                if (delta && delta[0]) {
+                                    mcode_str_append_cstr(&extracted, delta);
+                                } else if (txt && txt[0]) {
+                                    mcode_str_append_cstr(&extracted, txt);
+                                } else if (content && content[0]) {
+                                    mcode_str_append_cstr(&extracted, content);
+                                } else if (res && res[0] && extracted.len == 0) {
+                                    mcode_str_set(&extracted, res);
+                                } else if (extracted.len == 0) {
+                                    extract_content_text_blocks(yyjson_obj_get(root, "message"), &extracted);
+                                }
                             }
                         }
                     }

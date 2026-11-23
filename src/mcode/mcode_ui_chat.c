@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 typedef enum {
     TOOL_KIND_CMD = 0,
@@ -18,15 +19,17 @@ static tool_kind classify_tool_name(const char *name) {
     if (strstr(name, "bash") || strstr(name, "Bash") || strstr(name, "command") || strstr(name, "shell"))
         return TOOL_KIND_CMD;
     if (strstr(name, "Edit") || strstr(name, "Write") || strstr(name, "edit") ||
-        strstr(name, "write") || strstr(name, "file_change") || strstr(name, "patch"))
+        strstr(name, "write") || strstr(name, "file_change") || strstr(name, "patch") ||
+        strstr(name, "replace"))
         return TOOL_KIND_EDIT;
+    if (strstr(name, "Web") || strstr(name, "web") || strstr(name, "fetch") || strstr(name, "url"))
+        return TOOL_KIND_WEB;
     if (strstr(name, "Read") || strstr(name, "read") || strstr(name, "view"))
         return TOOL_KIND_READ;
     if (strstr(name, "Search") || strstr(name, "Grep") || strstr(name, "Glob") ||
-        strstr(name, "search") || strstr(name, "grep") || strstr(name, "glob"))
+        strstr(name, "search") || strstr(name, "grep") || strstr(name, "glob") ||
+        strstr(name, "find_") || strstr(name, "list_dir"))
         return TOOL_KIND_SEARCH;
-    if (strstr(name, "Web") || strstr(name, "web") || strstr(name, "fetch"))
-        return TOOL_KIND_WEB;
     return TOOL_KIND_OTHER;
 }
 
@@ -38,6 +41,151 @@ static const char *tool_icon_for_kind(tool_kind kind) {
     case TOOL_KIND_SEARCH: return CUI_ICON_SEARCH;
     case TOOL_KIND_WEB:    return CUI_ICON_GLOBE;
     default:               return CUI_ICON_ZAP;
+    }
+}
+
+static bool link_starts_with_icase(const char *s, const char *prefix) {
+    while (*prefix) {
+        if (!*s || tolower((unsigned char)*s) != tolower((unsigned char)*prefix)) return false;
+        ++s;
+        ++prefix;
+    }
+    return true;
+}
+
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+static bool has_non_file_uri_scheme(const char *s) {
+    if (!s || !isalpha((unsigned char)s[0])) return false;
+    if (link_starts_with_icase(s, "mailto:") || link_starts_with_icase(s, "tel:")) return true;
+    const char *p = s + 1;
+    while (*p && (isalnum((unsigned char)*p) || *p == '+' || *p == '-' || *p == '.')) ++p;
+    return (p[0] == ':' && p[1] == '/' && p[2] == '/');
+}
+
+static bool path_exists_on_disk(const char *path) {
+    if (!path || !path[0]) return false;
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+static bool is_line_range_token(const char *s) {
+    if (!s || !isdigit((unsigned char)s[0])) return false;
+    bool saw_dash = false;
+    for (const char *p = s; *p; ++p) {
+        if (isdigit((unsigned char)*p)) continue;
+        if (*p == '-' && !saw_dash && isdigit((unsigned char)p[1])) {
+            saw_dash = true;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+static void strip_line_col_suffix(char *path) {
+    if (!path || !path[0]) return;
+    for (int pass = 0; pass < 2; ++pass) {
+        const char *slash = strrchr(path, '/');
+        const char *bslash = strrchr(path, '\\');
+        const char *sep = (bslash && (!slash || bslash > slash)) ? bslash : slash;
+        char *colon = strrchr(path, ':');
+        if (!colon) break;
+        if (sep && colon < sep) break;
+        /* Preserve Windows drive letter prefix like "C:" */
+        if (colon == path + 1 && isalpha((unsigned char)path[0])) break;
+        if (!is_line_range_token(colon + 1)) break;
+        *colon = '\0';
+    }
+}
+
+static void open_markdown_link(mcode_app *app, cui_ctx *ui, const mcode_thread *thread,
+                               const char *raw_link) {
+    if (!raw_link || !raw_link[0]) return;
+    while (*raw_link == ' ' || *raw_link == '\t') ++raw_link;
+    if (!raw_link[0]) return;
+
+    bool is_file_uri = link_starts_with_icase(raw_link, "file://");
+    if (!is_file_uri && has_non_file_uri_scheme(raw_link)) {
+        cui_app_open_url(raw_link);
+        return;
+    }
+
+    char path[MCODE_PATH_MAX] = "";
+    if (is_file_uri) {
+        const char *p = raw_link + 7;
+        if (link_starts_with_icase(p, "localhost/")) p += 9;
+#ifdef _WIN32
+        if (p[0] == '/' && isalpha((unsigned char)p[1]) && p[2] == ':') ++p;
+#endif
+        size_t w = 0;
+        while (*p && w + 1 < sizeof path) {
+            if (*p == '#' || *p == '?') break;
+            if (*p == '%' && p[1] && p[2]) {
+                int hi = hex_nibble(p[1]);
+                int lo = hex_nibble(p[2]);
+                if (hi >= 0 && lo >= 0) {
+                    path[w++] = (char)((hi << 4) | lo);
+                    p += 3;
+                    continue;
+                }
+            }
+            path[w++] = *p++;
+        }
+        path[w] = '\0';
+    } else {
+        snprintf(path, sizeof path, "%s", raw_link);
+        size_t len = strlen(path);
+        while (len > 0 && isspace((unsigned char)path[len - 1])) path[--len] = '\0';
+    }
+
+    if (!path[0]) return;
+
+    /* Strip #L... fragment and :line[:col] suffixes when the literal path does not exist. */
+    if (!path_exists_on_disk(path)) {
+        char *hash = strchr(path, '#');
+        if (hash) *hash = '\0';
+        if (!path_exists_on_disk(path)) {
+            strip_line_col_suffix(path);
+        }
+    }
+
+    /* Expand leading ~/ */
+    char resolved[MCODE_PATH_MAX] = "";
+    if (path[0] == '~' && (path[1] == '/' || path[1] == '\0')) {
+        const char *home = getenv("HOME");
+        if (home && home[0]) {
+            snprintf(resolved, sizeof resolved, "%s%s", home, path + 1);
+        } else {
+            snprintf(resolved, sizeof resolved, "%s", path);
+        }
+    } else {
+        bool is_abs = (path[0] == '/' || path[0] == '\\' ||
+                       (isalpha((unsigned char)path[0]) && path[1] == ':' &&
+                        (path[2] == '/' || path[2] == '\\')));
+        if (!is_abs && thread && thread->workdir[0]) {
+            size_t wlen = strlen(thread->workdir);
+            while (wlen > 1 && (thread->workdir[wlen - 1] == '/' ||
+                                thread->workdir[wlen - 1] == '\\')) {
+                --wlen;
+            }
+            snprintf(resolved, sizeof resolved, "%.*s/%s", (int)wlen, thread->workdir, path);
+        } else {
+            snprintf(resolved, sizeof resolved, "%s", path);
+        }
+    }
+
+    if (path_exists_on_disk(resolved)) {
+        cui_app_open_url(resolved);
+    } else if (app && ui) {
+        char msg[256];
+        snprintf(msg, sizeof msg, "File not found: %s", resolved);
+        app_chrome_notify(app->chrome, ui, msg, CUI_TONE_WARNING);
     }
 }
 
@@ -516,6 +664,7 @@ static void draw_thread_header(mcode_app *app, cui_ctx *ui, mcode_thread *thread
                                         .font = CUI_FONT_MEDIUM, .size = 15,
                                         .placeholder = "Untitled thread") & CUI_CHANGED) {
                         thread->title_auto_fallback[0] = '\0';
+                        thread->title_pending = false;
                         if (thread->title_run) {
                             mcode_agent_title_stop(thread->title_run);
                         }
@@ -672,7 +821,7 @@ static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int tur
                                                           .length = (int)b->text.len,
                                                           .streaming = streaming);
                     if (mr.link && mr.link[0]) {
-                        cui_app_open_url(mr.link);
+                        open_markdown_link(app, ui, thread, mr.link);
                     }
                 }
             } else if (b->kind == MCODE_BLOCK_ERROR) {

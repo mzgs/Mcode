@@ -140,6 +140,7 @@ typedef struct {
     /* Live runtime state (not persisted) */
     struct mcode_agent_run *active_run;
     struct mcode_title_run *title_run;
+    bool title_pending;
     char title_auto_fallback[MCODE_NAME_MAX];
     char status_text[160];
     double run_started_mono;
