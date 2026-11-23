@@ -106,6 +106,12 @@ typedef enum {
     MCODE_THREAD_SETTLED,
 } mcode_thread_state;
 
+typedef enum {
+    MCODE_SPEED_DEFAULT = 0,
+    MCODE_SPEED_STANDARD,
+    MCODE_SPEED_FAST,
+} mcode_speed_mode;
+
 struct mcode_agent_run;
 
 typedef struct {
@@ -115,6 +121,7 @@ typedef struct {
     app_agent_kind agent;
     char model[APP_MODEL_NAME_MAX];
     char reasoning_effort[32];
+    mcode_speed_mode speed_mode;
     bool use_worktree;
     bool auto_approve;
     char workdir[MCODE_PATH_MAX];

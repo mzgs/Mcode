@@ -178,6 +178,7 @@ static void test_store_roundtrip(void) {
                                              "o3", true, false, "/tmp/wt-demo", "mcode/login");
     CHECK(t != NULL);
     snprintf(t->reasoning_effort, sizeof t->reasoning_effort, "high");
+    t->speed_mode = MCODE_SPEED_FAST;
     mcode_turn *tr = mcode_thread_add_turn(t, "Build login flow");
     mcode_block *b = mcode_turn_add_block(tr, MCODE_BLOCK_TEXT);
     mcode_str_set(&b->text, "Done implementing login.");
@@ -196,6 +197,7 @@ static void test_store_roundtrip(void) {
     CHECK(strcmp(loaded.threads[0].title, "Implement login") == 0);
     CHECK(loaded.threads[0].agent == APP_AGENT_CODEX);
     CHECK(strcmp(loaded.threads[0].reasoning_effort, "high") == 0);
+    CHECK(loaded.threads[0].speed_mode == MCODE_SPEED_FAST);
     CHECK(loaded.threads[0].use_worktree);
     CHECK(loaded.threads[0].turn_count == 1);
     CHECK(strcmp(mcode_str_cstr(&loaded.threads[0].turns[0].blocks[0].text), "Done implementing login.") == 0);
@@ -278,7 +280,7 @@ static void test_git_worktree_and_diff(void) {
 static void test_model_catalog(void) {
     const char *codex_json =
         "{\"models\":["
-        "{\"slug\":\"gpt-6.2-sol\",\"display_name\":\"GPT-6.2-Sol\",\"visibility\":\"list\",\"description\":\"Fast go-to model.\",\"default_reasoning_level\":\"low\",\"supported_reasoning_levels\":[{\"effort\":\"low\"},{\"effort\":\"medium\"},{\"effort\":\"high\"},{\"effort\":\"xhigh\"}]},"
+        "{\"slug\":\"gpt-6.2-sol\",\"display_name\":\"GPT-6.2-Sol\",\"visibility\":\"list\",\"description\":\"Fast go-to model.\",\"default_reasoning_level\":\"low\",\"supported_reasoning_levels\":[{\"effort\":\"low\"},{\"effort\":\"medium\"},{\"effort\":\"high\"},{\"effort\":\"xhigh\"}],\"additional_speed_tiers\":[\"fast\"],\"service_tiers\":[{\"id\":\"priority\",\"name\":\"Fast\",\"description\":\"2x speed, increased usage\"}]},"
         "{\"slug\":\"gpt-hidden\",\"display_name\":\"Hidden\",\"visibility\":\"hide\",\"description\":\"Internal.\"},"
         "{\"slug\":\"gpt-6.2-astra\",\"display_name\":\"GPT-6.2-Astra\",\"visibility\":\"list\",\"description\":\"Complex coding.\"}"
         "]}";
@@ -291,19 +293,26 @@ static void test_model_catalog(void) {
     CHECK(strcmp(opts[0].default_effort, "low") == 0);
     CHECK(opts[0].effort_count == 4);
     CHECK(strcmp(opts[0].efforts[2], "high") == 0);
+    CHECK(opts[0].supports_fast);
+    CHECK(strcmp(opts[0].fast_desc, "2x speed, increased usage") == 0);
     CHECK(strcmp(opts[1].id, "gpt-6.2-astra") == 0);
+    CHECK(!opts[1].supports_fast);
 
     char cfg_model[APP_MODEL_NAME_MAX] = "";
     char cfg_effort[24] = "";
+    bool cfg_fast = false;
     const char *codex_toml =
         "# comment\n"
         "model = \"gpt-6.2-sol\"\n"
         "model_reasoning_effort = \"high\"\n"
+        "service_tier = \"fast\"\n"
         "[features]\n"
         "model = \"ignored-section-model\"\n";
-    mcode_agent_parse_codex_config_toml(codex_toml, cfg_model, sizeof cfg_model, cfg_effort, sizeof cfg_effort);
+    mcode_agent_parse_codex_config_toml(codex_toml, cfg_model, sizeof cfg_model,
+                                        cfg_effort, sizeof cfg_effort, &cfg_fast);
     CHECK(strcmp(cfg_model, "gpt-6.2-sol") == 0);
     CHECK(strcmp(cfg_effort, "high") == 0);
+    CHECK(cfg_fast);
 
     const char *claude_json = "{\"model\":\"opus\",\"effortLevel\":\"xhigh\"}";
     mcode_agent_parse_claude_settings_json(claude_json, strlen(claude_json),

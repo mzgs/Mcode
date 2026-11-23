@@ -24,6 +24,8 @@ typedef struct {
     char default_effort[24];
     char efforts[MCODE_MAX_EFFORTS_PER_MODEL][24];
     int effort_count;
+    bool supports_fast;
+    char fast_desc[96];
 } mcode_model_option;
 
 typedef struct mcode_model_fetch mcode_model_fetch;
@@ -33,6 +35,7 @@ typedef struct {
     int count[APP_AGENT_COUNT];
     char cli_default_model[APP_AGENT_COUNT][APP_MODEL_NAME_MAX];
     char cli_default_effort[APP_AGENT_COUNT][24];
+    bool cli_default_fast[APP_AGENT_COUNT];
     bool loading_agy;
     bool loaded_agy;
     mcode_model_fetch *agy_fetch;
@@ -67,6 +70,12 @@ void mcode_model_format_display(const mcode_model_catalog *cat, const mcode_thre
                                 const app_settings *settings,
                                 char *name_out, size_t name_cap,
                                 char *effort_out, size_t effort_cap);
+/* Whether the thread's currently active model supports Fast vs Standard speed tiers.
+ * If out_desc is non-NULL, writes the tier description (e.g. "2x speed, increased usage") or "". */
+bool mcode_model_supports_fast(const mcode_model_catalog *cat, const mcode_thread *thread,
+                               const app_settings *settings, const char **out_desc);
+/* Resolved fast-mode state for `thread` (explicit override, else CLI default). */
+bool mcode_thread_is_fast_mode(const mcode_model_catalog *cat, const mcode_thread *thread);
 
 /* Pure parsers exposed for unit tests. */
 int mcode_agent_parse_codex_models_json(const char *json, size_t len,
@@ -75,7 +84,8 @@ int mcode_agent_parse_agy_models_text(const char *text,
                                       mcode_model_option *out, int max_out);
 void mcode_agent_parse_codex_config_toml(const char *toml,
                                          char *model_out, size_t model_cap,
-                                         char *effort_out, size_t effort_cap);
+                                         char *effort_out, size_t effort_cap,
+                                         bool *fast_out);
 void mcode_agent_parse_claude_settings_json(const char *json, size_t len,
                                             char *model_out, size_t model_cap,
                                             char *effort_out, size_t effort_cap);

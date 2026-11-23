@@ -1003,6 +1003,35 @@ int mcode_agent_parse_codex_models_json(const char *json, size_t len,
                     }
                 }
             }
+            yyjson_val *speed_tiers = yyjson_obj_get(m, "additional_speed_tiers");
+            if (yyjson_is_arr(speed_tiers)) {
+                size_t si, smax;
+                yyjson_val *sv;
+                yyjson_arr_foreach(speed_tiers, si, smax, sv) {
+                    if (yyjson_is_str(sv) && strcmp(yyjson_get_str(sv), "fast") == 0) {
+                        opt->supports_fast = true;
+                        break;
+                    }
+                }
+            }
+            yyjson_val *svc_tiers = yyjson_obj_get(m, "service_tiers");
+            if (yyjson_is_arr(svc_tiers)) {
+                size_t si, smax;
+                yyjson_val *sv;
+                yyjson_arr_foreach(svc_tiers, si, smax, sv) {
+                    const char *tid = jstr(sv, "id");
+                    const char *tname = jstr(sv, "name");
+                    if ((tid && (strcmp(tid, "priority") == 0 || strcmp(tid, "fast") == 0)) ||
+                        (tname && strcmp(tname, "Fast") == 0)) {
+                        opt->supports_fast = true;
+                        const char *tdesc = jstr(sv, "description");
+                        if (tdesc && tdesc[0]) {
+                            snprintf(opt->fast_desc, sizeof opt->fast_desc, "%s", tdesc);
+                        }
+                        break;
+                    }
+                }
+            }
         }
     }
     yyjson_doc_free(doc);
@@ -1108,9 +1137,11 @@ static void parse_toml_string_val(const char *raw, char *out, size_t cap) {
 
 void mcode_agent_parse_codex_config_toml(const char *toml,
                                          char *model_out, size_t model_cap,
-                                         char *effort_out, size_t effort_cap) {
+                                         char *effort_out, size_t effort_cap,
+                                         bool *fast_out) {
     if (model_out && model_cap > 0) model_out[0] = '\0';
     if (effort_out && effort_cap > 0) effort_out[0] = '\0';
+    if (fast_out) *fast_out = false;
     if (!toml || !toml[0]) return;
 
     const char *p = toml;
@@ -1141,6 +1172,10 @@ void mcode_agent_parse_codex_config_toml(const char *toml,
                 } else if (klen == 22 && memcmp(s, "model_reasoning_effort", 22) == 0 &&
                            effort_out && effort_cap > 0) {
                     parse_toml_string_val(val_line, effort_out, effort_cap);
+                } else if (klen == 12 && memcmp(s, "service_tier", 12) == 0 && fast_out) {
+                    char tier[32] = "";
+                    parse_toml_string_val(val_line, tier, sizeof tier);
+                    *fast_out = (strcmp(tier, "fast") == 0 || strcmp(tier, "priority") == 0);
                 }
             }
         }
@@ -1197,7 +1232,8 @@ static void load_cli_config_defaults(mcode_model_catalog *cat) {
     if (toml) {
         mcode_agent_parse_codex_config_toml(toml,
             cat->cli_default_model[APP_AGENT_CODEX], sizeof cat->cli_default_model[APP_AGENT_CODEX],
-            cat->cli_default_effort[APP_AGENT_CODEX], sizeof cat->cli_default_effort[APP_AGENT_CODEX]);
+            cat->cli_default_effort[APP_AGENT_CODEX], sizeof cat->cli_default_effort[APP_AGENT_CODEX],
+            &cat->cli_default_fast[APP_AGENT_CODEX]);
         free(toml);
     }
     char *claude_json = read_home_file(".claude/settings.json", &len);
@@ -1455,6 +1491,30 @@ void mcode_model_format_display(const mcode_model_catalog *cat, const mcode_thre
     }
 }
 
+bool mcode_model_supports_fast(const mcode_model_catalog *cat, const mcode_thread *thread,
+                               const app_settings *settings, const char **out_desc) {
+    if (out_desc) *out_desc = "";
+    if (!cat || !thread) return false;
+    app_agent_kind ag = thread->agent;
+    if (ag < 0 || ag >= APP_AGENT_COUNT) return false;
+    const char *model_id = mcode_agent_effective_model(thread, settings);
+    if (!model_id[0]) model_id = cat->cli_default_model[ag];
+    const mcode_model_option *opt = mcode_model_find(cat, ag, model_id);
+    if (!opt || !opt->supports_fast) return false;
+    if (out_desc) *out_desc = opt->fast_desc;
+    return true;
+}
+
+bool mcode_thread_is_fast_mode(const mcode_model_catalog *cat, const mcode_thread *thread) {
+    if (!thread) return false;
+    if (thread->speed_mode == MCODE_SPEED_FAST) return true;
+    if (thread->speed_mode == MCODE_SPEED_STANDARD) return false;
+    if (cat && thread->agent >= 0 && thread->agent < APP_AGENT_COUNT) {
+        return cat->cli_default_fast[thread->agent];
+    }
+    return false;
+}
+
 const char *mcode_agent_label(app_agent_kind kind) {
     switch (kind) {
     case APP_AGENT_CLAUDE: return "Claude Code";
@@ -1504,6 +1564,12 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
         snprintf(codex_effort_cfg, sizeof codex_effort_cfg,
                  "model_reasoning_effort=\"%s\"", thread->reasoning_effort);
     }
+    const char *codex_speed_cfg = NULL;
+    if (thread->speed_mode == MCODE_SPEED_FAST) {
+        codex_speed_cfg = "service_tier=\"fast\"";
+    } else if (thread->speed_mode == MCODE_SPEED_STANDARD) {
+        codex_speed_cfg = "service_tier=\"default\"";
+    }
     const char *argv[32];
     int n = 0;
 
@@ -1545,6 +1611,10 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
                 argv[n++] = "-c";
                 argv[n++] = codex_effort_cfg;
             }
+            if (codex_speed_cfg) {
+                argv[n++] = "-c";
+                argv[n++] = codex_speed_cfg;
+            }
             if (thread->auto_approve) {
                 argv[n++] = "--dangerously-bypass-approvals-and-sandbox";
             } else {
@@ -1567,6 +1637,10 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
             if (codex_effort_cfg[0]) {
                 argv[n++] = "-c";
                 argv[n++] = codex_effort_cfg;
+            }
+            if (codex_speed_cfg) {
+                argv[n++] = "-c";
+                argv[n++] = codex_speed_cfg;
             }
             if (thread->auto_approve) {
                 argv[n++] = "--dangerously-bypass-approvals-and-sandbox";

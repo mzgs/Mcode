@@ -796,8 +796,13 @@ static void draw_thread_model_selector(mcode_app *app, cui_ctx *ui, mcode_thread
         cui_popover_toggle(ui, "model-picker-pop");
     }
 
+    const char *fast_desc = "";
+    bool supports_fast = mcode_model_supports_fast(&app->models, thread, settings, &fast_desc);
+    bool is_fast = supports_fast && mcode_thread_is_fast_mode(&app->models, thread);
+
     cui_popover(ui, "model-picker-pop", .placement = CUI_PLACE_TOP_START,
                 .width = 528, .pad = 1, .gap = 0) {
+        cui_column(ui, .width = CUI_FILL, .gap = 0) {
         cui_row(ui, .width = CUI_FILL, .height = CUI_PX(336.0f), .gap = 0,
                 .align = CUI_ALIGN_STRETCH) {
             /* Column 1: Vertical provider icon rail */
@@ -841,6 +846,7 @@ static void draw_thread_model_selector(mcode_app *app, cui_ctx *ui, mcode_thread
                             thread->session_id[0] = '\0';
                             thread->model[0] = '\0';
                             thread->reasoning_effort[0] = '\0';
+                            thread->speed_mode = MCODE_SPEED_DEFAULT;
                             app->model_search[0] = '\0';
                             mcode_ui_mark_dirty(app);
                             eff_model = mcode_agent_effective_model(thread, settings);
@@ -849,6 +855,8 @@ static void draw_thread_model_selector(mcode_app *app, cui_ctx *ui, mcode_thread
                             mcode_model_format_display(&app->models, thread, settings,
                                                        model_name, sizeof model_name,
                                                        effort_label, sizeof effort_label);
+                            supports_fast = mcode_model_supports_fast(&app->models, thread, settings, &fast_desc);
+                            is_fast = supports_fast && mcode_thread_is_fast_mode(&app->models, thread);
                         }
                     }
                     cui_pop_id(ui);
@@ -1146,6 +1154,79 @@ static void draw_thread_model_selector(mcode_app *app, cui_ctx *ui, mcode_thread
                     }
                 }
             }
+        }
+
+        if (supports_fast) {
+            cui_separator(ui);
+            cui_row(ui, .width = CUI_FILL, .pad_x = 12, .pad_y = 8, .gap = 10,
+                    .align = CUI_ALIGN_CENTER) {
+                static const char *const k_speed_labels[2] = { "Standard", "Fast" };
+                static const char *const k_speed_icons[2] = { NULL, CUI_ICON_ZAP };
+                int spd_idx = is_fast ? 1 : 0;
+                if (cui_segmented(ui, "speed-tier-seg", k_speed_labels, 2, &spd_idx,
+                                  .size = CUI_SIZE_SM, .icons = k_speed_icons)) {
+                    thread->speed_mode = (spd_idx == 1) ? MCODE_SPEED_FAST : MCODE_SPEED_STANDARD;
+                    is_fast = (spd_idx == 1);
+                    mcode_ui_mark_dirty(app);
+                }
+                if (fast_desc && fast_desc[0]) {
+                    cui_text(ui, fast_desc, .size = 12, .color = CUI_COLOR_TEXT_MUTED,
+                             .nowrap = true);
+                }
+            }
+        }
+        }
+    }
+
+    /* Inline bolt toggle right next to the model selector when the active model supports Fast mode */
+    if (supports_fast) {
+        cui_id zid = cui_make_id(ui, "speed-bolt-btn");
+        cui_rect zr = cui_get_rect(ui, zid);
+        bool zhov = !busy && zr.w > 0.0f &&
+                    mp.x >= zr.x && mp.x <= zr.x + zr.w &&
+                    mp.y >= zr.y && mp.y <= zr.y + zr.h;
+        cui_color zbg = is_fast
+            ? cui_alpha(cui_color_of(ui, CUI_COLOR_WARNING), zhov ? 0.22f : 0.14f)
+            : (zhov ? cui_alpha(cui_color_of(ui, CUI_COLOR_FOREGROUND), 0.08f)
+                    : CUI_RGBA(0x00000001u));
+        cui_color zfg = busy
+            ? CUI_COLOR_TEXT_MUTED
+            : (is_fast ? CUI_COLOR_WARNING : CUI_COLOR_TEXT_MUTED);
+        bool zclick = cui_card_begin(ui, &(cui_card_opts){
+            .id = "speed-bolt-btn",
+            .dir = CUI_ROW,
+            .align = CUI_ALIGN_CENTER,
+            .width = CUI_PX(30),
+            .height = CUI_PX(30),
+            .pad = 1,
+            .gap = 0,
+            .hoverable = !busy,
+            .border = -1.0f,
+            .radius = 9,
+            .bg = zbg,
+        });
+        cui_row(ui, .width = CUI_FILL, .justify = CUI_JUSTIFY_CENTER, .align = CUI_ALIGN_CENTER) {
+            cui_icon(ui, CUI_ICON_ZAP, 14, zfg);
+        }
+        cui_card_end(ui);
+        char ztip[160];
+        if (is_fast) {
+            if (fast_desc && fast_desc[0]) {
+                snprintf(ztip, sizeof ztip, "Speed: Fast (%s) — click for Standard", fast_desc);
+            } else {
+                snprintf(ztip, sizeof ztip, "Speed: Fast — click for Standard");
+            }
+        } else {
+            if (fast_desc && fast_desc[0]) {
+                snprintf(ztip, sizeof ztip, "Speed: Standard — click for Fast (%s)", fast_desc);
+            } else {
+                snprintf(ztip, sizeof ztip, "Speed: Standard — click for Fast");
+            }
+        }
+        cui_tooltip(ui, ztip);
+        if (zclick && !busy) {
+            thread->speed_mode = is_fast ? MCODE_SPEED_STANDARD : MCODE_SPEED_FAST;
+            mcode_ui_mark_dirty(app);
         }
     }
 }

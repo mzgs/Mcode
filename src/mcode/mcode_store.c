@@ -361,6 +361,10 @@ bool mcode_store_load(mcode_store *store, const char *path) {
             snprintf(t->model, sizeof t->model, "%s", jstr_or(tv, "model", ""));
             snprintf(t->reasoning_effort, sizeof t->reasoning_effort, "%s",
                      jstr_or(tv, "reasoning_effort", ""));
+            const char *spd = jstr_or(tv, "speed_mode", "");
+            if (strcmp(spd, "fast") == 0) t->speed_mode = MCODE_SPEED_FAST;
+            else if (strcmp(spd, "standard") == 0) t->speed_mode = MCODE_SPEED_STANDARD;
+            else t->speed_mode = MCODE_SPEED_DEFAULT;
             t->use_worktree = jbool_or(tv, "use_worktree", false);
             t->auto_approve = jbool_or(tv, "auto_approve", false);
             snprintf(t->workdir, sizeof t->workdir, "%s", jstr_or(tv, "workdir", ""));
@@ -475,6 +479,11 @@ bool mcode_store_save(const mcode_store *store, const char *path) {
         yyjson_mut_obj_add_str(doc, to, "model", t->model);
         if (t->reasoning_effort[0]) {
             yyjson_mut_obj_add_str(doc, to, "reasoning_effort", t->reasoning_effort);
+        }
+        if (t->speed_mode == MCODE_SPEED_FAST) {
+            yyjson_mut_obj_add_str(doc, to, "speed_mode", "fast");
+        } else if (t->speed_mode == MCODE_SPEED_STANDARD) {
+            yyjson_mut_obj_add_str(doc, to, "speed_mode", "standard");
         }
         yyjson_mut_obj_add_bool(doc, to, "use_worktree", t->use_worktree);
         yyjson_mut_obj_add_bool(doc, to, "auto_approve", t->auto_approve);
