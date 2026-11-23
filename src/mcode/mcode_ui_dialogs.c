@@ -21,8 +21,11 @@ static void draw_new_thread_dialog(mcode_app *app, cui_ctx *ui) {
                 "Claude Code", "Codex", "Antigravity CLI"
             };
             cui_text(ui, "Agent", .font = CUI_FONT_MEDIUM);
-            cui_segmented(ui, "nt-agent", agent_labels, APP_AGENT_COUNT, &app->new_thread_agent,
-                          .full_width = true);
+            if (cui_segmented(ui, "nt-agent", agent_labels, APP_AGENT_COUNT, &app->new_thread_agent,
+                              .full_width = true)) {
+                app->new_thread_model[0] = '\0';
+                app->new_thread_custom_model = false;
+            }
             if (!app->cli_status.available[app->new_thread_agent]) {
                 cui_alert(ui, "CLI not detected",
                           .description = "You can still create the thread and configure the CLI path in Settings.",
@@ -34,10 +37,59 @@ static void draw_new_thread_dialog(mcode_app *app, cui_ctx *ui) {
                       .placeholder = "e.g. Fix auth token refresh (auto-titled from first prompt)",
                       .width = CUI_FILL);
 
-            cui_input(ui, "nt-model", app->new_thread_model, sizeof app->new_thread_model,
-                      .label = "Model override (optional)",
-                      .placeholder = "Leave blank to use CLI default",
-                      .width = CUI_FILL);
+            {
+                app_agent_kind ag = (app_agent_kind)app->new_thread_agent;
+                const app_settings *settings = app_chrome_settings(app->chrome);
+                const char *def_model = mcode_agent_default_model(settings, ag);
+                int cat_count = (ag >= 0 && ag < APP_AGENT_COUNT) ? app->models.count[ag] : 0;
+                const char *model_labels[MCODE_MAX_MODELS_PER_AGENT + 2];
+                char def_label[128];
+                if (def_model[0]) {
+                    snprintf(def_label, sizeof def_label, "Default (%s)",
+                             mcode_model_display_label(&app->models, ag, def_model));
+                } else {
+                    snprintf(def_label, sizeof def_label, "CLI Default");
+                }
+                model_labels[0] = def_label;
+
+                int custom_idx = cat_count + 1;
+                int sel_idx = 0;
+                if (app->new_thread_custom_model) {
+                    sel_idx = custom_idx;
+                } else if (app->new_thread_model[0]) {
+                    sel_idx = custom_idx;
+                }
+                for (int i = 0; i < cat_count; ++i) {
+                    model_labels[i + 1] = app->models.items[ag][i].label[0]
+                        ? app->models.items[ag][i].label
+                        : app->models.items[ag][i].id;
+                    if (!app->new_thread_custom_model && app->new_thread_model[0] &&
+                        strcmp(app->new_thread_model, app->models.items[ag][i].id) == 0) {
+                        sel_idx = i + 1;
+                    }
+                }
+                model_labels[custom_idx] = "Custom model ID...";
+
+                if (cui_select(ui, "nt-model-select", model_labels, custom_idx + 1, &sel_idx,
+                               .label = "Model", .searchable = true, .width = CUI_FILL)) {
+                    if (sel_idx == 0) {
+                        app->new_thread_model[0] = '\0';
+                        app->new_thread_custom_model = false;
+                    } else if (sel_idx == custom_idx) {
+                        app->new_thread_custom_model = true;
+                    } else if (sel_idx >= 1 && sel_idx <= cat_count) {
+                        snprintf(app->new_thread_model, sizeof app->new_thread_model, "%s",
+                                 app->models.items[ag][sel_idx - 1].id);
+                        app->new_thread_custom_model = false;
+                    }
+                }
+                if (sel_idx == custom_idx) {
+                    cui_input(ui, "nt-model-custom", app->new_thread_model,
+                              sizeof app->new_thread_model,
+                              .placeholder = "Enter custom model ID (e.g. sonnet, gpt-6.2-sol)",
+                              .width = CUI_FILL);
+                }
+            }
 
             mcode_project *sel_proj = &app->store.projects[app->new_thread_project_idx];
             cui_switch(ui, "Create isolated Git worktree", &app->new_thread_worktree,

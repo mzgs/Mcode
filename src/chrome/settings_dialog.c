@@ -68,6 +68,33 @@ static bool draw_general_section(app_chrome *chrome, cui_ctx *ui, bool compact) 
     cui_box_end(ui);
 
     cui_separator(ui);
+    cui_text(ui, "Default Models (optional)", .font = CUI_FONT_MEDIUM);
+
+    setting_row_begin(ui, "Claude model", compact, false);
+    int f_cm = cui_input(ui, "default-claude-model", chrome->settings.mcode.default_claude_model,
+                         sizeof chrome->settings.mcode.default_claude_model,
+                         .placeholder = "CLI default (e.g. opus, sonnet)", .width = CUI_FILL);
+    if (f_cm & CUI_CHANGED) chrome->settings_dirty = true;
+    if (chrome->settings_dirty && (f_cm & (CUI_SUBMITTED | CUI_BLURRED))) changed = true;
+    cui_box_end(ui);
+
+    setting_row_begin(ui, "Codex model", compact, false);
+    int f_xm = cui_input(ui, "default-codex-model", chrome->settings.mcode.default_codex_model,
+                         sizeof chrome->settings.mcode.default_codex_model,
+                         .placeholder = "CLI default (e.g. gpt-6.2-sol)", .width = CUI_FILL);
+    if (f_xm & CUI_CHANGED) chrome->settings_dirty = true;
+    if (chrome->settings_dirty && (f_xm & (CUI_SUBMITTED | CUI_BLURRED))) changed = true;
+    cui_box_end(ui);
+
+    setting_row_begin(ui, "Antigravity model", compact, false);
+    int f_am = cui_input(ui, "default-agy-model", chrome->settings.mcode.default_agy_model,
+                         sizeof chrome->settings.mcode.default_agy_model,
+                         .placeholder = "CLI default (e.g. gemini-4-neon-high)", .width = CUI_FILL);
+    if (f_am & CUI_CHANGED) chrome->settings_dirty = true;
+    if (chrome->settings_dirty && (f_am & (CUI_SUBMITTED | CUI_BLURRED))) changed = true;
+    cui_box_end(ui);
+
+    cui_separator(ui);
 
     setting_row_begin(ui, "Settings file", compact, false);
     cui_row(ui, .width = CUI_FILL, .gap = 8, .wrap = true) {

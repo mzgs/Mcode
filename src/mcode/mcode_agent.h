@@ -12,8 +12,50 @@ typedef struct {
     char resolved_path[APP_AGENT_COUNT][APP_CLI_PATH_MAX];
 } mcode_cli_status;
 
+enum {
+    MCODE_MAX_MODELS_PER_AGENT = 64,
+};
+
+typedef struct {
+    char id[APP_MODEL_NAME_MAX];
+    char label[96];
+    char detail[160];
+} mcode_model_option;
+
+typedef struct mcode_model_fetch mcode_model_fetch;
+
+typedef struct {
+    mcode_model_option items[APP_AGENT_COUNT][MCODE_MAX_MODELS_PER_AGENT];
+    int count[APP_AGENT_COUNT];
+    bool loading_agy;
+    bool loaded_agy;
+    mcode_model_fetch *agy_fetch;
+} mcode_model_catalog;
+
 /* Detect installed CLI binaries for Claude Code, Codex, and Antigravity CLI. */
 void mcode_agent_detect_clis(const app_settings *settings, mcode_cli_status *out);
+
+/* Initialize / refresh / poll / free the per-agent model catalog.
+ * Loads Claude presets, Codex local models cache (~/.codex/models_cache.json),
+ * and optionally spawns `agy models` asynchronously when Antigravity CLI is available. */
+void mcode_model_catalog_init(mcode_model_catalog *cat);
+void mcode_model_catalog_refresh(mcode_model_catalog *cat, const mcode_cli_status *clis);
+bool mcode_model_catalog_poll(mcode_model_catalog *cat);
+void mcode_model_catalog_free(mcode_model_catalog *cat);
+
+/* Default model configured in settings for `agent` (empty string if none). */
+const char *mcode_agent_default_model(const app_settings *settings, app_agent_kind agent);
+/* Effective model passed to the CLI (thread override, else settings default, else ""). */
+const char *mcode_agent_effective_model(const mcode_thread *thread, const app_settings *settings);
+/* Human-readable display name for `model_id` (falls back to `model_id` or "Default"). */
+const char *mcode_model_display_label(const mcode_model_catalog *cat, app_agent_kind agent,
+                                      const char *model_id);
+
+/* Pure parsers exposed for unit tests. */
+int mcode_agent_parse_codex_models_json(const char *json, size_t len,
+                                        mcode_model_option *out, int max_out);
+int mcode_agent_parse_agy_models_text(const char *text,
+                                      mcode_model_option *out, int max_out);
 
 /* Human-readable display name & short badge for an agent kind. */
 const char *mcode_agent_label(app_agent_kind kind);

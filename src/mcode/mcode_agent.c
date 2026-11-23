@@ -875,6 +875,328 @@ void mcode_agent_detect_clis(const app_settings *settings, mcode_cli_status *out
     }
 }
 
+/* ---- Model catalog & dynamic CLI model discovery ---- */
+
+struct mcode_model_fetch {
+    mcode_proc *proc;
+    pthread_mutex_t mu;
+    mcode_str stdout_buf;
+    bool finished;
+    int exit_code;
+};
+
+static void set_model_opt(mcode_model_option *opt, const char *id, const char *label, const char *detail) {
+    memset(opt, 0, sizeof *opt);
+    snprintf(opt->id, sizeof opt->id, "%s", id ? id : "");
+    snprintf(opt->label, sizeof opt->label, "%s", (label && label[0]) ? label : (id ? id : ""));
+    snprintf(opt->detail, sizeof opt->detail, "%s", detail ? detail : "");
+}
+
+static void load_claude_default_models(mcode_model_catalog *cat) {
+    static const struct { const char *id, *label, *detail; } k_claude[] = {
+        { "opus",   "Claude Opus",   "Most capable model for complex reasoning and architecture" },
+        { "sonnet", "Claude Sonnet", "Balanced everyday coding and implementation model" },
+        { "haiku",  "Claude Haiku",  "Fast, lightweight model for quick edits and questions" },
+        { "fable",  "Claude Fable",  "Latest Claude Fable alias" },
+    };
+    int n = 0;
+    for (size_t i = 0; i < sizeof k_claude / sizeof k_claude[0] && n < MCODE_MAX_MODELS_PER_AGENT; ++i) {
+        set_model_opt(&cat->items[APP_AGENT_CLAUDE][n++],
+                      k_claude[i].id, k_claude[i].label, k_claude[i].detail);
+    }
+    cat->count[APP_AGENT_CLAUDE] = n;
+}
+
+static void load_codex_fallback_models(mcode_model_catalog *cat) {
+    static const struct { const char *id, *label, *detail; } k_codex[] = {
+        { "gpt-5.4",       "GPT-5.4",       "Frontier coding and reasoning model" },
+        { "gpt-5.3-codex", "GPT-5.3-Codex", "Agentic coding model" },
+        { "o3",            "o3",            "Deep reasoning model" },
+        { "o4-mini",       "o4-mini",       "Fast, affordable reasoning model" },
+    };
+    int n = 0;
+    for (size_t i = 0; i < sizeof k_codex / sizeof k_codex[0] && n < MCODE_MAX_MODELS_PER_AGENT; ++i) {
+        set_model_opt(&cat->items[APP_AGENT_CODEX][n++],
+                      k_codex[i].id, k_codex[i].label, k_codex[i].detail);
+    }
+    cat->count[APP_AGENT_CODEX] = n;
+}
+
+static void load_agy_fallback_models(mcode_model_catalog *cat) {
+    static const struct { const char *id, *label, *detail; } k_agy[] = {
+        { "gemini-4-neon-high",       "Gemini 4 Neon (High)",       "gemini-4-neon-high" },
+        { "gemini-4-neon-medium",     "Gemini 4 Neon (Medium)",     "gemini-4-neon-medium" },
+        { "gemini-4-carbon-high",     "Gemini 4 Carbon (High)",     "gemini-4-carbon-high" },
+        { "gemini-4-argon-high",      "Gemini 4 Argon (High)",      "gemini-4-argon-high" },
+        { "gemini-3.8-flash-high",    "Gemini 3.8 Flash (High)",    "gemini-3.8-flash-high" },
+        { "claude-opus-5-5-high",     "Claude Opus 5.5 (High)",     "claude-opus-5-5-high" },
+        { "claude-sonnet-5-5-high",   "Claude Sonnet 5.5 (High)",   "claude-sonnet-5-5-high" },
+    };
+    int n = 0;
+    for (size_t i = 0; i < sizeof k_agy / sizeof k_agy[0] && n < MCODE_MAX_MODELS_PER_AGENT; ++i) {
+        set_model_opt(&cat->items[APP_AGENT_AGY][n++],
+                      k_agy[i].id, k_agy[i].label, k_agy[i].detail);
+    }
+    cat->count[APP_AGENT_AGY] = n;
+}
+
+int mcode_agent_parse_codex_models_json(const char *json, size_t len,
+                                        mcode_model_option *out, int max_out) {
+    if (!json || len == 0 || !out || max_out <= 0) return 0;
+    yyjson_doc *doc = yyjson_read(json, len, 0);
+    if (!doc) return 0;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *models = yyjson_is_obj(root) ? yyjson_obj_get(root, "models") : NULL;
+    int count = 0;
+    if (yyjson_is_arr(models)) {
+        size_t idx, max;
+        yyjson_val *m;
+        yyjson_arr_foreach(models, idx, max, m) {
+            if (count >= max_out) break;
+            if (!yyjson_is_obj(m)) continue;
+            const char *slug = jstr(m, "slug");
+            if (!slug || !slug[0]) continue;
+            const char *vis = jstr(m, "visibility");
+            if (vis && strcmp(vis, "hide") == 0) continue;
+            const char *disp = jstr(m, "display_name");
+            const char *desc = jstr(m, "description");
+            set_model_opt(&out[count++], slug, (disp && disp[0]) ? disp : slug, desc ? desc : "");
+        }
+    }
+    yyjson_doc_free(doc);
+    return count;
+}
+
+static bool is_model_slug_char(unsigned char ch) {
+    return isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == ':' || ch == '/';
+}
+
+static void strip_ansi_into(const char *src, size_t len, char *dst, size_t cap) {
+    if (!dst || cap == 0) return;
+    size_t w = 0;
+    for (size_t i = 0; i < len && w + 1 < cap; ++i) {
+        if ((unsigned char)src[i] == 0x1b && i + 1 < len && src[i + 1] == '[') {
+            i += 2;
+            while (i < len && !((src[i] >= 'A' && src[i] <= 'Z') || (src[i] >= 'a' && src[i] <= 'z'))) {
+                ++i;
+            }
+            continue;
+        }
+        dst[w++] = src[i];
+    }
+    dst[w] = '\0';
+}
+
+int mcode_agent_parse_agy_models_text(const char *text,
+                                      mcode_model_option *out, int max_out) {
+    if (!text || !text[0] || !out || max_out <= 0) return 0;
+    int count = 0;
+    const char *p = text;
+    while (*p && count < max_out) {
+        const char *nl = strchr(p, '\n');
+        size_t line_len = nl ? (size_t)(nl - p) : strlen(p);
+        const char *seg = p;
+        size_t seg_len = line_len;
+        /* Spinner output precedes the first model line using carriage returns ('\r'). */
+        for (size_t i = 0; i < line_len; ++i) {
+            if (p[i] == '\r') {
+                seg = p + i + 1;
+                seg_len = line_len - (i + 1);
+            }
+        }
+        char clean[512];
+        strip_ansi_into(seg, seg_len, clean, sizeof clean);
+
+        char *s = clean;
+        while (*s && isspace((unsigned char)*s)) ++s;
+        size_t clen = strlen(s);
+        while (clen > 0 && isspace((unsigned char)s[clen - 1])) s[--clen] = '\0';
+
+        if (clen > 0 && isalnum((unsigned char)s[0])) {
+            char *sp = s;
+            while (*sp && !isspace((unsigned char)*sp)) ++sp;
+            size_t id_len = (size_t)(sp - s);
+            bool valid_id = (id_len >= 2 && id_len < APP_MODEL_NAME_MAX);
+            for (size_t i = 0; valid_id && i < id_len; ++i) {
+                if (!is_model_slug_char((unsigned char)s[i])) valid_id = false;
+            }
+            /* Skip prose lines such as "Fetching available models..." or "Error: ..." */
+            if (valid_id && strchr(s, '-') != NULL && *sp != '\0') {
+                char *lbl = sp;
+                while (*lbl && isspace((unsigned char)*lbl)) ++lbl;
+                if (*lbl && (lbl - sp) >= 2) {
+                    char id_buf[APP_MODEL_NAME_MAX];
+                    snprintf(id_buf, sizeof id_buf, "%.*s", (int)id_len, s);
+                    set_model_opt(&out[count++], id_buf, lbl, id_buf);
+                }
+            }
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return count;
+}
+
+static bool load_codex_models_from_cache(mcode_model_catalog *cat) {
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) return false;
+    char path[MCODE_PATH_MAX];
+    int n = snprintf(path, sizeof path, "%s/.codex/models_cache.json", home);
+    if (n <= 0 || (size_t)n >= sizeof path) return false;
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    long sz = ftell(f);
+    if (sz <= 0 || sz > 8 * 1024 * 1024) { fclose(f); return false; }
+    rewind(f);
+    char *buf = malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return false; }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[got] = '\0';
+
+    mcode_model_option parsed[MCODE_MAX_MODELS_PER_AGENT];
+    int cnt = mcode_agent_parse_codex_models_json(buf, got, parsed, MCODE_MAX_MODELS_PER_AGENT);
+    free(buf);
+    if (cnt <= 0) return false;
+    memcpy(cat->items[APP_AGENT_CODEX], parsed, (size_t)cnt * sizeof parsed[0]);
+    cat->count[APP_AGENT_CODEX] = cnt;
+    return true;
+}
+
+static void on_agy_models_bytes(const char *data, size_t len, bool is_stderr, void *user) {
+    if (is_stderr) return;
+    mcode_model_fetch *fetch = (mcode_model_fetch *)user;
+    pthread_mutex_lock(&fetch->mu);
+    if (fetch->stdout_buf.len < 256 * 1024) {
+        mcode_str_append(&fetch->stdout_buf, data, len);
+    }
+    pthread_mutex_unlock(&fetch->mu);
+}
+
+static void on_agy_models_exit(int exit_code, bool killed, void *user) {
+    (void)killed;
+    mcode_model_fetch *fetch = (mcode_model_fetch *)user;
+    pthread_mutex_lock(&fetch->mu);
+    fetch->exit_code = exit_code;
+    fetch->finished = true;
+    pthread_mutex_unlock(&fetch->mu);
+}
+
+static void agy_fetch_destroy(mcode_model_fetch *fetch) {
+    if (!fetch) return;
+    if (fetch->proc) {
+        mcode_proc_destroy(fetch->proc);
+        fetch->proc = NULL;
+    }
+    mcode_str_free(&fetch->stdout_buf);
+    pthread_mutex_destroy(&fetch->mu);
+    free(fetch);
+}
+
+void mcode_model_catalog_init(mcode_model_catalog *cat) {
+    if (!cat) return;
+    memset(cat, 0, sizeof *cat);
+    load_claude_default_models(cat);
+    if (!load_codex_models_from_cache(cat)) {
+        load_codex_fallback_models(cat);
+    }
+    load_agy_fallback_models(cat);
+}
+
+void mcode_model_catalog_refresh(mcode_model_catalog *cat, const mcode_cli_status *clis) {
+    if (!cat) return;
+    if (!load_codex_models_from_cache(cat) && cat->count[APP_AGENT_CODEX] == 0) {
+        load_codex_fallback_models(cat);
+    }
+    if (clis && clis->available[APP_AGENT_AGY] && clis->resolved_path[APP_AGENT_AGY][0] &&
+        !cat->agy_fetch) {
+        mcode_model_fetch *fetch = calloc(1, sizeof *fetch);
+        if (!fetch) return;
+        pthread_mutex_init(&fetch->mu, NULL);
+        mcode_str_init(&fetch->stdout_buf);
+        const char *argv[] = { clis->resolved_path[APP_AGENT_AGY], "models", NULL };
+        fetch->proc = mcode_proc_spawn(&(mcode_proc_desc){
+            .argv = argv,
+            .cwd = NULL,
+            .merge_stderr = false,
+            .on_bytes = on_agy_models_bytes,
+            .on_exit = on_agy_models_exit,
+            .user = fetch,
+        });
+        if (!fetch->proc) {
+            agy_fetch_destroy(fetch);
+            return;
+        }
+        cat->agy_fetch = fetch;
+        cat->loading_agy = true;
+    }
+}
+
+bool mcode_model_catalog_poll(mcode_model_catalog *cat) {
+    if (!cat || !cat->agy_fetch) return false;
+    mcode_model_fetch *fetch = cat->agy_fetch;
+    pthread_mutex_lock(&fetch->mu);
+    bool finished = fetch->finished;
+    pthread_mutex_unlock(&fetch->mu);
+    if (!finished) return false;
+
+    bool updated = false;
+    if (fetch->exit_code == 0 && fetch->stdout_buf.len > 0) {
+        mcode_model_option parsed[MCODE_MAX_MODELS_PER_AGENT];
+        int cnt = mcode_agent_parse_agy_models_text(mcode_str_cstr(&fetch->stdout_buf),
+                                                    parsed, MCODE_MAX_MODELS_PER_AGENT);
+        if (cnt > 0) {
+            memcpy(cat->items[APP_AGENT_AGY], parsed, (size_t)cnt * sizeof parsed[0]);
+            cat->count[APP_AGENT_AGY] = cnt;
+            cat->loaded_agy = true;
+            updated = true;
+        }
+    }
+    agy_fetch_destroy(fetch);
+    cat->agy_fetch = NULL;
+    cat->loading_agy = false;
+    return updated;
+}
+
+void mcode_model_catalog_free(mcode_model_catalog *cat) {
+    if (!cat) return;
+    if (cat->agy_fetch) {
+        agy_fetch_destroy(cat->agy_fetch);
+        cat->agy_fetch = NULL;
+    }
+    cat->loading_agy = false;
+}
+
+const char *mcode_agent_default_model(const app_settings *settings, app_agent_kind agent) {
+    if (!settings) return "";
+    switch (agent) {
+    case APP_AGENT_CLAUDE: return settings->mcode.default_claude_model;
+    case APP_AGENT_CODEX:  return settings->mcode.default_codex_model;
+    case APP_AGENT_AGY:    return settings->mcode.default_agy_model;
+    default:               return "";
+    }
+}
+
+const char *mcode_agent_effective_model(const mcode_thread *thread, const app_settings *settings) {
+    if (!thread) return "";
+    if (thread->model[0]) return thread->model;
+    return mcode_agent_default_model(settings, thread->agent);
+}
+
+const char *mcode_model_display_label(const mcode_model_catalog *cat, app_agent_kind agent,
+                                      const char *model_id) {
+    if (!model_id || !model_id[0]) return "Default";
+    if (cat && agent >= 0 && agent < APP_AGENT_COUNT) {
+        for (int i = 0; i < cat->count[agent]; ++i) {
+            if (strcmp(cat->items[agent][i].id, model_id) == 0) {
+                return cat->items[agent][i].label[0] ? cat->items[agent][i].label : model_id;
+            }
+        }
+    }
+    return model_id;
+}
+
 const char *mcode_agent_label(app_agent_kind kind) {
     switch (kind) {
     case APP_AGENT_CLAUDE: return "Claude Code";
@@ -918,6 +1240,7 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
     }
 
     const char *bin = status.resolved_path[thread->agent];
+    const char *model = mcode_agent_effective_model(thread, settings);
     const char *argv[32];
     int n = 0;
 
@@ -933,9 +1256,9 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
             argv[n++] = "--resume";
             argv[n++] = thread->session_id;
         }
-        if (thread->model[0]) {
+        if (model[0]) {
             argv[n++] = "--model";
-            argv[n++] = thread->model;
+            argv[n++] = model;
         }
         if (thread->auto_approve) {
             argv[n++] = "--dangerously-skip-permissions";
@@ -947,9 +1270,9 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
             argv[n++] = "resume";
             argv[n++] = "--json";
             argv[n++] = "--skip-git-repo-check";
-            if (thread->model[0]) {
+            if (model[0]) {
                 argv[n++] = "-m";
-                argv[n++] = thread->model;
+                argv[n++] = model;
             }
             if (thread->auto_approve) {
                 argv[n++] = "--dangerously-bypass-approvals-and-sandbox";
@@ -966,9 +1289,9 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
                 argv[n++] = "--cd";
                 argv[n++] = thread->workdir;
             }
-            if (thread->model[0]) {
+            if (model[0]) {
                 argv[n++] = "-m";
-                argv[n++] = thread->model;
+                argv[n++] = model;
             }
             if (thread->auto_approve) {
                 argv[n++] = "--dangerously-bypass-approvals-and-sandbox";
@@ -987,6 +1310,10 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
         if (thread->session_id[0]) {
             argv[n++] = "--conversation";
             argv[n++] = thread->session_id;
+        }
+        if (model[0]) {
+            argv[n++] = "--model";
+            argv[n++] = model;
         }
         if (thread->auto_approve) {
             argv[n++] = "--dangerously-skip-permissions";

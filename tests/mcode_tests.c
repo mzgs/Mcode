@@ -273,11 +273,60 @@ static void test_git_worktree_and_diff(void) {
 }
 #endif
 
+static void test_model_catalog(void) {
+    const char *codex_json =
+        "{\"models\":["
+        "{\"slug\":\"gpt-6.2-sol\",\"display_name\":\"GPT-6.2-Sol\",\"visibility\":\"list\",\"description\":\"Fast go-to model.\"},"
+        "{\"slug\":\"gpt-hidden\",\"display_name\":\"Hidden\",\"visibility\":\"hide\",\"description\":\"Internal.\"},"
+        "{\"slug\":\"gpt-6.2-astra\",\"display_name\":\"GPT-6.2-Astra\",\"visibility\":\"list\",\"description\":\"Complex coding.\"}"
+        "]}";
+    mcode_model_option opts[8];
+    int n = mcode_agent_parse_codex_models_json(codex_json, strlen(codex_json), opts, 8);
+    CHECK(n == 2);
+    CHECK(strcmp(opts[0].id, "gpt-6.2-sol") == 0);
+    CHECK(strcmp(opts[0].label, "GPT-6.2-Sol") == 0);
+    CHECK(strcmp(opts[0].detail, "Fast go-to model.") == 0);
+    CHECK(strcmp(opts[1].id, "gpt-6.2-astra") == 0);
+
+    const char *agy_text =
+        "\r\xe2\xa0\x8b Fetching available models...\rgemini-4-neon-high             Gemini 4 Neon (High)\n"
+        "claude-opus-5-5-high           Claude Opus 5.5 (High)\n"
+        "Not a model line\n";
+    n = mcode_agent_parse_agy_models_text(agy_text, opts, 8);
+    CHECK(n == 2);
+    CHECK(strcmp(opts[0].id, "gemini-4-neon-high") == 0);
+    CHECK(strcmp(opts[0].label, "Gemini 4 Neon (High)") == 0);
+    CHECK(strcmp(opts[1].id, "claude-opus-5-5-high") == 0);
+    CHECK(strcmp(opts[1].label, "Claude Opus 5.5 (High)") == 0);
+
+    mcode_model_catalog cat;
+    mcode_model_catalog_init(&cat);
+    CHECK(cat.count[APP_AGENT_CLAUDE] >= 3);
+    CHECK(cat.count[APP_AGENT_CODEX] >= 1);
+    CHECK(cat.count[APP_AGENT_AGY] >= 1);
+    CHECK(strcmp(mcode_model_display_label(&cat, APP_AGENT_CLAUDE, "opus"), "Claude Opus") == 0);
+    CHECK(strcmp(mcode_model_display_label(&cat, APP_AGENT_CLAUDE, "custom-id"), "custom-id") == 0);
+    CHECK(strcmp(mcode_model_display_label(&cat, APP_AGENT_CLAUDE, ""), "Default") == 0);
+
+    app_settings s;
+    memset(&s, 0, sizeof s);
+    snprintf(s.mcode.default_codex_model, sizeof s.mcode.default_codex_model, "gpt-6.2-sol");
+    mcode_thread t;
+    memset(&t, 0, sizeof t);
+    t.agent = APP_AGENT_CODEX;
+    CHECK(strcmp(mcode_agent_effective_model(&t, &s), "gpt-6.2-sol") == 0);
+    snprintf(t.model, sizeof t.model, "gpt-6.2-astra");
+    CHECK(strcmp(mcode_agent_effective_model(&t, &s), "gpt-6.2-astra") == 0);
+
+    mcode_model_catalog_free(&cat);
+}
+
 int main(void) {
     test_helpers();
     test_claude_parser();
     test_codex_parser();
     test_agy_parser();
+    test_model_catalog();
     test_store_roundtrip();
 #ifndef _WIN32
     test_git_worktree_and_diff();

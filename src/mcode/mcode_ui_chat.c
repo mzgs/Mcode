@@ -1,4 +1,5 @@
 #include "mcode_ui_internal.h"
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -631,6 +632,213 @@ static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int tur
     cui_pop_id(ui);
 }
 
+static bool model_contains_icase(const char *hay, const char *needle) {
+    if (!needle || !needle[0]) return true;
+    if (!hay || !hay[0]) return false;
+    for (; *hay; ++hay) {
+        const char *a = hay, *b = needle;
+        while (*a && *b && tolower((unsigned char)*a) == tolower((unsigned char)*b)) {
+            ++a;
+            ++b;
+        }
+        if (!*b) return true;
+    }
+    return false;
+}
+
+static bool draw_model_option_row(cui_ctx *ui, const char *id, const char *title,
+                                  const char *detail, bool selected) {
+    cui_push_id(ui, id);
+    bool clicked = cui_card_begin(ui, &(cui_card_opts){
+        .id = "mopt",
+        .width = CUI_FILL,
+        .pad_x = 9,
+        .pad_y = 6,
+        .gap = 2,
+        .hoverable = true,
+        .selected = selected,
+        .border = selected ? 1.0f : -1.0f,
+        .radius = 7,
+    });
+    cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
+        cui_text(ui, title, .font = CUI_FONT_MEDIUM, .size = 13,
+                 .width = CUI_FILL, .nowrap = true);
+        if (selected) {
+            cui_icon(ui, CUI_ICON_CHECK, 14, CUI_COLOR_ACCENT);
+        }
+    }
+    if (detail && detail[0] && strcmp(detail, title) != 0) {
+        cui_text(ui, detail, .size = 11.5f, .color = CUI_COLOR_TEXT_MUTED,
+                 .width = CUI_FILL, .nowrap = true);
+    }
+    cui_card_end(ui);
+    cui_pop_id(ui);
+    return clicked;
+}
+
+static void draw_thread_model_selector(mcode_app *app, cui_ctx *ui, mcode_thread *thread, bool busy) {
+    const app_settings *settings = app_chrome_settings(app->chrome);
+    const char *def_model = mcode_agent_default_model(settings, thread->agent);
+    const char *eff_model = mcode_agent_effective_model(thread, settings);
+    const char *shown = eff_model[0]
+        ? mcode_model_display_label(&app->models, thread->agent, eff_model)
+        : "Default model";
+
+    char btn_label[140];
+    if (!thread->model[0] && def_model[0]) {
+        snprintf(btn_label, sizeof btn_label, "%s (Default)###model-btn", shown);
+    } else {
+        snprintf(btn_label, sizeof btn_label, "%s###model-btn", shown);
+    }
+
+    char tooltip[192];
+    if (eff_model[0]) {
+        snprintf(tooltip, sizeof tooltip, "Model: %s (click to change)", eff_model);
+    } else {
+        snprintf(tooltip, sizeof tooltip, "Select model for %s", mcode_agent_label(thread->agent));
+    }
+
+    bool open = cui_popover_is_open(ui, "model-picker-pop");
+    if (cui_button(ui, btn_label,
+                   .variant = CUI_BUTTON_OUTLINE,
+                   .size = CUI_SIZE_SM,
+                   .icon = CUI_ICON_CPU,
+                   .icon_right = CUI_ICON_CHEVRON_DOWN,
+                   .disabled = busy,
+                   .selected = open,
+                   .tooltip = tooltip)) {
+        app->model_search[0] = '\0';
+        snprintf(app->model_custom_input, sizeof app->model_custom_input, "%s", thread->model);
+        cui_popover_toggle(ui, "model-picker-pop");
+    }
+
+    cui_popover(ui, "model-picker-pop", .placement = CUI_PLACE_TOP_START,
+                .width = 340, .pad = 10, .gap = 8) {
+        cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
+            char hdr[96];
+            snprintf(hdr, sizeof hdr, "%s Model", mcode_agent_label(thread->agent));
+            cui_text(ui, hdr, .font = CUI_FONT_MEDIUM, .size = 13, .width = CUI_FILL);
+            if (thread->agent == APP_AGENT_AGY && app->models.loading_agy) {
+                cui_spinner(ui, 13);
+            } else if (thread->agent == APP_AGENT_CODEX || thread->agent == APP_AGENT_AGY) {
+                if (cui_icon_button(ui, CUI_ICON_REFRESH_CW, .size = CUI_SIZE_SM,
+                                    .variant = CUI_BUTTON_GHOST,
+                                    .tooltip = "Refresh available models")) {
+                    mcode_agent_detect_clis(settings, &app->cli_status);
+                    mcode_model_catalog_refresh(&app->models, &app->cli_status);
+                }
+            }
+        }
+
+        cui_search(ui, "model-filter", app->model_search, sizeof app->model_search,
+                   .placeholder = "Filter models...", .width = CUI_FILL);
+
+        int cat_count = (thread->agent >= 0 && thread->agent < APP_AGENT_COUNT)
+            ? app->models.count[thread->agent] : 0;
+        bool has_custom_active = false;
+        if (thread->model[0]) {
+            has_custom_active = true;
+            for (int i = 0; i < cat_count; ++i) {
+                if (strcmp(app->models.items[thread->agent][i].id, thread->model) == 0) {
+                    has_custom_active = false;
+                    break;
+                }
+            }
+        }
+
+        bool show_default = model_contains_icase("CLI default", app->model_search) ||
+                            model_contains_icase(def_model, app->model_search);
+        int visible = show_default ? 1 : 0;
+        if (has_custom_active && model_contains_icase(thread->model, app->model_search)) {
+            ++visible;
+        }
+        for (int i = 0; i < cat_count; ++i) {
+            const mcode_model_option *m = &app->models.items[thread->agent][i];
+            if (model_contains_icase(m->label, app->model_search) ||
+                model_contains_icase(m->id, app->model_search) ||
+                model_contains_icase(m->detail, app->model_search)) {
+                ++visible;
+            }
+        }
+
+        float list_h = visible > 0 ? (float)visible * 48.0f : 44.0f;
+        if (list_h > 240.0f) list_h = 240.0f;
+        if (list_h < 48.0f) list_h = 48.0f;
+
+        cui_scroll(ui, .id = "model-picker-list", .width = CUI_FILL,
+                   .height = CUI_PX(list_h), .gap = 3) {
+            if (show_default) {
+                char def_detail[160];
+                if (def_model[0]) {
+                    snprintf(def_detail, sizeof def_detail, "Uses Settings default (%s)", def_model);
+                } else {
+                    snprintf(def_detail, sizeof def_detail, "Use %s's configured default model",
+                             mcode_agent_label(thread->agent));
+                }
+                if (draw_model_option_row(ui, "default", "CLI Default", def_detail,
+                                          thread->model[0] == '\0')) {
+                    thread->model[0] = '\0';
+                    mcode_ui_mark_dirty(app);
+                    cui_popover_close(ui, "model-picker-pop");
+                }
+            }
+
+            if (has_custom_active && model_contains_icase(thread->model, app->model_search)) {
+                if (draw_model_option_row(ui, "custom-active", thread->model, "Custom model ID", true)) {
+                    cui_popover_close(ui, "model-picker-pop");
+                }
+            }
+
+            for (int i = 0; i < cat_count; ++i) {
+                const mcode_model_option *m = &app->models.items[thread->agent][i];
+                if (!model_contains_icase(m->label, app->model_search) &&
+                    !model_contains_icase(m->id, app->model_search) &&
+                    !model_contains_icase(m->detail, app->model_search)) {
+                    continue;
+                }
+                bool sel = thread->model[0] && strcmp(thread->model, m->id) == 0;
+                const char *sub = m->detail[0] ? m->detail : m->id;
+                char row_id[48];
+                snprintf(row_id, sizeof row_id, "m-%d", i);
+                if (draw_model_option_row(ui, row_id, m->label, sub, sel)) {
+                    snprintf(thread->model, sizeof thread->model, "%s", m->id);
+                    mcode_ui_mark_dirty(app);
+                    cui_popover_close(ui, "model-picker-pop");
+                }
+            }
+
+            if (visible == 0) {
+                cui_box(ui, .pad = 10, .width = CUI_FILL) {
+                    cui_muted(ui, "No matching models.");
+                }
+            }
+        }
+
+        cui_separator(ui);
+        cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
+            int f = cui_input(ui, "custom-model-input", app->model_custom_input,
+                              sizeof app->model_custom_input,
+                              .placeholder = "Custom model ID...",
+                              .size = CUI_SIZE_SM, .width = CUI_FILL);
+            bool apply = (f & CUI_SUBMITTED) != 0;
+            if (cui_button(ui, "Use", .variant = CUI_BUTTON_SECONDARY, .size = CUI_SIZE_SM)) {
+                apply = true;
+            }
+            if (apply) {
+                const char *p = app->model_custom_input;
+                while (*p && isspace((unsigned char)*p)) ++p;
+                size_t len = strlen(p);
+                while (len > 0 && isspace((unsigned char)p[len - 1])) --len;
+                if (len >= sizeof thread->model) len = sizeof thread->model - 1;
+                memcpy(thread->model, p, len);
+                thread->model[len] = '\0';
+                mcode_ui_mark_dirty(app);
+                cui_popover_close(ui, "model-picker-pop");
+            }
+        }
+    }
+}
+
 void mcode_ui_draw_chat(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
     if (!thread) {
         draw_empty_workspace(app, ui);
@@ -648,10 +856,18 @@ void mcode_ui_draw_chat(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
                     if (thread->turn_count == 0) {
                         cui_column(ui, .width = CUI_FILL, .pad_y = 20, .gap = 14) {
                             cui_heading(ui, thread->title, 4);
-                            char sub[256];
-                            snprintf(sub, sizeof sub, "Ready in %s with %s.",
-                                     thread->workdir[0] ? thread->workdir : "project",
-                                     mcode_agent_label(thread->agent));
+                            const char *eff_model = mcode_agent_effective_model(thread, app_chrome_settings(app->chrome));
+                            char sub[320];
+                            if (eff_model[0]) {
+                                snprintf(sub, sizeof sub, "Ready in %s with %s (%s).",
+                                         thread->workdir[0] ? thread->workdir : "project",
+                                         mcode_agent_label(thread->agent),
+                                         mcode_model_display_label(&app->models, thread->agent, eff_model));
+                            } else {
+                                snprintf(sub, sizeof sub, "Ready in %s with %s.",
+                                         thread->workdir[0] ? thread->workdir : "project",
+                                         mcode_agent_label(thread->agent));
+                            }
                             cui_secondary(ui, sub);
 
                             int pick = cui_prompt_suggestions(ui, "starter-prompts",
@@ -683,8 +899,11 @@ void mcode_ui_draw_chat(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
         cui_separator(ui);
         cui_row(ui, .width = CUI_FILL, .justify = CUI_JUSTIFY_CENTER, .pad_x = 16, .pad_y = 12) {
             cui_column(ui, .width = CUI_FILL, .max_width = 860, .gap = 8) {
+                bool busy = (thread->active_run != NULL);
+
                 /* Compact pre-composer options strip */
                 cui_row(ui, .width = CUI_FILL, .gap = 10, .align = CUI_ALIGN_CENTER, .wrap = true) {
+                    draw_thread_model_selector(app, ui, thread, busy);
                     if (!app->cli_status.available[thread->agent]) {
                         cui_badge(ui, "CLI not found", .icon = CUI_ICON_TRIANGLE_ALERT,
                                   .tone = CUI_TONE_DANGER, .size = CUI_SIZE_SM);
@@ -694,9 +913,6 @@ void mcode_ui_draw_chat(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
                         snprintf(sshort, sizeof sshort, "Session %.8s", thread->session_id);
                         cui_muted(ui, sshort);
                     }
-                    if (thread->model[0]) {
-                        cui_badge(ui, thread->model, .size = CUI_SIZE_SM);
-                    }
                     cui_spacer(ui);
                     if (cui_chip(ui, "Auto-approve", &thread->auto_approve)) {
                         mcode_ui_mark_dirty(app);
@@ -704,7 +920,6 @@ void mcode_ui_draw_chat(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
                 }
 
                 int agent_sel = (int)thread->agent;
-                bool busy = (thread->active_run != NULL);
                 static const char *const k_first_placeholders[APP_AGENT_COUNT] = {
                     "Ask Claude Code to implement a feature, fix a bug, or inspect code...",
                     "Ask Codex to implement a feature, fix a bug, or inspect code...",
@@ -749,8 +964,10 @@ void mcode_ui_draw_chat(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
                     if (!busy && agent_sel >= 0 && agent_sel < APP_AGENT_COUNT &&
                         agent_sel != (int)thread->agent) {
                         thread->agent = (app_agent_kind)agent_sel;
-                        /* Reset session ID when switching agent provider */
+                        /* Reset session ID and model override when switching agent provider */
                         thread->session_id[0] = '\0';
+                        thread->model[0] = '\0';
+                        cui_popover_close(ui, "model-picker-pop");
                         mcode_ui_mark_dirty(app);
                     }
                 }

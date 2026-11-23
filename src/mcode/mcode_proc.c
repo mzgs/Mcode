@@ -128,6 +128,7 @@ bool mcode_find_executable(const char *name_or_path, char *out, size_t cap) {
             "/.cargo/bin",
             "/.npm-global/bin",
             "/bin",
+            "/.gemini/bin",
             "/.antigravity/bin",
         };
         for (size_t i = 0; i < sizeof home_suffixes / sizeof home_suffixes[0]; ++i) {
@@ -156,8 +157,8 @@ static void augment_child_path(void) {
     char next_path[4096];
     if (home && home[0]) {
         snprintf(next_path, sizeof next_path,
-                 "%s/.local/bin:/opt/homebrew/bin:/usr/local/bin:%s",
-                 home, (cur && cur[0]) ? cur : "/usr/bin:/bin");
+                 "%s/.local/bin:%s/.gemini/bin:/opt/homebrew/bin:/usr/local/bin:%s",
+                 home, home, (cur && cur[0]) ? cur : "/usr/bin:/bin");
     } else {
         snprintf(next_path, sizeof next_path,
                  "/opt/homebrew/bin:/usr/local/bin:%s",

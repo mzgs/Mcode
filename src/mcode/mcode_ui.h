@@ -17,6 +17,11 @@ typedef struct {
 
     mcode_cli_status cli_status;
     double cli_checked_at;
+    mcode_model_catalog models;
+
+    /* Model picker popover state */
+    char model_search[128];
+    char model_custom_input[APP_MODEL_NAME_MAX];
 
     /* Sidebar search & filter */
     char thread_search[128];
@@ -27,6 +32,7 @@ typedef struct {
     int new_thread_agent;
     char new_thread_title[MCODE_NAME_MAX];
     char new_thread_model[APP_MODEL_NAME_MAX];
+    bool new_thread_custom_model;
     bool new_thread_worktree;
     bool new_thread_auto_approve;
 

@@ -274,10 +274,13 @@ void mcode_app_init(mcode_app *app, app_chrome *chrome) {
 
     mcode_agent_detect_clis(chrome ? app_chrome_settings(chrome) : NULL, &app->cli_status);
     app->cli_checked_at = mcode_now_mono();
+    mcode_model_catalog_init(&app->models);
+    mcode_model_catalog_refresh(&app->models, &app->cli_status);
 }
 
 void mcode_app_shutdown(mcode_app *app) {
     if (!app) return;
+    mcode_model_catalog_free(&app->models);
     if (app->term_proc) {
         mcode_proc_destroy(app->term_proc);
         app->term_proc = NULL;
@@ -347,17 +350,24 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
         if (sel) mcode_ui_refresh_thread_diff(sel);
     }
 
+    bool catalog_updated = mcode_model_catalog_poll(&app->models);
     if (running > 0 || term_active) {
         cui_request_wakeup(ui, 0.05f);
-    } else if (any_finished) {
+    } else if (app->models.loading_agy) {
+        cui_request_wakeup(ui, 0.1f);
+    } else if (any_finished || catalog_updated) {
         cui_request_redraw(ui);
     }
 
     /* Refresh CLI availability periodically when settings dialog closes or every 30s */
     double now = mcode_now_mono();
     if (now - app->cli_checked_at > 30.0) {
+        bool had_agy = app->cli_status.available[APP_AGENT_AGY];
         mcode_agent_detect_clis(app_chrome_settings(app->chrome), &app->cli_status);
         app->cli_checked_at = now;
+        if (app->cli_status.available[APP_AGENT_AGY] && (!had_agy || !app->models.loaded_agy)) {
+            mcode_model_catalog_refresh(&app->models, &app->cli_status);
+        }
     }
 
     /* Debounced atomic save of workspace state */
@@ -520,6 +530,7 @@ void mcode_app_action_new_thread(cui_ctx *ui, void *user) {
     app->new_thread_agent = (int)s->mcode.default_agent;
     app->new_thread_title[0] = '\0';
     app->new_thread_model[0] = '\0';
+    app->new_thread_custom_model = false;
     app->new_thread_worktree = s->mcode.use_worktrees_by_default;
     app->new_thread_auto_approve = s->mcode.auto_approve_permissions;
     app->new_thread_open = true;
