@@ -300,6 +300,12 @@ static const char *const theme_names[APP_THEME_COUNT] = {
     "dark",
 };
 
+static const char *const agent_names[APP_AGENT_COUNT] = {
+    "claude",
+    "codex",
+    "agy",
+};
+
 static double json_number(yyjson_val *value) {
     return yyjson_is_num(value) ? yyjson_get_num(value) : NAN;
 }
@@ -327,6 +333,18 @@ static bool str_eq_ignore_case(const char *a, const char *b) {
         ++b;
     }
     return *a == *b;
+}
+
+static bool parse_agent_kind(yyjson_val *value, app_agent_kind *out) {
+    const char *text = json_cstr(value, NULL);
+    if (!text) return false;
+    for (int i = 0; i < APP_AGENT_COUNT; ++i) {
+        if (str_eq_ignore_case(text, agent_names[i])) {
+            *out = (app_agent_kind)i;
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool parse_theme_mode(yyjson_val *value, app_theme_mode *out) {
@@ -431,16 +449,51 @@ bool app_settings_load(app_settings *settings, const char *override) {
     app_settings loaded = *settings;
     bool applied = false;
 
-    size_t len = 0;
-    const char *text = json_cstr(yyjson_obj_get(root, "example_string"), &len);
-    if (text && len < sizeof loaded.example_string) {
-        memcpy(loaded.example_string, text, len + 1);
-        applied = true;
-    }
-    double number = json_number(yyjson_obj_get(root, "example_number"));
-    if (number >= EXAMPLE_NUMBER_MIN && number <= EXAMPLE_NUMBER_MAX) {
-        loaded.example_number = number;
-        applied = true;
+    yyjson_val *mcode = yyjson_obj_get(root, "mcode");
+    if (yyjson_is_obj(mcode)) {
+        if (parse_agent_kind(yyjson_obj_get(mcode, "default_agent"), &loaded.mcode.default_agent))
+            applied = true;
+        yyjson_val *wt = yyjson_obj_get(mcode, "use_worktrees_by_default");
+        if (yyjson_is_bool(wt)) {
+            loaded.mcode.use_worktrees_by_default = yyjson_get_bool(wt);
+            applied = true;
+        }
+        yyjson_val *aa = yyjson_obj_get(mcode, "auto_approve_permissions");
+        if (yyjson_is_bool(aa)) {
+            loaded.mcode.auto_approve_permissions = yyjson_get_bool(aa);
+            applied = true;
+        }
+        size_t len = 0;
+        const char *text = json_cstr(yyjson_obj_get(mcode, "claude_bin"), &len);
+        if (text && len < sizeof loaded.mcode.claude_bin) {
+            memcpy(loaded.mcode.claude_bin, text, len + 1);
+            applied = true;
+        }
+        text = json_cstr(yyjson_obj_get(mcode, "codex_bin"), &len);
+        if (text && len < sizeof loaded.mcode.codex_bin) {
+            memcpy(loaded.mcode.codex_bin, text, len + 1);
+            applied = true;
+        }
+        text = json_cstr(yyjson_obj_get(mcode, "agy_bin"), &len);
+        if (text && len < sizeof loaded.mcode.agy_bin) {
+            memcpy(loaded.mcode.agy_bin, text, len + 1);
+            applied = true;
+        }
+        text = json_cstr(yyjson_obj_get(mcode, "default_claude_model"), &len);
+        if (text && len < sizeof loaded.mcode.default_claude_model) {
+            memcpy(loaded.mcode.default_claude_model, text, len + 1);
+            applied = true;
+        }
+        text = json_cstr(yyjson_obj_get(mcode, "default_codex_model"), &len);
+        if (text && len < sizeof loaded.mcode.default_codex_model) {
+            memcpy(loaded.mcode.default_codex_model, text, len + 1);
+            applied = true;
+        }
+        text = json_cstr(yyjson_obj_get(mcode, "default_agy_model"), &len);
+        if (text && len < sizeof loaded.mcode.default_agy_model) {
+            memcpy(loaded.mcode.default_agy_model, text, len + 1);
+            applied = true;
+        }
     }
 
     yyjson_val *appearance = yyjson_obj_get(root, "appearance");
@@ -557,9 +610,21 @@ bool app_settings_save(const app_settings *settings, const char *override) {
     if (!doc) return false;
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
-    bool ok = root &&
-        yyjson_mut_obj_add_str(doc, root, "example_string", settings->example_string) &&
-        yyjson_mut_obj_add_real(doc, root, "example_number", settings->example_number);
+    const char *agent_name = (settings->mcode.default_agent >= 0 &&
+                              settings->mcode.default_agent < APP_AGENT_COUNT)
+        ? agent_names[settings->mcode.default_agent] : agent_names[APP_AGENT_CLAUDE];
+    yyjson_mut_val *mcode = root ? yyjson_mut_obj(doc) : NULL;
+    bool ok = root && mcode &&
+        yyjson_mut_obj_add_str(doc, mcode, "default_agent", agent_name) &&
+        yyjson_mut_obj_add_bool(doc, mcode, "use_worktrees_by_default", settings->mcode.use_worktrees_by_default) &&
+        yyjson_mut_obj_add_bool(doc, mcode, "auto_approve_permissions", settings->mcode.auto_approve_permissions) &&
+        yyjson_mut_obj_add_str(doc, mcode, "claude_bin", settings->mcode.claude_bin) &&
+        yyjson_mut_obj_add_str(doc, mcode, "codex_bin", settings->mcode.codex_bin) &&
+        yyjson_mut_obj_add_str(doc, mcode, "agy_bin", settings->mcode.agy_bin) &&
+        yyjson_mut_obj_add_str(doc, mcode, "default_claude_model", settings->mcode.default_claude_model) &&
+        yyjson_mut_obj_add_str(doc, mcode, "default_codex_model", settings->mcode.default_codex_model) &&
+        yyjson_mut_obj_add_str(doc, mcode, "default_agy_model", settings->mcode.default_agy_model) &&
+        yyjson_mut_obj_add_val(doc, root, "mcode", mcode);
 
     const char *theme_name = (settings->appearance.theme_mode >= 0 &&
                               settings->appearance.theme_mode < APP_THEME_COUNT)

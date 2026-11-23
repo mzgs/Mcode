@@ -9,8 +9,6 @@
 #define APP_KEYBINDING_COMMAND_PALETTE "command_palette"
 
 enum {
-    EXAMPLE_NUMBER_MIN = 0,
-    EXAMPLE_NUMBER_MAX = 100,
     WINDOW_WIDTH_MIN = 360,
     WINDOW_WIDTH_MAX = 8192,
     WINDOW_HEIGHT_MIN = 280,
@@ -20,10 +18,19 @@ enum {
     APP_MAX_KEYBINDINGS = 64,
     APP_KEYBINDING_ID_MAX = 64,
     APP_KEYBINDING_LABEL_MAX = 96,
+    APP_CLI_PATH_MAX = 512,
+    APP_MODEL_NAME_MAX = 96,
 };
 
 #define FONT_SCALE_MIN 0.85f
 #define FONT_SCALE_MAX 1.35f
+
+typedef enum {
+    APP_AGENT_CLAUDE = 0,
+    APP_AGENT_CODEX,
+    APP_AGENT_AGY,
+    APP_AGENT_COUNT
+} app_agent_kind;
 
 typedef enum {
     APP_THEME_SYSTEM = 0,
@@ -45,9 +52,18 @@ typedef struct {
 } app_deferred_keybinding;
 
 typedef struct {
-    /* Template example fields — replace with your own app settings. */
-    char example_string[128];
-    double example_number;
+    /* Mcode agent & workflow preferences. */
+    struct {
+        app_agent_kind default_agent;
+        bool use_worktrees_by_default;
+        bool auto_approve_permissions;
+        char claude_bin[APP_CLI_PATH_MAX];
+        char codex_bin[APP_CLI_PATH_MAX];
+        char agy_bin[APP_CLI_PATH_MAX];
+        char default_claude_model[APP_MODEL_NAME_MAX];
+        char default_codex_model[APP_MODEL_NAME_MAX];
+        char default_agy_model[APP_MODEL_NAME_MAX];
+    } mcode;
 
     /* Persisted appearance preferences. */
     struct {

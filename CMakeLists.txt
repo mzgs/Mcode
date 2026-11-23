@@ -2,16 +2,16 @@ cmake_minimum_required(VERSION 3.14)
 if(CMAKE_HOST_APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET AND "$ENV{MACOSX_DEPLOYMENT_TARGET}" STREQUAL "")
     set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "Minimum macOS deployment version" FORCE)
 endif()
-project(c_gui_template VERSION 0.1.10 LANGUAGES C)
+project(mcode VERSION 0.1.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-set(APP_NAME "C GUI Template" CACHE STRING "App name used for the window and settings folder")
-set(APP_DESCRIPTION "A C99 desktop app built with Better-C-UI." CACHE STRING "Short app description for OS metadata and About")
-set(APP_AUTHOR "Example" CACHE STRING "Publisher / author name for OS executable metadata")
+set(APP_NAME "Mcode" CACHE STRING "App name used for the window and settings folder")
+set(APP_DESCRIPTION "Native desktop control plane for AI coding agents." CACHE STRING "Short app description for OS metadata and About")
+set(APP_AUTHOR "Mcode" CACHE STRING "Publisher / author name for OS executable metadata")
 set(APP_COPYRIGHT "" CACHE STRING "Optional copyright notice for macOS Info.plist and Windows version info")
-set(APP_BUNDLE_ID "com.example.c-gui-template" CACHE STRING "Reverse-DNS app identifier (macOS CFBundleIdentifier, Linux desktop/icon ID)")
-set(APP_GITHUB_REPO "mzgs/C-GUI-Template" CACHE STRING "GitHub owner/repo for update checks (empty to disable)")
+set(APP_BUNDLE_ID "com.mcode.app" CACHE STRING "Reverse-DNS app identifier (macOS CFBundleIdentifier, Linux desktop/icon ID)")
+set(APP_GITHUB_REPO "" CACHE STRING "GitHub owner/repo for update checks (empty to disable)")
 
 function(app_escape_xml out_var value)
     string(REPLACE "&" "&amp;" value "${value}")
@@ -118,8 +118,23 @@ if(APPLE)
     target_link_libraries(app_chrome PRIVATE "-framework Cocoa")
 endif()
 
+add_library(app_mcode STATIC
+    src/mcode/mcode_types.c
+    src/mcode/mcode_proc.c
+    src/mcode/mcode_git.c
+    src/mcode/mcode_agent.c
+    src/mcode/mcode_store.c
+    src/mcode/mcode_ui.c
+    src/mcode/mcode_ui_sidebar.c
+    src/mcode/mcode_ui_chat.c
+    src/mcode/mcode_ui_diff.c
+    src/mcode/mcode_ui_terminal.c
+    src/mcode/mcode_ui_dialogs.c)
+target_include_directories(app_mcode PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src/mcode")
+target_link_libraries(app_mcode PUBLIC app_chrome PRIVATE app_common yyjson Threads::Threads)
+
 add_executable(empty_gui MACOSX_BUNDLE main.c)
-target_link_libraries(empty_gui PRIVATE app_chrome app_common)
+target_link_libraries(empty_gui PRIVATE app_mcode app_chrome app_common)
 cui_app_target(empty_gui)
 install(TARGETS empty_gui
     BUNDLE DESTINATION . COMPONENT app
@@ -146,6 +161,10 @@ if(APPLE)
         MACOSX_BUNDLE_GUI_IDENTIFIER "${APP_BUNDLE_ID}"
         MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
         MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}")
+    add_custom_command(TARGET empty_gui POST_BUILD
+        COMMAND /bin/sh "${CMAKE_CURRENT_SOURCE_DIR}/scripts/codesign_macos.sh" "$<TARGET_BUNDLE_DIR:empty_gui>"
+        COMMENT "Code signing ${APP_NAME}.app (if ~/.macos-codesign/macos-codesign.p12 is present)"
+        VERBATIM)
     add_custom_target(run COMMAND $<TARGET_FILE:empty_gui> DEPENDS empty_gui
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" USES_TERMINAL VERBATIM)
 elseif(WIN32)
@@ -209,6 +228,10 @@ if(BUILD_TESTING)
     add_executable(actions_tests tests/actions_tests.c)
     target_link_libraries(actions_tests PRIVATE app_chrome app_common)
     add_test(NAME actions_tests COMMAND actions_tests)
+
+    add_executable(mcode_tests tests/mcode_tests.c)
+    target_link_libraries(mcode_tests PRIVATE app_mcode app_common)
+    add_test(NAME mcode_tests COMMAND mcode_tests)
 
     add_test(NAME window_smoke COMMAND ${CMAKE_COMMAND} -E env
         "CUI_SCREENSHOT=${CMAKE_CURRENT_BINARY_DIR}/window-smoke.png"

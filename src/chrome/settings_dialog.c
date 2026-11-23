@@ -13,25 +13,58 @@ static void setting_row_begin(cui_ctx *ui, const char *label, bool compact, bool
 }
 
 static bool draw_general_section(app_chrome *chrome, cui_ctx *ui, bool compact) {
+    static const char *const agent_labels[APP_AGENT_COUNT] = {
+        "Claude Code", "Codex", "Antigravity CLI"
+    };
     bool changed = false;
 
-    setting_row_begin(ui, "Example string", compact, false);
-    int flags = cui_input(ui, "example-string", chrome->settings.example_string,
-                          sizeof chrome->settings.example_string, .width = CUI_FILL);
-    if (flags & CUI_CHANGED) chrome->settings_dirty = true;
-    if (chrome->settings_dirty && (flags & (CUI_SUBMITTED | CUI_BLURRED))) changed = true;
+    setting_row_begin(ui, "Default agent", compact, true);
+    int agent = (int)chrome->settings.mcode.default_agent;
+    bool agent_changed = compact
+        ? cui_select(ui, "default-agent", agent_labels, APP_AGENT_COUNT, &agent, .width = CUI_FILL)
+        : cui_segmented(ui, "default-agent", agent_labels, APP_AGENT_COUNT, &agent);
+    if (agent_changed) {
+        chrome->settings.mcode.default_agent = (app_agent_kind)agent;
+        changed = true;
+    }
     cui_box_end(ui);
 
-    setting_row_begin(ui, "Example number (0–100)", compact, false);
-    double previous = chrome->settings.example_number;
-    if (cui_number(ui, "example-number", &chrome->settings.example_number,
-                   EXAMPLE_NUMBER_MIN, EXAMPLE_NUMBER_MAX, .width = CUI_FILL)) {
-        if (isfinite(chrome->settings.example_number)) {
-            changed = true;
-        } else {
-            chrome->settings.example_number = previous;
-        }
+    if (cui_switch(ui, "Isolate new threads in Git worktrees",
+                   &chrome->settings.mcode.use_worktrees_by_default,
+                   .description = "Create a dedicated branch and worktree under ~/.mcode/worktrees/ for each thread")) {
+        changed = true;
     }
+    if (cui_switch(ui, "Auto-approve agent permissions",
+                   &chrome->settings.mcode.auto_approve_permissions,
+                   .description = "Pass unattended execution flags (best used with isolated worktrees)")) {
+        changed = true;
+    }
+
+    cui_separator(ui);
+    cui_text(ui, "Agent CLI Binaries", .font = CUI_FONT_MEDIUM);
+
+    setting_row_begin(ui, "Claude CLI", compact, false);
+    int f_claude = cui_input(ui, "claude-bin", chrome->settings.mcode.claude_bin,
+                             sizeof chrome->settings.mcode.claude_bin,
+                             .placeholder = "claude", .width = CUI_FILL);
+    if (f_claude & CUI_CHANGED) chrome->settings_dirty = true;
+    if (chrome->settings_dirty && (f_claude & (CUI_SUBMITTED | CUI_BLURRED))) changed = true;
+    cui_box_end(ui);
+
+    setting_row_begin(ui, "Codex CLI", compact, false);
+    int f_codex = cui_input(ui, "codex-bin", chrome->settings.mcode.codex_bin,
+                            sizeof chrome->settings.mcode.codex_bin,
+                            .placeholder = "codex", .width = CUI_FILL);
+    if (f_codex & CUI_CHANGED) chrome->settings_dirty = true;
+    if (chrome->settings_dirty && (f_codex & (CUI_SUBMITTED | CUI_BLURRED))) changed = true;
+    cui_box_end(ui);
+
+    setting_row_begin(ui, "Antigravity CLI", compact, false);
+    int f_agy = cui_input(ui, "agy-bin", chrome->settings.mcode.agy_bin,
+                          sizeof chrome->settings.mcode.agy_bin,
+                          .placeholder = "agy", .width = CUI_FILL);
+    if (f_agy & CUI_CHANGED) chrome->settings_dirty = true;
+    if (chrome->settings_dirty && (f_agy & (CUI_SUBMITTED | CUI_BLURRED))) changed = true;
     cui_box_end(ui);
 
     cui_separator(ui);

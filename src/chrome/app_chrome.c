@@ -24,8 +24,17 @@ const char *const chrome_section_icons[SETTINGS_SECTION_COUNT] = {
 };
 
 static const app_settings k_default_settings = {
-    .example_string = "Example",
-    .example_number = 42,
+    .mcode = {
+        .default_agent = APP_AGENT_CLAUDE,
+        .use_worktrees_by_default = true,
+        .auto_approve_permissions = false,
+        .claude_bin = "claude",
+        .codex_bin = "codex",
+        .agy_bin = "agy",
+        .default_claude_model = "",
+        .default_codex_model = "",
+        .default_agy_model = "",
+    },
     .appearance = {
         .theme_mode = APP_THEME_SYSTEM,
         .accent = CUI_ACCENT_NEUTRAL,
@@ -36,12 +45,12 @@ static const app_settings k_default_settings = {
         .has_pos = false,
         .x = 0,
         .y = 0,
-        .width = 900,
-        .height = 600,
+        .width = 1360,
+        .height = 860,
         .fullscreen = false,
     },
     .updates = {
-        .check_on_startup = true,
+        .check_on_startup = false,
     },
 };
 
