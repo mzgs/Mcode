@@ -652,7 +652,6 @@ static void draw_empty_workspace(mcode_app *app, cui_ctx *ui) {
 
 static void draw_thread_header(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
     const mcode_project *proj = mcode_store_find_project(&app->store, thread->project_id);
-    bool running = (thread->active_run != NULL);
 
     cui_column(ui, .width = CUI_FILL, .gap = 0) {
         cui_row(ui, .width = CUI_FILL, .pad_x = 16, .pad_y = 10, .gap = 10,
@@ -670,15 +669,7 @@ static void draw_thread_header(mcode_app *app, cui_ctx *ui, mcode_thread *thread
                         }
                         mcode_ui_mark_dirty(app);
                     }
-                    if (running) {
-                        float secs = (float)(mcode_now_mono() - thread->run_started_mono);
-                        char elapsed[32];
-                        format_work_duration(secs, true, elapsed, sizeof elapsed);
-                        char status_lbl[192];
-                        snprintf(status_lbl, sizeof status_lbl, "%s · %s",
-                                 thread->status_text[0] ? thread->status_text : "Working", elapsed);
-                        cui_agent_status(ui, status_lbl, .status = CUI_TASK_RUNNING);
-                    } else if (thread->state == MCODE_THREAD_SETTLED) {
+                    if (!thread->active_run && thread->state == MCODE_THREAD_SETTLED) {
                         cui_badge(ui, "Settled", .tone = CUI_TONE_SUCCESS, .icon = CUI_ICON_CHECK,
                                   .size = CUI_SIZE_SM);
                     }
@@ -836,11 +827,11 @@ static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int tur
                 : turn->duration_sec;
             char elapsed[32];
             format_work_duration(live_secs, true, elapsed, sizeof elapsed);
-            cui_row(ui, .gap = 6, .align = CUI_ALIGN_CENTER) {
-                cui_spinner(ui, 12);
-                cui_shimmer_text(ui, "Working", .font = CUI_FONT_MEDIUM, .size = 13, .nowrap = true);
-                cui_text(ui, "·", .size = 12.5f, .color = CUI_COLOR_TEXT_MUTED);
-                cui_text(ui, elapsed, .size = 12.5f, .color = CUI_COLOR_TEXT_MUTED, .tabular = true);
+            char status_lbl[192];
+            snprintf(status_lbl, sizeof status_lbl, "%s · %s",
+                     thread->status_text[0] ? thread->status_text : "Working", elapsed);
+            cui_row(ui, .width = CUI_FILL, .clip = true) {
+                cui_agent_status(ui, status_lbl, .status = CUI_TASK_RUNNING);
             }
         }
 
