@@ -23,9 +23,9 @@ void mcode_ui_format_elapsed(float seconds, char *out, size_t cap) {
     if (total < 60) {
         snprintf(out, cap, "%ds", total);
     } else if (total < 3600) {
-        snprintf(out, cap, "%dm %02ds", total / 60, total % 60);
+        snprintf(out, cap, "%dm %ds", total / 60, total % 60);
     } else {
-        snprintf(out, cap, "%dh %02dm", total / 3600, (total % 3600) / 60);
+        snprintf(out, cap, "%dh %dm", total / 3600, (total % 3600) / 60);
     }
 }
 

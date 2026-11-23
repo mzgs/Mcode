@@ -46,6 +46,35 @@ static bool looks_like_json(const char *s) {
     return *s == '{' || *s == '[';
 }
 
+static void format_work_duration(float seconds, bool live, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    if (seconds < 0.0f) seconds = 0.0f;
+    int total = (int)seconds;
+    if (!live && total == 0) {
+        snprintf(out, cap, "<1s");
+        return;
+    }
+    if (total < 60) {
+        snprintf(out, cap, "%ds", total);
+    } else if (total < 3600) {
+        int m = total / 60;
+        int s = total % 60;
+        if (!live && s == 0) {
+            snprintf(out, cap, "%dm", m);
+        } else {
+            snprintf(out, cap, "%dm %ds", m, s);
+        }
+    } else {
+        int h = total / 3600;
+        int m = (total % 3600) / 60;
+        if (!live && m == 0) {
+            snprintf(out, cap, "%dh", h);
+        } else {
+            snprintf(out, cap, "%dh %dm", h, m);
+        }
+    }
+}
+
 static void format_tool_detail(const char *raw, const char *workdir, char *out, size_t cap, size_t max_chars) {
     if (!out || cap == 0) return;
     out[0] = '\0';
@@ -180,8 +209,9 @@ static void format_tool_row_title(const mcode_block *b, const char *workdir, flo
         if (b->status == CUI_TASK_FAILED) {
             snprintf(out + n, cap - (size_t)n, " · failed");
         } else if (secs >= 1.0f && b->status != CUI_TASK_PENDING) {
-            if (secs < 10.0f) snprintf(out + n, cap - (size_t)n, " · %.1fs", (double)secs);
-            else snprintf(out + n, cap - (size_t)n, " · %.0fs", (double)secs);
+            char dur[32];
+            format_work_duration(secs, running, dur, sizeof dur);
+            snprintf(out + n, cap - (size_t)n, " · %s", dur);
         }
     }
 }
@@ -225,7 +255,9 @@ static void format_tool_group_title(const mcode_block *blocks, int start, int co
     if (out_failed) *out_failed = n_failed;
 
     if (running_idx >= 0) {
-        format_tool_row_title(&blocks[running_idx], workdir, 0.0f, false, out, cap);
+        const mcode_block *rb = &blocks[running_idx];
+        float rsecs = (rb->started_mono > 0.0) ? (float)(mcode_now_mono() - rb->started_mono) : rb->duration_sec;
+        format_tool_row_title(rb, workdir, rsecs, true, out, cap);
         return;
     }
 
@@ -252,7 +284,9 @@ static void format_tool_group_title(const mcode_block *blocks, int start, int co
         pos += snprintf(out + pos, cap - (size_t)pos, " · %d failed", n_failed);
     }
     if (total_secs >= 1.0f && (size_t)pos < cap) {
-        snprintf(out + pos, cap - (size_t)pos, " · %.0fs", (double)total_secs);
+        char dur[32];
+        format_work_duration(total_secs, false, dur, sizeof dur);
+        snprintf(out + pos, cap - (size_t)pos, " · %s", dur);
     }
 }
 
@@ -267,7 +301,7 @@ static void draw_tool_payload(cui_ctx *ui, const char *id, const char *label,
 
 static void draw_tool_row(cui_ctx *ui, const mcode_block *b, const char *workdir,
                           const char *bid) {
-    float secs = (b->status == CUI_TASK_RUNNING)
+    float secs = (b->status == CUI_TASK_RUNNING && b->started_mono > 0.0)
         ? (float)(mcode_now_mono() - b->started_mono)
         : b->duration_sec;
     const char *inp = b->input.len > 0 ? mcode_str_cstr(&b->input) : NULL;
@@ -393,8 +427,12 @@ static void draw_thread_header(mcode_app *app, cui_ctx *ui, mcode_thread *thread
                     }
                     if (running) {
                         float secs = (float)(mcode_now_mono() - thread->run_started_mono);
-                        cui_agent_status(ui, thread->status_text[0] ? thread->status_text : "Working...",
-                                         .status = CUI_TASK_RUNNING, .seconds = secs);
+                        char elapsed[32];
+                        format_work_duration(secs, true, elapsed, sizeof elapsed);
+                        char status_lbl[192];
+                        snprintf(status_lbl, sizeof status_lbl, "%s · %s",
+                                 thread->status_text[0] ? thread->status_text : "Working", elapsed);
+                        cui_agent_status(ui, status_lbl, .status = CUI_TASK_RUNNING);
                     } else if (thread->state == MCODE_THREAD_SETTLED) {
                         cui_badge(ui, "Settled", .tone = CUI_TONE_SUCCESS, .icon = CUI_ICON_CHECK,
                                   .size = CUI_SIZE_SM);
@@ -540,10 +578,17 @@ static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int tur
             }
         }
 
-        if (turn->running && turn->block_count == 0) {
-            cui_row(ui, .gap = 8, .align = CUI_ALIGN_CENTER) {
-                cui_loader(ui, .style = CUI_LOADER_DOTS, .size = 20, .color = CUI_COLOR_ACCENT);
-                cui_shimmer_text(ui, thread->status_text[0] ? thread->status_text : "Thinking...");
+        if (turn->running) {
+            float live_secs = (turn->started_mono > 0.0)
+                ? (float)(mcode_now_mono() - turn->started_mono)
+                : turn->duration_sec;
+            char elapsed[32];
+            format_work_duration(live_secs, true, elapsed, sizeof elapsed);
+            cui_row(ui, .gap = 6, .align = CUI_ALIGN_CENTER) {
+                cui_spinner(ui, 12);
+                cui_shimmer_text(ui, "Working", .font = CUI_FONT_MEDIUM, .size = 13, .nowrap = true);
+                cui_text(ui, "·", .size = 12.5f, .color = CUI_COLOR_TEXT_MUTED);
+                cui_text(ui, elapsed, .size = 12.5f, .color = CUI_COLOR_TEXT_MUTED, .tabular = true);
             }
         }
 
@@ -562,19 +607,23 @@ static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int tur
                     }
                 }
                 cui_spacer(ui);
-                char meta[128] = "";
-                if (turn->input_tokens > 0 || turn->output_tokens > 0) {
-                    if (turn->cost_usd > 0.0) {
-                        snprintf(meta, sizeof meta, "%.1fs · %d in / %d out · $%.4f",
-                                 turn->duration_sec, turn->input_tokens, turn->output_tokens, turn->cost_usd);
-                    } else {
-                        snprintf(meta, sizeof meta, "%.1fs · %d in / %d out",
-                                 turn->duration_sec, turn->input_tokens, turn->output_tokens);
-                    }
-                } else if (turn->duration_sec > 0.05f) {
-                    snprintf(meta, sizeof meta, "%.1fs", turn->duration_sec);
+                char meta[160] = "";
+                int pos = 0;
+                if (turn->duration_sec > 0.05f) {
+                    char dur[32];
+                    format_work_duration(turn->duration_sec, false, dur, sizeof dur);
+                    pos += snprintf(meta + pos, sizeof meta - (size_t)pos, "Worked for %s", dur);
                 }
-                if (meta[0]) cui_muted(ui, meta);
+                if (turn->input_tokens > 0 || turn->output_tokens > 0) {
+                    pos += snprintf(meta + pos, sizeof meta - (size_t)pos, "%s%d in / %d out",
+                                    pos > 0 ? " · " : "", turn->input_tokens, turn->output_tokens);
+                    if (turn->cost_usd > 0.0 && (size_t)pos < sizeof meta) {
+                        snprintf(meta + pos, sizeof meta - (size_t)pos, " · $%.4f", turn->cost_usd);
+                    }
+                }
+                if (meta[0]) {
+                    cui_text(ui, meta, .size = 12, .color = CUI_COLOR_TEXT_MUTED, .tabular = true);
+                }
             }
         }
     }
