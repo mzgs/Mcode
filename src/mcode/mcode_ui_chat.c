@@ -249,7 +249,7 @@ static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int tur
         if (turn->running && turn->block_count == 0) {
             cui_row(ui, .gap = 8, .align = CUI_ALIGN_CENTER) {
                 cui_loader(ui, .style = CUI_LOADER_DOTS, .size = 20, .color = CUI_COLOR_ACCENT);
-                cui_shimmer_text(ui, thread->status_text[0] ? thread->status_text : "Agent is thinking...");
+                cui_shimmer_text(ui, thread->status_text[0] ? thread->status_text : "Thinking...");
             }
         }
 

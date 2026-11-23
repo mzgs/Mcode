@@ -54,6 +54,7 @@ static void test_claude_parser(void) {
     mcode_agent_parse_line_for_test(APP_AGENT_CLAUDE, &t, turn,
         "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess_claude_123\"}", false);
     CHECK(strcmp(t.session_id, "sess_claude_123") == 0);
+    CHECK(t.status_text[0] == '\0');
 
     mcode_agent_parse_line_for_test(APP_AGENT_CLAUDE, &t, turn,
         "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Checking files...\"}}}", false);
@@ -97,6 +98,10 @@ static void test_codex_parser(void) {
     mcode_agent_parse_line_for_test(APP_AGENT_CODEX, &t, turn,
         "{\"type\":\"thread.started\",\"thread_id\":\"codex_thr_99\"}", false);
     CHECK(strcmp(t.session_id, "codex_thr_99") == 0);
+    CHECK(t.status_text[0] == '\0');
+    mcode_agent_parse_line_for_test(APP_AGENT_CODEX, &t, turn,
+        "{\"type\":\"turn.started\"}", false);
+    CHECK(t.status_text[0] == '\0');
 
     mcode_agent_parse_line_for_test(APP_AGENT_CODEX, &t, turn,
         "{\"type\":\"item.started\",\"item\":{\"id\":\"item_1\",\"type\":\"command_execution\",\"command\":\"ctest\"}}", false);

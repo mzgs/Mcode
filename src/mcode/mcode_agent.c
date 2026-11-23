@@ -196,10 +196,6 @@ static void parse_claude_json(mcode_agent_run *run, yyjson_val *root) {
     if (!type) return;
 
     if (strcmp(type, "system") == 0) {
-        const char *subtype = jstr(root, "subtype");
-        if (subtype && strcmp(subtype, "init") == 0) {
-            emit_simple(run, EV_STATUS, "Claude Code connected...");
-        }
         return;
     }
 
@@ -403,12 +399,10 @@ static void parse_codex_json(mcode_agent_run *run, yyjson_val *root) {
     if (strcmp(type, "thread.started") == 0) {
         const char *tid = jstr(root, "thread_id");
         if (tid && tid[0]) emit_simple(run, EV_SESSION, tid);
-        emit_simple(run, EV_STATUS, "Codex session started...");
         return;
     }
 
     if (strcmp(type, "turn.started") == 0) {
-        emit_simple(run, EV_STATUS, "Codex is working...");
         return;
     }
 
@@ -638,8 +632,6 @@ static void handle_line(mcode_agent_run *run, const char *line, bool is_stderr) 
             }
             if (strstr(p, "Error") || strstr(p, "error") || strstr(p, "FATAL") || strstr(p, "not found")) {
                 emit_simple(run, EV_ERROR, p);
-            } else {
-                emit_simple(run, EV_STATUS, p);
             }
         }
         free(copy);
@@ -1021,8 +1013,7 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
     thread->run_started_mono = turn->started_mono;
     thread->updated_at = mcode_now_epoch();
     thread->scroll_to_bottom_frames = 2;
-    snprintf(thread->status_text, sizeof thread->status_text, "Starting %s...",
-             mcode_agent_short_label(thread->agent));
+    thread->status_text[0] = '\0';
 
     run->proc = mcode_proc_spawn(&(mcode_proc_desc){
         .argv = argv,
