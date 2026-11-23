@@ -67,13 +67,17 @@ static void test_claude_parser(void) {
         "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_1\",\"content\":\"int main(void) {}\",\"is_error\":false}]}}", false);
 
     mcode_agent_parse_line_for_test(APP_AGENT_CLAUDE, &t, turn,
+        "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_2\",\"name\":\"Bash\",\"input\":{\"command\":\"ls -a /tmp/nonexistent-agents-md\"}}]}}", false);
+    mcode_agent_parse_line_for_test(APP_AGENT_CLAUDE, &t, turn,
+        "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_2\",\"content\":\"Exit code 1\\nls: /tmp/nonexistent-agents-md: No such file or directory\",\"is_error\":true}]}}", false);
+    mcode_agent_parse_line_for_test(APP_AGENT_CLAUDE, &t, turn,
         "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"All \"}}}", false);
     mcode_agent_parse_line_for_test(APP_AGENT_CLAUDE, &t, turn,
         "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"fixed!\"}}}", false);
     mcode_agent_parse_line_for_test(APP_AGENT_CLAUDE, &t, turn,
         "{\"type\":\"result\",\"is_error\":false,\"total_cost_usd\":0.0125,\"usage\":{\"input_tokens\":1000,\"output_tokens\":250}}", false);
 
-    CHECK(turn->block_count == 3);
+    CHECK(turn->block_count == 4);
     CHECK(turn->blocks[0].kind == MCODE_BLOCK_REASONING);
     CHECK(!turn->blocks[0].thinking);
     CHECK(strcmp(mcode_str_cstr(&turn->blocks[0].text), "Checking files...") == 0);
@@ -82,8 +86,11 @@ static void test_claude_parser(void) {
     CHECK(strcmp(turn->blocks[1].tool_detail, "main.c") == 0);
     CHECK(turn->blocks[1].status == CUI_TASK_DONE);
     CHECK(strcmp(mcode_str_cstr(&turn->blocks[1].output), "int main(void) {}") == 0);
-    CHECK(turn->blocks[2].kind == MCODE_BLOCK_TEXT);
-    CHECK(strcmp(mcode_str_cstr(&turn->blocks[2].text), "All fixed!") == 0);
+    CHECK(turn->blocks[2].kind == MCODE_BLOCK_TOOL);
+    CHECK(strcmp(turn->blocks[2].tool_name, "Bash") == 0);
+    CHECK(turn->blocks[2].status == CUI_TASK_DONE);
+    CHECK(turn->blocks[3].kind == MCODE_BLOCK_TEXT);
+    CHECK(strcmp(mcode_str_cstr(&turn->blocks[3].text), "All fixed!") == 0);
     CHECK(turn->input_tokens == 1000);
     CHECK(turn->output_tokens == 250);
 
@@ -110,13 +117,17 @@ static void test_codex_parser(void) {
     mcode_agent_parse_line_for_test(APP_AGENT_CODEX, &t, turn,
         "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_rg\",\"type\":\"command_execution\",\"command\":\"/bin/zsh -lc 'ls -la && rg --files -g *.html'\",\"aggregated_output\":\"total 0\\n\",\"exit_code\":1,\"status\":\"completed\"}}", false);
     mcode_agent_parse_line_for_test(APP_AGENT_CODEX, &t, turn,
+        "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_ls_probe\",\"type\":\"command_execution\",\"command\":\"/bin/zsh -lc \\\"git status --short\\nrg --files --hidden -g AGENTS.md -g '\\\"'!.git'\\\"'\\nnl -ba index.html\\nls -a /Users/demo/Downloads/AGENTS.md /Users/demo/AGENTS.md\\\"\",\"aggregated_output\":\"?? index.html\\nls: /Users/demo/AGENTS.md: No such file or directory\\n\",\"exit_code\":1,\"status\":\"failed\"}}", false);
+    mcode_agent_parse_line_for_test(APP_AGENT_CODEX, &t, turn,
+        "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_git_nongit\",\"type\":\"command_execution\",\"command\":\"/bin/zsh -lc 'git status --short'\",\"aggregated_output\":\"fatal: not a git repository (or any of the parent directories): .git\\n\",\"exit_code\":128,\"status\":\"failed\"}}", false);
+    mcode_agent_parse_line_for_test(APP_AGENT_CODEX, &t, turn,
         "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_fail\",\"type\":\"command_execution\",\"command\":\"ctest\",\"aggregated_output\":\"1 test failed\",\"exit_code\":1,\"status\":\"failed\"}}", false);
     mcode_agent_parse_line_for_test(APP_AGENT_CODEX, &t, turn,
         "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_2\",\"type\":\"agent_message\",\"text\":\"Tests pass.\"}}", false);
     mcode_agent_parse_line_for_test(APP_AGENT_CODEX, &t, turn,
         "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":400,\"output_tokens\":80}}", false);
 
-    CHECK(turn->block_count == 4);
+    CHECK(turn->block_count == 6);
     CHECK(turn->blocks[0].kind == MCODE_BLOCK_TOOL);
     CHECK(strcmp(turn->blocks[0].tool_name, "bash") == 0);
     CHECK(turn->blocks[0].status == CUI_TASK_DONE);
@@ -124,13 +135,81 @@ static void test_codex_parser(void) {
     CHECK(turn->blocks[1].kind == MCODE_BLOCK_TOOL);
     CHECK(turn->blocks[1].status == CUI_TASK_DONE);
     CHECK(turn->blocks[2].kind == MCODE_BLOCK_TOOL);
-    CHECK(turn->blocks[2].status == CUI_TASK_FAILED);
-    CHECK(turn->blocks[3].kind == MCODE_BLOCK_TEXT);
-    CHECK(strstr(mcode_str_cstr(&turn->blocks[3].text), "Tests pass.") != NULL);
+    CHECK(turn->blocks[2].status == CUI_TASK_DONE);
+    CHECK(turn->blocks[3].kind == MCODE_BLOCK_TOOL);
+    CHECK(turn->blocks[3].status == CUI_TASK_DONE);
+    CHECK(turn->blocks[4].kind == MCODE_BLOCK_TOOL);
+    CHECK(turn->blocks[4].status == CUI_TASK_FAILED);
+    CHECK(turn->blocks[5].kind == MCODE_BLOCK_TEXT);
+    CHECK(strstr(mcode_str_cstr(&turn->blocks[5].text), "Tests pass.") != NULL);
     CHECK(turn->input_tokens == 400);
     CHECK(turn->output_tokens == 80);
 
     mcode_thread_free(&t);
+}
+
+static void test_benign_probe_detection(void) {
+    /* Benign probes */
+    CHECK(mcode_command_is_benign_probe_exit(
+        "/bin/zsh -lc \"ls -a; rg --files -g 'AGENTS.md' -g '*.html' -g '\"'!*node_modules*'\"'\"",
+        ".\n..\n", 1));
+    CHECK(mcode_command_is_benign_probe_exit(
+        "/bin/zsh -lc \"git status --short\nrg --files --hidden -g AGENTS.md -g '\"'!.git'\"'\nnl -ba index.html\nls -a /tmp/missing1 /tmp/missing2\"",
+        "?? index.html\nls: /tmp/missing1: No such file or directory\n", 1));
+    CHECK(mcode_command_is_benign_probe_exit(
+        "/bin/zsh -lc 'git status --short; rg --files -g AGENTS.md'",
+        "fatal: not a git repository (or any of the parent directories): .git\n", 1));
+    CHECK(mcode_command_is_benign_probe_exit(
+        "/bin/zsh -lc 'git status --short'",
+        "fatal: not a git repository (or any of the parent directories): .git\n", 128));
+    CHECK(mcode_command_is_benign_probe_exit(
+        "/bin/zsh -lc 'git -C /tmp rev-parse --verify main'",
+        "fatal: Needed a single revision\n", 128));
+    CHECK(mcode_command_is_benign_probe_exit(
+        "/bin/zsh -lc 'test -f AGENTS.md'", "", 1));
+    CHECK(mcode_command_is_benign_probe_exit(
+        "/bin/zsh -lc '[ -d build ]'", "", 1));
+    CHECK(mcode_command_is_benign_probe_exit(
+        "/bin/zsh -lc 'command -v pnpm'", "", 1));
+    CHECK(mcode_command_is_benign_probe_exit(
+        "/bin/zsh -lc 'cat index.html | rg missing'", "", 1));
+    CHECK(mcode_command_is_benign_probe_exit(
+        "/bin/zsh -lc 'ls /tmp/no-such-file | head -n 5'",
+        "ls: /tmp/no-such-file: No such file or directory\n", 1));
+
+    /* Real failures that MUST remain failed */
+    CHECK(!mcode_command_is_benign_probe_exit("ctest", "1 test failed\n", 1));
+    CHECK(!mcode_command_is_benign_probe_exit(
+        "/bin/zsh -lc 'ctest | tail -n 20'", "1 test failed\n", 1));
+    CHECK(!mcode_command_is_benign_probe_exit(
+        "/bin/zsh -lc 'set -e\nffmpeg -i a b\nls -a /tmp/x'",
+        "ffmpeg: failed\n", 1));
+    CHECK(!mcode_command_is_benign_probe_exit(
+        "/bin/zsh -lc 'rg \"[unclosed\" src/'",
+        "regex parse error:\n    [unclosed\n", 2));
+    CHECK(!mcode_command_is_benign_probe_exit(
+        "/bin/zsh -lc 'ls --bogus'",
+        "ls: illegal option -- -\n", 1));
+    CHECK(!mcode_command_is_benign_probe_exit(
+        "/bin/zsh -lc 'ls /root/secret'",
+        "ls: /root/secret: Permission denied\n", 1));
+    CHECK(!mcode_command_is_benign_probe_exit(
+        "/bin/zsh -lc 'git commit -m \"test\"'",
+        "fatal: not a git repository\n", 128));
+    CHECK(!mcode_command_is_benign_probe_exit(
+        "/bin/zsh -lc 'ls /tmp/foo'",
+        "zsh: command not found: ls\n", 127));
+
+    /* Claude Bash tool JSON input + "Exit code N" prefix */
+    CHECK(mcode_tool_is_benign_probe_failure(
+        "Bash", "{\"command\": \"ls -a AGENTS.md\"}",
+        "Exit code 1\nls: AGENTS.md: No such file or directory\n", -1));
+    CHECK(!mcode_tool_is_benign_probe_failure(
+        "Bash", "{\"command\": \"ctest\"}",
+        "Exit code 1\n1 test failed\n", -1));
+    CHECK(!mcode_tool_is_benign_probe_failure(
+        "Read", "{\"file_path\": \"missing.txt\"}",
+        "No such file or directory", -1));
 }
 
 static void test_agy_parser(void) {
@@ -182,6 +261,16 @@ static void test_store_roundtrip(void) {
     mcode_turn *tr = mcode_thread_add_turn(t, "Build login flow");
     mcode_block *b = mcode_turn_add_block(tr, MCODE_BLOCK_TEXT);
     mcode_str_set(&b->text, "Done implementing login.");
+    mcode_block *tb_probe = mcode_turn_add_block(tr, MCODE_BLOCK_TOOL);
+    snprintf(tb_probe->tool_name, sizeof tb_probe->tool_name, "bash");
+    mcode_str_set(&tb_probe->input, "/bin/zsh -lc 'ls -a /tmp/missing-file'");
+    mcode_str_set(&tb_probe->output, "ls: /tmp/missing-file: No such file or directory\n");
+    tb_probe->status = CUI_TASK_FAILED;
+    mcode_block *tb_err = mcode_turn_add_block(tr, MCODE_BLOCK_TOOL);
+    snprintf(tb_err->tool_name, sizeof tb_err->tool_name, "bash");
+    mcode_str_set(&tb_err->input, "ctest");
+    mcode_str_set(&tb_err->output, "1 test failed\n");
+    tb_err->status = CUI_TASK_FAILED;
     s.show_terminal_panel = true;
     s.diff_inline_mode = true;
 
@@ -200,7 +289,10 @@ static void test_store_roundtrip(void) {
     CHECK(loaded.threads[0].speed_mode == MCODE_SPEED_FAST);
     CHECK(loaded.threads[0].use_worktree);
     CHECK(loaded.threads[0].turn_count == 1);
+    CHECK(loaded.threads[0].turns[0].block_count == 3);
     CHECK(strcmp(mcode_str_cstr(&loaded.threads[0].turns[0].blocks[0].text), "Done implementing login.") == 0);
+    CHECK(loaded.threads[0].turns[0].blocks[1].status == CUI_TASK_DONE);
+    CHECK(loaded.threads[0].turns[0].blocks[2].status == CUI_TASK_FAILED);
     CHECK(loaded.show_terminal_panel);
     CHECK(loaded.diff_inline_mode);
 
@@ -496,6 +588,7 @@ int main(void) {
     test_helpers();
     test_claude_parser();
     test_codex_parser();
+    test_benign_probe_detection();
     test_agy_parser();
     test_model_catalog();
     test_title_generation();

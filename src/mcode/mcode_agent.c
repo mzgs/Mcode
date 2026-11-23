@@ -103,14 +103,20 @@ static void emit_tool_start(mcode_agent_run *run, const char *id, const char *na
     push_ev(run, ev);
 }
 
-static void emit_tool_result(mcode_agent_run *run, const char *id, const char *output, bool failed) {
+static void emit_tool_result_code(mcode_agent_run *run, const char *id, const char *output,
+                                  bool failed, int exit_code) {
     agent_ev *ev = calloc(1, sizeof *ev);
     if (!ev) return;
     ev->kind = EV_TOOL_RESULT;
     ev->tool_id = dup_or_null(id);
     ev->text = dup_or_null(output);
     ev->flag = failed;
+    ev->int_a = exit_code;
     push_ev(run, ev);
+}
+
+static void emit_tool_result(mcode_agent_run *run, const char *id, const char *output, bool failed) {
+    emit_tool_result_code(run, id, output, failed, -1);
 }
 
 static const char *jstr(yyjson_val *obj, const char *key) {
@@ -363,32 +369,545 @@ static void parse_claude_json(mcode_agent_run *run, yyjson_val *root) {
     }
 }
 
-/* Treat exit code 1 from common search/probe utilities (rg, grep, diff, test, etc.)
- * as a normal "no matches" completion unless stderr/output indicates an actual error. */
-static bool is_benign_exit_one(const char *cmd, const char *output) {
-    if (!cmd || !cmd[0]) return false;
-    static const char *const search_tools[] = {
-        "rg ", "grep ", "egrep ", "fgrep ", "fd ", "diff ", "cmp ", "which ", "command -v ", "test "
+typedef enum {
+    PROBE_NONE = 0,
+    PROBE_SEARCH,
+    PROBE_FS,
+    PROBE_GIT_READ,
+} probe_kind;
+
+static bool str_eq_ci_local(const char *a, const char *b) {
+    if (!a || !b) return false;
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return false;
+        ++a;
+        ++b;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+static bool str_in_list(const char *s, const char *const *list, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        if (strcmp(s, list[i]) == 0) return true;
+    }
+    return false;
+}
+
+/* Strip outer `/bin/zsh -lc ...` wrapper and POSIX-unquote the single script argument
+ * so embedded quote sequences like `'"'!.git'"'` decode to the real shell script. */
+static char *unwrap_shell_script(const char *cmd) {
+    if (!cmd) return NULL;
+    const char *p = cmd;
+    while (*p == ' ' || *p == '\t') ++p;
+
+    static const char *const prefixes[] = {
+        "/bin/zsh -lc ", "/bin/bash -lc ", "/bin/sh -c ",
+        "/bin/zsh -c ", "/bin/bash -c ",
+        "zsh -lc ", "bash -lc ", "zsh -c ", "bash -c ", "sh -c "
     };
-    bool has_probe = false;
-    for (size_t i = 0; i < sizeof search_tools / sizeof search_tools[0]; ++i) {
-        if (strstr(cmd, search_tools[i])) {
-            has_probe = true;
+    bool wrapped = false;
+    for (size_t i = 0; i < sizeof prefixes / sizeof prefixes[0]; ++i) {
+        size_t plen = strlen(prefixes[i]);
+        if (strncmp(p, prefixes[i], plen) == 0) {
+            p += plen;
+            wrapped = true;
             break;
         }
     }
-    if (!has_probe) return false;
-    if (output && output[0]) {
-        if (strstr(output, "command not found") ||
-            strstr(output, "Permission denied") ||
-            strstr(output, "No such file or directory") ||
-            strstr(output, "error:") ||
-            strstr(output, "Error:") ||
-            strstr(output, "fatal:")) {
-            return false;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (!wrapped) return strdup(p);
+
+    size_t len = strlen(p);
+    char *out = malloc(len + 1);
+    if (!out) return NULL;
+    size_t w = 0;
+    bool in_sq = false, in_dq = false;
+    for (size_t i = 0; i < len; ++i) {
+        char c = p[i];
+        if (in_sq) {
+            if (c == '\'') in_sq = false;
+            else out[w++] = c;
+        } else if (in_dq) {
+            if (c == '"') {
+                in_dq = false;
+            } else if (c == '\\' && i + 1 < len &&
+                       (p[i + 1] == '"' || p[i + 1] == '\\' ||
+                        p[i + 1] == '$' || p[i + 1] == '`')) {
+                out[w++] = p[++i];
+            } else {
+                out[w++] = c;
+            }
+        } else {
+            if (c == '\'') {
+                in_sq = true;
+            } else if (c == '"') {
+                in_dq = true;
+            } else if (c == '\\' && i + 1 < len) {
+                out[w++] = p[++i];
+            } else {
+                out[w++] = c;
+            }
         }
     }
-    return true;
+    out[w] = '\0';
+    return out;
+}
+
+static bool next_shell_token(const char *s, size_t len, size_t *pos, char *out, size_t cap) {
+    if (!s || !pos || !out || cap == 0) return false;
+    size_t i = *pos;
+    while (i < len && (s[i] == ' ' || s[i] == '\t')) ++i;
+    if (i >= len) { *pos = i; return false; }
+
+    size_t w = 0;
+    bool in_sq = false, in_dq = false;
+    bool got_any = false;
+    while (i < len) {
+        char c = s[i];
+        if (!in_sq && !in_dq) {
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+                c == ';' || c == '|' || c == '&' || c == '<' || c == '>' ||
+                c == '(' || c == ')') {
+                break;
+            }
+            if (c == '#' && !got_any) {
+                i = len;
+                break;
+            }
+            if (c == '\'') { in_sq = true; got_any = true; ++i; continue; }
+            if (c == '"') { in_dq = true; got_any = true; ++i; continue; }
+            if (c == '\\' && i + 1 < len) {
+                ++i;
+                if (w + 1 < cap) out[w++] = s[i];
+                got_any = true;
+                ++i;
+                continue;
+            }
+        } else if (in_sq) {
+            if (c == '\'') { in_sq = false; ++i; continue; }
+        } else if (in_dq) {
+            if (c == '"') { in_dq = false; ++i; continue; }
+            if (c == '\\' && i + 1 < len &&
+                (s[i + 1] == '"' || s[i + 1] == '\\' || s[i + 1] == '$' || s[i + 1] == '`')) {
+                ++i;
+            }
+        }
+        if (w + 1 < cap) out[w++] = s[i];
+        got_any = true;
+        ++i;
+    }
+    out[w] = '\0';
+    *pos = i;
+    return got_any;
+}
+
+static bool is_env_assignment(const char *tok) {
+    if (!tok || (!isalpha((unsigned char)tok[0]) && tok[0] != '_')) return false;
+    for (const char *p = tok + 1; *p; ++p) {
+        if (*p == '=') return true;
+        if (!isalnum((unsigned char)*p) && *p != '_') return false;
+    }
+    return false;
+}
+
+static const char *base_cmd_name(const char *tok) {
+    if (!tok) return "";
+    const char *slash = strrchr(tok, '/');
+    return slash ? slash + 1 : tok;
+}
+
+static bool stmt_is_errexit(const char *stmt, size_t len) {
+    size_t pos = 0;
+    char tok[64];
+    if (!next_shell_token(stmt, len, &pos, tok, sizeof tok)) return false;
+    if (strcmp(tok, "set") != 0) return false;
+    bool next_is_opt = false;
+    while (next_shell_token(stmt, len, &pos, tok, sizeof tok)) {
+        if (next_is_opt) {
+            if (strcmp(tok, "errexit") == 0) return true;
+            next_is_opt = false;
+            continue;
+        }
+        if (strcmp(tok, "-o") == 0) {
+            next_is_opt = true;
+        } else if (tok[0] == '-' && tok[1] != '-' && tok[1] != '\0') {
+            if (strchr(tok + 1, 'e') != NULL) return true;
+        }
+    }
+    return false;
+}
+
+/* Scan statements split on unquoted `\n`, `;`, `&&`, `||`.
+ * Sets *out_has_errexit if any statement enables `set -e` / `set -o errexit`,
+ * and returns the last non-empty statement slice. */
+static void scan_script_statements(const char *script, bool *out_has_errexit,
+                                   const char **out_last_start, size_t *out_last_len) {
+    if (out_has_errexit) *out_has_errexit = false;
+    if (out_last_start) *out_last_start = NULL;
+    if (out_last_len) *out_last_len = 0;
+    if (!script) return;
+
+    size_t n = strlen(script);
+    size_t seg_start = 0;
+    bool in_sq = false, in_dq = false;
+
+    for (size_t i = 0; i <= n; ++i) {
+        char c = (i < n) ? script[i] : '\0';
+        if (i < n) {
+            if (in_sq) {
+                if (c == '\'') in_sq = false;
+                continue;
+            }
+            if (in_dq) {
+                if (c == '\\' && i + 1 < n) { ++i; continue; }
+                if (c == '"') in_dq = false;
+                continue;
+            }
+            if (c == '\\' && i + 1 < n) { ++i; continue; }
+            if (c == '\'') { in_sq = true; continue; }
+            if (c == '"') { in_dq = true; continue; }
+            if (c == '#' && (i == seg_start || script[i - 1] == ' ' || script[i - 1] == '\t')) {
+                /* End current segment before comment, then skip to newline */
+                size_t s = seg_start, e = i;
+                while (s < e && (script[s] == ' ' || script[s] == '\t' || script[s] == '\r')) ++s;
+                while (e > s && (script[e - 1] == ' ' || script[e - 1] == '\t' || script[e - 1] == '\r')) --e;
+                if (e > s) {
+                    if (out_has_errexit && stmt_is_errexit(script + s, e - s)) *out_has_errexit = true;
+                    if (out_last_start) *out_last_start = script + s;
+                    if (out_last_len) *out_last_len = e - s;
+                }
+                while (i < n && script[i] != '\n') ++i;
+                seg_start = i + 1;
+                continue;
+            }
+        }
+
+        bool is_sep = (i == n) || (c == '\n') || (c == ';') ||
+                      (c == '&' && i + 1 < n && script[i + 1] == '&') ||
+                      (c == '|' && i + 1 < n && script[i + 1] == '|');
+        if (!is_sep) continue;
+
+        size_t s = seg_start, e = i;
+        while (s < e && (script[s] == ' ' || script[s] == '\t' || script[s] == '\r')) ++s;
+        while (e > s && (script[e - 1] == ' ' || script[e - 1] == '\t' || script[e - 1] == '\r')) --e;
+        if (e > s) {
+            if (out_has_errexit && stmt_is_errexit(script + s, e - s)) *out_has_errexit = true;
+            if (out_last_start) *out_last_start = script + s;
+            if (out_last_len) *out_last_len = e - s;
+        }
+        if ((c == '&' || c == '|') && i + 1 < n && script[i + 1] == c) ++i;
+        seg_start = i + 1;
+    }
+}
+
+static bool extract_command_word(const char *seg, size_t len, size_t *pos, char *cmd_out, size_t cap) {
+    char tok[128];
+    while (next_shell_token(seg, len, pos, tok, sizeof tok)) {
+        if (is_env_assignment(tok)) continue;
+        if (strcmp(tok, "!") == 0 || strcmp(tok, "time") == 0 ||
+            strcmp(tok, "builtin") == 0 || strcmp(tok, "noglob") == 0 ||
+            strcmp(tok, "nocorrect") == 0 || strcmp(tok, "env") == 0) {
+            continue;
+        }
+        snprintf(cmd_out, cap, "%s", tok);
+        return true;
+    }
+    cmd_out[0] = '\0';
+    return false;
+}
+
+static probe_kind classify_single_probe(const char *seg, size_t len) {
+    size_t pos = 0;
+    char raw_cmd[128];
+    if (!extract_command_word(seg, len, &pos, raw_cmd, sizeof raw_cmd)) return PROBE_NONE;
+
+    const char *cmd = base_cmd_name(raw_cmd);
+    if (strcmp(cmd, "command") == 0) {
+        char next[128];
+        size_t saved = pos;
+        while (next_shell_token(seg, len, &pos, next, sizeof next)) {
+            if (next[0] == '-' && next[1] != '\0' && strcmp(next, "--") != 0) {
+                if (strchr(next + 1, 'v') || strchr(next + 1, 'V')) return PROBE_SEARCH;
+                continue;
+            }
+            if (strcmp(next, "--") == 0) {
+                if (!next_shell_token(seg, len, &pos, next, sizeof next)) return PROBE_NONE;
+            }
+            snprintf(raw_cmd, sizeof raw_cmd, "%s", next);
+            cmd = base_cmd_name(raw_cmd);
+            saved = pos;
+            break;
+        }
+        if (saved == pos && strcmp(cmd, "command") == 0) return PROBE_NONE;
+    }
+
+    static const char *const search_cmds[] = {
+        "rg", "grep", "egrep", "fgrep", "ag", "ack", "fd", "fdfind",
+        "diff", "cmp", "which", "where", "whereis", "type", "test", "[", "[["
+    };
+    if (str_in_list(cmd, search_cmds, sizeof search_cmds / sizeof search_cmds[0])) {
+        return PROBE_SEARCH;
+    }
+
+    static const char *const fs_cmds[] = {
+        "ls", "stat", "file", "readlink", "realpath", "find"
+    };
+    if (str_in_list(cmd, fs_cmds, sizeof fs_cmds / sizeof fs_cmds[0])) {
+        return PROBE_FS;
+    }
+
+    if (strcmp(cmd, "git") == 0) {
+        char tok[128];
+        while (next_shell_token(seg, len, &pos, tok, sizeof tok)) {
+            if (strcmp(tok, "-C") == 0 || strcmp(tok, "-c") == 0 ||
+                strcmp(tok, "--git-dir") == 0 || strcmp(tok, "--work-tree") == 0 ||
+                strcmp(tok, "--namespace") == 0 || strcmp(tok, "--super-prefix") == 0 ||
+                strcmp(tok, "--config-env") == 0) {
+                char skip[128];
+                (void)next_shell_token(seg, len, &pos, skip, sizeof skip);
+                continue;
+            }
+            if (tok[0] == '-') continue;
+
+            static const char *const git_read_subcmds[] = {
+                "status", "rev-parse", "branch", "log", "symbolic-ref", "show-ref",
+                "describe", "remote", "ls-files", "diff", "grep", "check-ignore",
+                "cat-file", "ls-tree", "rev-list", "merge-base", "name-rev",
+                "for-each-ref", "shortlog", "blame"
+            };
+            if (str_in_list(tok, git_read_subcmds,
+                            sizeof git_read_subcmds / sizeof git_read_subcmds[0])) {
+                return PROBE_GIT_READ;
+            }
+            if (strcmp(tok, "config") == 0) {
+                char opt[128];
+                while (next_shell_token(seg, len, &pos, opt, sizeof opt)) {
+                    if (strcmp(opt, "--get") == 0 || strcmp(opt, "--get-all") == 0 ||
+                        strcmp(opt, "--get-regexp") == 0 || strcmp(opt, "--list") == 0 ||
+                        strcmp(opt, "-l") == 0) {
+                        return PROBE_GIT_READ;
+                    }
+                }
+            }
+            return PROBE_NONE;
+        }
+    }
+
+    return PROBE_NONE;
+}
+
+static bool stage_is_readonly_filter(const char *seg, size_t len) {
+    size_t pos = 0;
+    char raw_cmd[128];
+    if (!extract_command_word(seg, len, &pos, raw_cmd, sizeof raw_cmd)) return false;
+    const char *cmd = base_cmd_name(raw_cmd);
+    static const char *const filters[] = {
+        "head", "tail", "sort", "uniq", "wc", "cut", "tr", "sed", "awk",
+        "cat", "nl", "grep", "egrep", "fgrep", "rg", "column", "fmt", "fold",
+        "tee", "less", "more"
+    };
+    return str_in_list(cmd, filters, sizeof filters / sizeof filters[0]);
+}
+
+static probe_kind classify_statement_probe(const char *stmt, size_t len) {
+    if (!stmt || len == 0) return PROBE_NONE;
+    const char *starts[16];
+    size_t lens[16];
+    int count = 0;
+
+    size_t seg_start = 0;
+    bool in_sq = false, in_dq = false;
+    for (size_t i = 0; i <= len; ++i) {
+        char c = (i < len) ? stmt[i] : '\0';
+        if (i < len) {
+            if (in_sq) { if (c == '\'') in_sq = false; continue; }
+            if (in_dq) {
+                if (c == '\\' && i + 1 < len) { ++i; continue; }
+                if (c == '"') in_dq = false;
+                continue;
+            }
+            if (c == '\\' && i + 1 < len) { ++i; continue; }
+            if (c == '\'') { in_sq = true; continue; }
+            if (c == '"') { in_dq = true; continue; }
+        }
+        bool is_pipe = (i == len) || (c == '|' && !(i + 1 < len && stmt[i + 1] == '|'));
+        if (!is_pipe) continue;
+        if (count < 16) {
+            starts[count] = stmt + seg_start;
+            lens[count] = i - seg_start;
+            ++count;
+        }
+        seg_start = i + 1;
+    }
+
+    if (count <= 0) return PROBE_NONE;
+    if (count == 1) return classify_single_probe(starts[0], lens[0]);
+
+    probe_kind last_kind = classify_single_probe(starts[count - 1], lens[count - 1]);
+    if (last_kind == PROBE_SEARCH) return PROBE_SEARCH;
+
+    probe_kind first_kind = classify_single_probe(starts[0], lens[0]);
+    if (first_kind != PROBE_NONE) {
+        for (int i = 1; i < count; ++i) {
+            if (!stage_is_readonly_filter(starts[i], lens[i])) return PROBE_NONE;
+        }
+        return first_kind;
+    }
+    return PROBE_NONE;
+}
+
+static bool slice_contains(const char *s, size_t len, const char *needle) {
+    size_t nlen = strlen(needle);
+    if (nlen == 0 || nlen > len) return false;
+    for (size_t i = 0; i + nlen <= len; ++i) {
+        if (memcmp(s + i, needle, nlen) == 0) return true;
+    }
+    return false;
+}
+
+static bool line_is_benign_git_fatal(const char *line, size_t len) {
+    static const char *const benign_git[] = {
+        "not a git repository",
+        "does not have any commits yet",
+        "No names found",
+        "ambiguous argument",
+        "unknown revision",
+        "Needed a single revision",
+        "not a symbolic ref",
+        "not a valid object name",
+        "bad default revision"
+    };
+    for (size_t i = 0; i < sizeof benign_git / sizeof benign_git[0]; ++i) {
+        if (slice_contains(line, len, benign_git[i])) return true;
+    }
+    return false;
+}
+
+static bool output_has_hard_error(const char *output, probe_kind kind, int exit_code) {
+    if (!output || !output[0]) return false;
+
+    static const char *const hard_errors[] = {
+        "command not found",
+        "Permission denied",
+        "Operation not permitted",
+        "syntax error",
+        "illegal option",
+        "invalid option",
+        "unrecognized option",
+        "unknown option",
+        "Segmentation fault",
+        "Bus error",
+        "Abort trap",
+        "error:",
+        "Error:",
+        "error]",
+        "os error "
+    };
+    for (size_t i = 0; i < sizeof hard_errors / sizeof hard_errors[0]; ++i) {
+        if (strstr(output, hard_errors[i])) return true;
+    }
+
+    /* Inspect output line-by-line for non-benign `fatal:` or search-tool missing-path errors. */
+    const char *p = output;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        size_t llen = nl ? (size_t)(nl - p) : strlen(p);
+        if (slice_contains(p, llen, "fatal:") && !line_is_benign_git_fatal(p, llen)) {
+            return true;
+        }
+        if (kind == PROBE_SEARCH && exit_code < 0 &&
+            slice_contains(p, llen, "No such file or directory")) {
+            static const char *const search_prefixes[] = {
+                "rg:", "grep:", "egrep:", "fgrep:", "diff:", "cmp:", "fd:"
+            };
+            for (size_t i = 0; i < sizeof search_prefixes / sizeof search_prefixes[0]; ++i) {
+                size_t plen = strlen(search_prefixes[i]);
+                if (llen >= plen && memcmp(p, search_prefixes[i], plen) == 0) {
+                    return true;
+                }
+            }
+        }
+        p = nl ? nl + 1 : p + llen;
+    }
+    return false;
+}
+
+bool mcode_command_is_benign_probe_exit(const char *cmd, const char *output, int exit_code) {
+    if (!cmd || !cmd[0]) return false;
+    if (exit_code == 0) return true;
+    if (exit_code > 0 && exit_code != 1 && exit_code != 2 && exit_code != 128) return false;
+
+    char *script = unwrap_shell_script(cmd);
+    if (!script) return false;
+
+    bool has_errexit = false;
+    const char *last_stmt = NULL;
+    size_t last_len = 0;
+    scan_script_statements(script, &has_errexit, &last_stmt, &last_len);
+
+    bool benign = false;
+    if (!has_errexit && last_stmt && last_len > 0) {
+        probe_kind kind = classify_statement_probe(last_stmt, last_len);
+        if (kind == PROBE_SEARCH) {
+            if (exit_code < 0 || exit_code == 1) {
+                benign = !output_has_hard_error(output, kind, exit_code);
+            }
+        } else if (kind == PROBE_FS) {
+            if (exit_code < 0 || exit_code == 1 || exit_code == 2) {
+                benign = !output_has_hard_error(output, kind, exit_code);
+            }
+        } else if (kind == PROBE_GIT_READ) {
+            if (exit_code == 128) {
+                benign = output && line_is_benign_git_fatal(output, strlen(output)) &&
+                         !output_has_hard_error(output, kind, exit_code);
+            } else if (exit_code < 0 || exit_code == 1) {
+                benign = !output_has_hard_error(output, kind, exit_code);
+            }
+        }
+    }
+
+    free(script);
+    return benign;
+}
+
+static bool is_command_tool_name(const char *tool_name) {
+    if (!tool_name || !tool_name[0]) return false;
+    return str_eq_ci_local(tool_name, "bash") ||
+           str_eq_ci_local(tool_name, "shell") ||
+           str_eq_ci_local(tool_name, "sh") ||
+           str_eq_ci_local(tool_name, "run_command") ||
+           str_eq_ci_local(tool_name, "command_execution") ||
+           str_eq_ci_local(tool_name, "execute_command");
+}
+
+bool mcode_tool_is_benign_probe_failure(const char *tool_name, const char *input,
+                                        const char *output, int exit_code) {
+    if (!is_command_tool_name(tool_name) || !input || !input[0]) return false;
+
+    if (exit_code < 0 && output && strncmp(output, "Exit code ", 10) == 0) {
+        char *endp = NULL;
+        long parsed = strtol(output + 10, &endp, 10);
+        if (endp && endp != output + 10 &&
+            (*endp == '\n' || *endp == '\r' || *endp == ' ' || *endp == '\0')) {
+            exit_code = (int)parsed;
+        }
+    }
+
+    const char *p = input;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+    if (*p == '{') {
+        yyjson_doc *doc = yyjson_read(p, strlen(p), 0);
+        if (doc) {
+            yyjson_val *root = yyjson_doc_get_root(doc);
+            const char *jcmd = jstr(root, "command");
+            if (!jcmd) jcmd = jstr(root, "cmd");
+            bool res = jcmd ? mcode_command_is_benign_probe_exit(jcmd, output, exit_code) : false;
+            yyjson_doc_free(doc);
+            return res;
+        }
+    }
+
+    return mcode_command_is_benign_probe_exit(input, output, exit_code);
 }
 
 /* ---- OpenAI Codex JSONL parser ---- */
@@ -433,11 +952,12 @@ static void parse_codex_json(mcode_agent_run *run, yyjson_val *root) {
             const char *cmd = jstr(item, "command");
             const char *out = jstr(item, "aggregated_output");
             yyjson_val *ec = yyjson_obj_get(item, "exit_code");
-            int exit_code = yyjson_is_num(ec) ? (int)yyjson_get_num(ec) : 0;
-            bool failed = yyjson_is_num(ec) && exit_code != 0;
+            bool has_ec = yyjson_is_num(ec);
+            int exit_code = has_ec ? (int)yyjson_get_num(ec) : -1;
+            bool failed = has_ec && exit_code != 0;
             const char *status = jstr(item, "status");
             if (status && strcmp(status, "failed") == 0) failed = true;
-            if (failed && exit_code == 1 && is_benign_exit_one(cmd, out)) {
+            if (failed && mcode_command_is_benign_probe_exit(cmd, out, exit_code)) {
                 failed = false;
             }
 
@@ -451,7 +971,7 @@ static void parse_codex_json(mcode_agent_run *run, yyjson_val *root) {
                 emit_simple(run, EV_STATUS, st);
             } else {
                 emit_tool_start(run, iid ? iid : "cmd", "bash", short_cmd, cmd ? cmd : "");
-                emit_tool_result(run, iid ? iid : "cmd", out ? out : "", failed);
+                emit_tool_result_code(run, iid ? iid : "cmd", out ? out : "", failed, exit_code);
             }
         } else if (strcmp(itype, "file_change") == 0) {
             yyjson_val *changes = yyjson_obj_get(item, "changes");
@@ -794,7 +1314,14 @@ static void apply_event(mcode_thread *thread, mcode_turn *turn, const agent_ev *
             }
         }
         if (b) {
-            b->status = ev->flag ? CUI_TASK_FAILED : CUI_TASK_DONE;
+            bool failed = ev->flag;
+            if (failed && mcode_tool_is_benign_probe_failure(b->tool_name,
+                                                             mcode_str_cstr(&b->input),
+                                                             ev->text ? ev->text : "",
+                                                             ev->int_a)) {
+                failed = false;
+            }
+            b->status = failed ? CUI_TASK_FAILED : CUI_TASK_DONE;
             b->duration_sec = (float)(mcode_now_mono() - b->started_mono);
             if (ev->text) mcode_str_set(&b->output, ev->text);
         }

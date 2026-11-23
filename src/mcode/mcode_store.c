@@ -3,6 +3,7 @@
 #endif
 
 #include "mcode_store.h"
+#include "mcode_agent.h"
 #include "mcode_git.h"
 #include "app_log.h"
 #include <yyjson.h>
@@ -411,6 +412,13 @@ bool mcode_store_load(mcode_store *store, const char *path) {
                             int bs = jint_or(bv, "status", CUI_TASK_DONE);
                             if (bs < CUI_TASK_PENDING || bs > CUI_TASK_SKIPPED) bs = CUI_TASK_DONE;
                             b->status = (cui_task_status)bs;
+                            if (b->kind == MCODE_BLOCK_TOOL && b->status == CUI_TASK_FAILED &&
+                                mcode_tool_is_benign_probe_failure(b->tool_name,
+                                                                   mcode_str_cstr(&b->input),
+                                                                   mcode_str_cstr(&b->output),
+                                                                   -1)) {
+                                b->status = CUI_TASK_DONE;
+                            }
                             b->duration_sec = (float)jnum_or(bv, "duration_sec", 0.0);
                         }
                     }

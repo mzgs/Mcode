@@ -135,6 +135,13 @@ bool mcode_agent_sanitize_title(const char *raw, char *out, size_t cap);
 bool mcode_agent_parse_title_response(app_agent_kind agent, const char *raw, size_t len,
                                       char *out, size_t cap);
 
+/* Classify whether a non-zero command exit represents a benign read-only probe
+ * (e.g., rg/grep no matches, ls/stat on missing optional files, git status outside a repo).
+ * Pass exit_code < 0 when the numeric exit code is unknown. */
+bool mcode_command_is_benign_probe_exit(const char *cmd, const char *output, int exit_code);
+bool mcode_tool_is_benign_probe_failure(const char *tool_name, const char *input,
+                                        const char *output, int exit_code);
+
 /* Exposed for unit tests: feed a single output line through a provider's parser
  * directly into a thread & turn (without spawning a subprocess). */
 void mcode_agent_parse_line_for_test(app_agent_kind agent, mcode_thread *thread,
