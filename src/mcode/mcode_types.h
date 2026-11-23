@@ -114,6 +114,12 @@ typedef enum {
 } mcode_speed_mode;
 
 typedef enum {
+    MCODE_PERM_SUPERVISED = 0,
+    MCODE_PERM_ACCEPT_EDITS,
+    MCODE_PERM_FULL_ACCESS,
+} mcode_permission_mode;
+
+typedef enum {
     MCODE_APPROVAL_NONE = 0,
     MCODE_APPROVAL_ALLOW_ONCE,
     MCODE_APPROVAL_ALLOW_SESSION,
@@ -141,6 +147,7 @@ typedef struct {
     char model[APP_MODEL_NAME_MAX];
     char reasoning_effort[32];
     mcode_speed_mode speed_mode;
+    mcode_permission_mode perm_mode;
     bool use_worktree;
     bool auto_approve;
     char workdir[MCODE_PATH_MAX];

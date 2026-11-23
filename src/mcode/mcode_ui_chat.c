@@ -1544,6 +1544,139 @@ static void draw_thread_model_selector(mcode_app *app, cui_ctx *ui, mcode_thread
     }
 }
 
+static void draw_thread_permission_selector(mcode_app *app, cui_ctx *ui, mcode_thread *thread,
+                                            bool busy, cui_placement popover_placement) {
+    static const struct {
+        mcode_permission_mode mode;
+        const char *icon;
+        const char *title;
+        const char *desc;
+    } k_modes[3] = {
+        {
+            MCODE_PERM_SUPERVISED,
+            CUI_ICON_LOCK,
+            "Supervised",
+            "Ask before commands and file changes.",
+        },
+        {
+            MCODE_PERM_ACCEPT_EDITS,
+            CUI_ICON_SQUARE_PEN,
+            "Auto-accept edits",
+            "Auto-approve edits, ask before other actions.",
+        },
+        {
+            MCODE_PERM_FULL_ACCESS,
+            CUI_ICON_TRIANGLE_ALERT,
+            "Full access",
+            "Allow commands and edits without prompts.",
+        },
+    };
+
+    mcode_permission_mode cur = thread->perm_mode;
+    if (thread->auto_approve) cur = MCODE_PERM_FULL_ACCESS;
+    int cur_idx = 1;
+    for (int i = 0; i < 3; ++i) {
+        if (k_modes[i].mode == cur) { cur_idx = i; break; }
+    }
+
+    cui_vec2 mp = cui_mouse_pos(ui);
+    cui_id pid = cui_make_id(ui, "perm-mode-btn");
+    cui_rect pr = cui_get_rect(ui, pid);
+    bool hovered = !busy && pr.w > 0.0f &&
+                   mp.x >= pr.x && mp.x <= pr.x + pr.w &&
+                   mp.y >= pr.y && mp.y <= pr.y + pr.h;
+    bool open = cui_popover_is_open(ui, "perm-mode-pop");
+
+    cui_color bg = (open || hovered)
+        ? cui_alpha(cui_color_of(ui, CUI_COLOR_FOREGROUND), 0.08f)
+        : CUI_RGBA(0x00000001u);
+    cui_color fg = busy ? CUI_COLOR_TEXT_MUTED : CUI_COLOR_TEXT_SECONDARY;
+
+    bool clicked = cui_card_begin(ui, &(cui_card_opts){
+        .id = "perm-mode-btn",
+        .dir = CUI_ROW,
+        .align = CUI_ALIGN_CENTER,
+        .width = CUI_PX(30),
+        .height = CUI_PX(30),
+        .pad = 1,
+        .gap = 0,
+        .hoverable = !busy,
+        .border = -1.0f,
+        .radius = 9,
+        .bg = bg,
+    });
+    cui_row(ui, .width = CUI_FILL, .justify = CUI_JUSTIFY_CENTER, .align = CUI_ALIGN_CENTER) {
+        cui_icon(ui, k_modes[cur_idx].icon, 15, fg);
+    }
+    cui_card_end(ui);
+
+    char tip[192];
+    snprintf(tip, sizeof tip, "%s — %s", k_modes[cur_idx].title, k_modes[cur_idx].desc);
+    cui_tooltip(ui, tip);
+
+    if (clicked && !busy) {
+        cui_popover_toggle(ui, "perm-mode-pop");
+    }
+
+    bool close_pop = false;
+    cui_popover(ui, "perm-mode-pop", .placement = popover_placement,
+                .width = 336, .pad = 6, .gap = 4) {
+        cui_column(ui, .width = CUI_FILL, .gap = 4) {
+            for (int i = 0; i < 3; ++i) {
+                bool sel = (k_modes[i].mode == cur);
+                cui_push_id_int(ui, i);
+                cui_id rid = cui_make_id(ui, "pm-row");
+                cui_rect rr = cui_get_rect(ui, rid);
+                bool rhov = rr.w > 0.0f && mp.x >= rr.x && mp.x <= rr.x + rr.w &&
+                            mp.y >= rr.y && mp.y <= rr.y + rr.h;
+                cui_color rbg = sel
+                    ? cui_alpha(cui_color_of(ui, CUI_COLOR_FOREGROUND), 0.10f)
+                    : (rhov ? cui_alpha(cui_color_of(ui, CUI_COLOR_FOREGROUND), 0.06f)
+                            : CUI_RGBA(0x00000001u));
+                bool row_click = cui_card_begin(ui, &(cui_card_opts){
+                    .id = "pm-row",
+                    .dir = CUI_ROW,
+                    .align = CUI_ALIGN_START,
+                    .width = CUI_FILL,
+                    .pad_x = 12,
+                    .pad_y = 10,
+                    .gap = 12,
+                    .hoverable = true,
+                    .border = -1.0f,
+                    .radius = 9,
+                    .bg = rbg,
+                });
+                cui_box(ui, .pad_top = 2) {
+                    cui_icon(ui, k_modes[i].icon, 16, CUI_COLOR_TEXT_SECONDARY);
+                }
+                cui_column(ui, .width = CUI_FILL, .gap = 3) {
+                    cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
+                        cui_text(ui, k_modes[i].title, .font = CUI_FONT_MEDIUM, .size = 13.5f,
+                                 .color = CUI_COLOR_FOREGROUND, .width = CUI_FILL, .nowrap = true);
+                        if (sel) {
+                            cui_icon(ui, CUI_ICON_CHECK, 14, CUI_COLOR_TEXT_SECONDARY);
+                        }
+                    }
+                    cui_text(ui, k_modes[i].desc, .size = 12.0f,
+                             .color = CUI_COLOR_TEXT_MUTED, .width = CUI_FILL);
+                }
+                cui_card_end(ui);
+                cui_pop_id(ui);
+
+                if (row_click) {
+                    thread->perm_mode = k_modes[i].mode;
+                    thread->auto_approve = (k_modes[i].mode == MCODE_PERM_FULL_ACCESS);
+                    mcode_ui_mark_dirty(app);
+                    close_pop = true;
+                }
+            }
+        }
+    }
+    if (close_pop) {
+        cui_popover_close(ui, "perm-mode-pop");
+    }
+}
+
 static const char *thread_project_display_name(mcode_app *app, const mcode_thread *thread) {
     const mcode_project *proj = mcode_store_find_project(&app->store, thread->project_id);
     if (proj && proj->name[0]) return proj->name;
@@ -1559,29 +1692,28 @@ static const char *thread_project_display_name(mcode_app *app, const mcode_threa
 
 static void draw_composer_options_strip(mcode_app *app, cui_ctx *ui, mcode_thread *thread, bool busy) {
     const mcode_project *comp_proj = mcode_store_find_project(&app->store, thread->project_id);
+    bool show_missing = !app->cli_status.available[thread->agent];
+    bool show_session = (thread->session_id[0] != '\0');
+    bool show_worktree = (thread->turn_count == 0 && !busy && comp_proj && comp_proj->is_git_repo);
+    if (!show_missing && !show_session && !show_worktree) return;
+
     cui_row(ui, .width = CUI_FILL, .gap = 10, .align = CUI_ALIGN_CENTER, .wrap = true) {
-        if (!app->cli_status.available[thread->agent]) {
+        if (show_missing) {
             cui_badge(ui, "CLI not found", .icon = CUI_ICON_TRIANGLE_ALERT,
                       .tone = CUI_TONE_DANGER, .size = CUI_SIZE_SM);
         }
-        if (thread->session_id[0]) {
+        if (show_session) {
             char sshort[32];
             snprintf(sshort, sizeof sshort, "Session %.8s", thread->session_id);
             cui_muted(ui, sshort);
         }
         cui_spacer(ui);
-        if (thread->turn_count == 0 && !busy && comp_proj && comp_proj->is_git_repo) {
+        if (show_worktree) {
             bool wt = thread->use_worktree;
             if (cui_chip(ui, "Worktree", &wt)) {
                 mcode_ui_toggle_thread_worktree(app, ui, thread);
             }
         }
-        if (cui_chip(ui, "Auto-approve", &thread->auto_approve)) {
-            mcode_ui_mark_dirty(app);
-        }
-        cui_tooltip(ui, thread->auto_approve
-            ? "Auto-approve enabled: bypasses sandbox and permission prompts"
-            : "Interactive approval: prompts you to Approve or Deny restricted actions");
     }
 }
 
@@ -1622,6 +1754,7 @@ static void draw_thread_composer(mcode_app *app, cui_ctx *ui, mcode_thread *thre
                 .pad_left = toolbar_left, .pad_right = 48.0f, .pad_bottom = 11.0f,
                 .gap = 4, .align = CUI_ALIGN_CENTER, .clip = true) {
             draw_thread_model_selector(app, ui, thread, busy, pop_place);
+            draw_thread_permission_selector(app, ui, thread, busy, pop_place);
         }
     }
 

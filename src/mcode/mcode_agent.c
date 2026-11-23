@@ -72,6 +72,7 @@ struct mcode_agent_run {
     char init_model[APP_MODEL_NAME_MAX];
     char init_effort[32];
     mcode_speed_mode init_speed;
+    mcode_permission_mode init_perm_mode;
     char init_session_id[MCODE_SESSION_MAX];
     char active_session_id[MCODE_SESSION_MAX];
     bool rpc_prompt_sent;
@@ -1540,7 +1541,8 @@ static void codex_rpc_send_thread_open(mcode_agent_run *run, bool resume, int rp
     if (run->init_cwd[0]) {
         yyjson_mut_obj_add_strcpy(doc, params, "cwd", run->init_cwd);
     }
-    yyjson_mut_obj_add_str(doc, params, "approvalPolicy", "on-request");
+    const char *policy = (run->init_perm_mode == MCODE_PERM_SUPERVISED) ? "untrusted" : "on-request";
+    yyjson_mut_obj_add_str(doc, params, "approvalPolicy", policy);
     yyjson_mut_obj_add_str(doc, params, "sandbox", "workspace-write");
     if (run->init_model[0]) {
         yyjson_mut_obj_add_strcpy(doc, params, "model", run->init_model);
@@ -1574,7 +1576,8 @@ static void codex_rpc_send_turn_start(mcode_agent_run *run) {
     if (run->init_cwd[0]) {
         yyjson_mut_obj_add_strcpy(doc, params, "cwd", run->init_cwd);
     }
-    yyjson_mut_obj_add_str(doc, params, "approvalPolicy", "on-request");
+    const char *policy = (run->init_perm_mode == MCODE_PERM_SUPERVISED) ? "untrusted" : "on-request";
+    yyjson_mut_obj_add_str(doc, params, "approvalPolicy", policy);
     if (run->init_model[0]) {
         yyjson_mut_obj_add_strcpy(doc, params, "model", run->init_model);
     }
@@ -2007,7 +2010,9 @@ static void agy_acp_send_configure_and_prompt(mcode_agent_run *run) {
             yyjson_mut_obj_add_str(doc, root, "method", "session/set_mode");
             yyjson_mut_val *params = yyjson_mut_obj(doc);
             yyjson_mut_obj_add_strcpy(doc, params, "sessionId", run->active_session_id);
-            yyjson_mut_obj_add_str(doc, params, "modeId", "accept-edits");
+            const char *mode_id = (run->init_perm_mode == MCODE_PERM_SUPERVISED)
+                ? "default" : "accept-edits";
+            yyjson_mut_obj_add_str(doc, params, "modeId", mode_id);
             yyjson_mut_obj_add_val(doc, root, "params", params);
             send_json_doc(run->proc, doc);
             yyjson_mut_doc_free(doc);
@@ -3341,11 +3346,14 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
     const char *argv[32];
     int n = 0;
     agent_proto_kind proto = AGENT_PROTO_STREAM;
+    mcode_permission_mode perm_mode = thread->perm_mode;
+    if (thread->auto_approve) perm_mode = MCODE_PERM_FULL_ACCESS;
+    bool full_access = (perm_mode == MCODE_PERM_FULL_ACCESS);
 
     if (thread->agent == APP_AGENT_CLAUDE) {
         argv[n++] = bin;
         argv[n++] = "-p";
-        if (thread->auto_approve) {
+        if (full_access) {
             argv[n++] = prompt;
         } else {
             proto = AGENT_PROTO_CLAUDE_CTL;
@@ -3368,14 +3376,18 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
             argv[n++] = "--effort";
             argv[n++] = thread->reasoning_effort;
         }
-        if (thread->auto_approve) {
+        if (full_access) {
             argv[n++] = "--dangerously-skip-permissions";
         } else {
             argv[n++] = "--permission-prompts";
             argv[n++] = "host";
+            if (perm_mode == MCODE_PERM_ACCEPT_EDITS) {
+                argv[n++] = "--permission-mode";
+                argv[n++] = "acceptEdits";
+            }
         }
     } else if (thread->agent == APP_AGENT_CODEX) {
-        if (!thread->auto_approve) {
+        if (!full_access) {
             proto = AGENT_PROTO_CODEX_RPC;
             argv[n++] = bin;
             argv[n++] = "app-server";
@@ -3427,7 +3439,7 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
             }
         }
     } else { /* APP_AGENT_AGY */
-        if (!thread->auto_approve) {
+        if (!full_access) {
             proto = AGENT_PROTO_AGY_ACP;
             argv[n++] = bin;
             argv[n++] = "acp";
@@ -3463,6 +3475,7 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
         snprintf(run->init_effort, sizeof run->init_effort, "%s", thread->reasoning_effort);
     }
     run->init_speed = thread->speed_mode;
+    run->init_perm_mode = perm_mode;
     if (thread->session_id[0]) {
         snprintf(run->init_session_id, sizeof run->init_session_id, "%s", thread->session_id);
     }

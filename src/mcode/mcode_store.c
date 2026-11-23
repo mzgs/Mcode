@@ -204,6 +204,7 @@ mcode_thread *mcode_store_add_thread(mcode_store *store, const mcode_project *pr
     if (model && model[0]) snprintf(t->model, sizeof t->model, "%s", model);
     t->use_worktree = use_worktree;
     t->auto_approve = auto_approve;
+    t->perm_mode = auto_approve ? MCODE_PERM_FULL_ACCESS : MCODE_PERM_ACCEPT_EDITS;
     if (workdir && workdir[0]) snprintf(t->workdir, sizeof t->workdir, "%s", workdir);
     else if (proj) snprintf(t->workdir, sizeof t->workdir, "%s", proj->path);
     if (branch && branch[0]) snprintf(t->branch, sizeof t->branch, "%s", branch);
@@ -371,6 +372,19 @@ bool mcode_store_load(mcode_store *store, const char *path) {
             else t->speed_mode = MCODE_SPEED_DEFAULT;
             t->use_worktree = jbool_or(tv, "use_worktree", false);
             t->auto_approve = jbool_or(tv, "auto_approve", false);
+            const char *pm = jstr_or(tv, "permission_mode", "");
+            if (strcmp(pm, "supervised") == 0) {
+                t->perm_mode = MCODE_PERM_SUPERVISED;
+                t->auto_approve = false;
+            } else if (strcmp(pm, "accept_edits") == 0) {
+                t->perm_mode = MCODE_PERM_ACCEPT_EDITS;
+                t->auto_approve = false;
+            } else if (strcmp(pm, "full_access") == 0) {
+                t->perm_mode = MCODE_PERM_FULL_ACCESS;
+                t->auto_approve = true;
+            } else {
+                t->perm_mode = t->auto_approve ? MCODE_PERM_FULL_ACCESS : MCODE_PERM_ACCEPT_EDITS;
+            }
             snprintf(t->workdir, sizeof t->workdir, "%s", jstr_or(tv, "workdir", ""));
             snprintf(t->branch, sizeof t->branch, "%s", jstr_or(tv, "branch", ""));
             snprintf(t->session_id, sizeof t->session_id, "%s", jstr_or(tv, "session_id", ""));
@@ -501,7 +515,11 @@ bool mcode_store_save(const mcode_store *store, const char *path) {
             yyjson_mut_obj_add_str(doc, to, "speed_mode", "standard");
         }
         yyjson_mut_obj_add_bool(doc, to, "use_worktree", t->use_worktree);
-        yyjson_mut_obj_add_bool(doc, to, "auto_approve", t->auto_approve);
+        yyjson_mut_obj_add_bool(doc, to, "auto_approve", t->perm_mode == MCODE_PERM_FULL_ACCESS);
+        const char *pm_str = (t->perm_mode == MCODE_PERM_SUPERVISED) ? "supervised"
+                           : (t->perm_mode == MCODE_PERM_FULL_ACCESS) ? "full_access"
+                           : "accept_edits";
+        yyjson_mut_obj_add_str(doc, to, "permission_mode", pm_str);
         yyjson_mut_obj_add_str(doc, to, "workdir", t->workdir);
         yyjson_mut_obj_add_str(doc, to, "branch", t->branch);
         yyjson_mut_obj_add_str(doc, to, "session_id", t->session_id);
