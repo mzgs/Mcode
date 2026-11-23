@@ -1768,6 +1768,479 @@ void mcode_agent_destroy(mcode_agent_run *run) {
     free(run);
 }
 
+/* ---- Asynchronous thread title generation ---- */
+
+struct mcode_title_run {
+    app_agent_kind agent;
+    mcode_proc *proc;
+    pthread_mutex_t mu;
+    mcode_str stdout_buf;
+    double started_mono;
+    bool timed_out;
+    bool finished;
+    bool killed;
+    int exit_code;
+};
+
+static bool starts_with_icase(const char *s, const char *prefix) {
+    while (*prefix) {
+        if (!*s || tolower((unsigned char)*s) != tolower((unsigned char)*prefix)) return false;
+        ++s;
+        ++prefix;
+    }
+    return true;
+}
+
+bool mcode_agent_sanitize_title(const char *raw, char *out, size_t cap) {
+    if (!out || cap < 2) return false;
+    out[0] = '\0';
+    if (!raw || !raw[0]) return false;
+
+    /* Pick the first non-empty line, stripping ANSI codes and spinner \r segments. */
+    char clean[512];
+    clean[0] = '\0';
+    const char *p = raw;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        size_t line_len = nl ? (size_t)(nl - p) : strlen(p);
+        while (line_len > 0 && p[line_len - 1] == '\r') --line_len;
+
+        const char *seg = p;
+        size_t seg_len = line_len;
+        for (size_t i = 0; i < line_len; ++i) {
+            if (p[i] == '\r') {
+                seg = p + i + 1;
+                seg_len = line_len - (i + 1);
+            }
+        }
+
+        char tmp[512];
+        strip_ansi_into(seg, seg_len, tmp, sizeof tmp);
+        char *s = tmp;
+        while (*s && isspace((unsigned char)*s)) ++s;
+        if (*s) {
+            snprintf(clean, sizeof clean, "%s", s);
+            break;
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+    if (!clean[0]) return false;
+
+    char *s = clean;
+    size_t slen = strlen(s);
+    while (slen > 0 && isspace((unsigned char)s[slen - 1])) s[--slen] = '\0';
+
+    /* Strip leading markdown headings/bullets and common "Title:" labels. */
+    bool stripped = true;
+    while (stripped && slen > 0) {
+        stripped = false;
+        while (slen > 0 && isspace((unsigned char)*s)) { ++s; --slen; stripped = true; }
+        if (slen > 0 && *s == '#') {
+            while (slen > 0 && *s == '#') { ++s; --slen; }
+            while (slen > 0 && isspace((unsigned char)*s)) { ++s; --slen; }
+            stripped = true;
+        } else if (slen >= 2 && (*s == '-' || *s == '*') && isspace((unsigned char)s[1])) {
+            s += 2;
+            slen -= 2;
+            stripped = true;
+        }
+        static const char *const k_labels[] = { "thread title:", "title:", "summary:" };
+        for (size_t i = 0; i < sizeof k_labels / sizeof k_labels[0]; ++i) {
+            size_t llen = strlen(k_labels[i]);
+            if (slen > llen && starts_with_icase(s, k_labels[i])) {
+                s += llen;
+                slen -= llen;
+                stripped = true;
+                break;
+            }
+        }
+        while (slen > 0 && isspace((unsigned char)s[slen - 1])) { s[--slen] = '\0'; stripped = true; }
+
+        /* Unwrap symmetric quotes, backticks, or markdown emphasis. */
+        if (slen >= 4 && s[0] == '*' && s[1] == '*' && s[slen - 2] == '*' && s[slen - 1] == '*') {
+            s += 2;
+            slen -= 4;
+            s[slen] = '\0';
+            stripped = true;
+        } else if (slen >= 2 &&
+                   ((s[0] == '"' && s[slen - 1] == '"') ||
+                    (s[0] == '\'' && s[slen - 1] == '\'') ||
+                    (s[0] == '`' && s[slen - 1] == '`') ||
+                    (s[0] == '*' && s[slen - 1] == '*') ||
+                    (s[0] == '_' && s[slen - 1] == '_'))) {
+            ++s;
+            slen -= 2;
+            s[slen] = '\0';
+            stripped = true;
+        }
+    }
+
+    /* Collapse internal whitespace and clamp to a sidebar-friendly length. */
+    size_t max_len = cap - 1;
+    if (max_len > 72) max_len = 72;
+    size_t w = 0;
+    bool prev_space = false;
+    for (size_t i = 0; i < slen && w < max_len; ++i) {
+        unsigned char ch = (unsigned char)s[i];
+        if (isspace(ch)) {
+            if (w == 0 || prev_space) continue;
+            out[w++] = ' ';
+            prev_space = true;
+        } else if (ch < 0x20 || ch == 0x7f) {
+            continue;
+        } else {
+            out[w++] = (char)ch;
+            prev_space = false;
+        }
+    }
+    /* Avoid splitting a multi-byte UTF-8 sequence at max_len. */
+    if (w == max_len && w > 0) {
+        size_t tail = w;
+        while (tail > 0 && ((unsigned char)out[tail - 1] & 0xC0) == 0x80) --tail;
+        if (tail > 0) {
+            unsigned char lead = (unsigned char)out[tail - 1];
+            size_t need = 1;
+            if ((lead & 0xE0) == 0xC0) need = 2;
+            else if ((lead & 0xF0) == 0xE0) need = 3;
+            else if ((lead & 0xF8) == 0xF0) need = 4;
+            if (w - (tail - 1) < need) w = tail - 1;
+        }
+    }
+
+    /* Strip trailing punctuation and whitespace. */
+    while (w > 0 && (isspace((unsigned char)out[w - 1]) ||
+                     out[w - 1] == '.' || out[w - 1] == ':' ||
+                     out[w - 1] == ';' || out[w - 1] == ',')) {
+        --w;
+    }
+    out[w] = '\0';
+    return w >= 2;
+}
+
+static void extract_content_text_blocks(yyjson_val *msg, mcode_str *dst) {
+    if (!yyjson_is_obj(msg) || !dst) return;
+    yyjson_val *content = yyjson_obj_get(msg, "content");
+    if (!yyjson_is_arr(content)) return;
+    size_t idx, max;
+    yyjson_val *item;
+    yyjson_arr_foreach(content, idx, max, item) {
+        const char *it = jstr(item, "type");
+        if (it && strcmp(it, "text") == 0) {
+            const char *txt = jstr(item, "text");
+            if (txt && txt[0]) mcode_str_append_cstr(dst, txt);
+        }
+    }
+}
+
+bool mcode_agent_parse_title_response(app_agent_kind agent, const char *raw, size_t len,
+                                      char *out, size_t cap) {
+    if (!out || cap < 2) return false;
+    out[0] = '\0';
+    if (!raw || len == 0) return false;
+
+    mcode_str extracted;
+    mcode_str plain;
+    mcode_str_init(&extracted);
+    mcode_str_init(&plain);
+    bool saw_json = false;
+    bool saw_error = false;
+
+    const char *p = raw;
+    const char *end = raw + len;
+    while (p < end) {
+        const char *nl = memchr(p, '\n', (size_t)(end - p));
+        size_t line_len = nl ? (size_t)(nl - p) : (size_t)(end - p);
+        while (line_len > 0 && p[line_len - 1] == '\r') --line_len;
+
+        const char *trim = p;
+        size_t tlen = line_len;
+        while (tlen > 0 && isspace((unsigned char)*trim)) { ++trim; --tlen; }
+        while (tlen > 0 && isspace((unsigned char)trim[tlen - 1])) --tlen;
+
+        bool handled_json = false;
+        if (tlen >= 2 && trim[0] == '{') {
+            yyjson_doc *doc = yyjson_read(trim, tlen, 0);
+            if (doc) {
+                yyjson_val *root = yyjson_doc_get_root(doc);
+                if (yyjson_is_obj(root)) {
+                    saw_json = true;
+                    handled_json = true;
+
+                    if (agent == APP_AGENT_CLAUDE) {
+                        const char *type = jstr(root, "type");
+                        if (type && strcmp(type, "result") == 0) {
+                            yyjson_val *err_v = yyjson_obj_get(root, "is_error");
+                            bool is_err = yyjson_is_bool(err_v) && yyjson_get_bool(err_v);
+                            if (is_err) {
+                                saw_error = true;
+                                mcode_str_clear(&extracted);
+                            } else {
+                                const char *res = jstr(root, "result");
+                                if (res && res[0]) mcode_str_set(&extracted, res);
+                            }
+                        } else if (type && strcmp(type, "stream_event") == 0) {
+                            yyjson_val *ev = yyjson_obj_get(root, "event");
+                            yyjson_val *delta = yyjson_is_obj(ev) ? yyjson_obj_get(ev, "delta") : NULL;
+                            const char *dt = jstr(delta, "type");
+                            if (dt && strcmp(dt, "text_delta") == 0) {
+                                const char *txt = jstr(delta, "text");
+                                if (txt && txt[0]) mcode_str_append_cstr(&extracted, txt);
+                            }
+                        } else if (type && strcmp(type, "assistant") == 0 && extracted.len == 0) {
+                            extract_content_text_blocks(yyjson_obj_get(root, "message"), &extracted);
+                        }
+                    } else if (agent == APP_AGENT_CODEX) {
+                        const char *type = jstr(root, "type");
+                        if (type && (strcmp(type, "error") == 0 || strcmp(type, "turn.failed") == 0)) {
+                            saw_error = true;
+                        } else if (type && strcmp(type, "item.completed") == 0) {
+                            yyjson_val *item = yyjson_obj_get(root, "item");
+                            const char *itype = jstr(item, "type");
+                            if (itype && (strcmp(itype, "agent_message") == 0 ||
+                                          strcmp(itype, "message") == 0)) {
+                                const char *txt = jstr(item, "text");
+                                if (txt && txt[0]) mcode_str_set(&extracted, txt);
+                            }
+                        }
+                    } else { /* APP_AGENT_AGY */
+                        const char *type = jstr(root, "type");
+                        if (!type) type = jstr(root, "event");
+                        yyjson_val *err_v = yyjson_obj_get(root, "is_error");
+                        bool is_err = yyjson_is_bool(err_v) && yyjson_get_bool(err_v);
+                        if (is_err || (type && (strcmp(type, "error") == 0 || strcmp(type, "failed") == 0))) {
+                            saw_error = true;
+                        } else if (type && (strcmp(type, "thinking") == 0 ||
+                                            strcmp(type, "reasoning") == 0 ||
+                                            strcmp(type, "thought") == 0 ||
+                                            strcmp(type, "tool_use") == 0 ||
+                                            strcmp(type, "tool_call") == 0 ||
+                                            strcmp(type, "function_call") == 0 ||
+                                            strcmp(type, "tool_result") == 0 ||
+                                            strcmp(type, "function_response") == 0 ||
+                                            strcmp(type, "system") == 0)) {
+                            /* Ignore non-text events */
+                        } else {
+                            const char *delta = jstr(root, "delta");
+                            const char *txt = jstr(root, "text");
+                            const char *content = jstr(root, "content");
+                            const char *res = jstr(root, "result");
+                            if (delta && delta[0]) {
+                                mcode_str_append_cstr(&extracted, delta);
+                            } else if (txt && txt[0]) {
+                                mcode_str_append_cstr(&extracted, txt);
+                            } else if (content && content[0]) {
+                                mcode_str_append_cstr(&extracted, content);
+                            } else if (res && res[0] && extracted.len == 0) {
+                                mcode_str_set(&extracted, res);
+                            } else if (extracted.len == 0) {
+                                extract_content_text_blocks(yyjson_obj_get(root, "message"), &extracted);
+                            }
+                        }
+                    }
+                }
+                yyjson_doc_free(doc);
+            }
+        }
+
+        if (!handled_json && !saw_json && tlen > 0) {
+            if (plain.len > 0) mcode_str_append_cstr(&plain, "\n");
+            mcode_str_append(&plain, trim, tlen);
+        }
+
+        if (!nl) break;
+        p = nl + 1;
+    }
+
+    bool ok = false;
+    if (saw_json) {
+        if (extracted.len > 0 && !saw_error) {
+            ok = mcode_agent_sanitize_title(mcode_str_cstr(&extracted), out, cap);
+        }
+    } else if (plain.len > 0) {
+        ok = mcode_agent_sanitize_title(mcode_str_cstr(&plain), out, cap);
+    }
+
+    mcode_str_free(&extracted);
+    mcode_str_free(&plain);
+    return ok;
+}
+
+static void on_title_bytes(const char *data, size_t len, bool is_stderr, void *user) {
+    if (is_stderr) return;
+    mcode_title_run *run = (mcode_title_run *)user;
+    pthread_mutex_lock(&run->mu);
+    if (run->stdout_buf.len < 64 * 1024) {
+        mcode_str_append(&run->stdout_buf, data, len);
+    }
+    pthread_mutex_unlock(&run->mu);
+}
+
+static void on_title_exit(int exit_code, bool killed, void *user) {
+    mcode_title_run *run = (mcode_title_run *)user;
+    pthread_mutex_lock(&run->mu);
+    run->exit_code = exit_code;
+    run->killed = killed;
+    run->finished = true;
+    pthread_mutex_unlock(&run->mu);
+}
+
+mcode_title_run *mcode_agent_start_title(const mcode_thread *thread,
+                                         const app_settings *settings,
+                                         const char *prompt) {
+    if (!thread || !prompt || !prompt[0]) return NULL;
+
+    mcode_cli_status status;
+    mcode_agent_detect_clis(settings, &status);
+    if (!status.available[thread->agent]) return NULL;
+
+    /* Cap the user prompt snippet sent for title generation (UTF-8 safe). */
+    size_t plen = strlen(prompt);
+    if (plen > 1000) {
+        plen = 1000;
+        while (plen > 0 && ((unsigned char)prompt[plen] & 0xC0) == 0x80) --plen;
+    }
+
+    mcode_str title_prompt;
+    mcode_str_init(&title_prompt);
+    mcode_str_append_cstr(&title_prompt,
+        "Generate a concise 3 to 6 word title summarizing this coding request. "
+        "Reply with ONLY the title text: no quotes, no markdown, no prefixes, "
+        "no explanation, and no trailing punctuation.\n\nRequest:\n");
+    mcode_str_append(&title_prompt, prompt, plen);
+
+    const char *bin = status.resolved_path[thread->agent];
+    const char *model = mcode_agent_effective_model(thread, settings);
+    const char *argv[24];
+    int n = 0;
+
+    if (thread->agent == APP_AGENT_CLAUDE) {
+        argv[n++] = bin;
+        argv[n++] = "-p";
+        argv[n++] = mcode_str_cstr(&title_prompt);
+        argv[n++] = "--output-format";
+        argv[n++] = "json";
+        argv[n++] = "--no-session-persistence";
+        argv[n++] = "--tools";
+        argv[n++] = "";
+        if (model[0]) {
+            argv[n++] = "--model";
+            argv[n++] = model;
+        }
+    } else if (thread->agent == APP_AGENT_CODEX) {
+        argv[n++] = bin;
+        argv[n++] = "exec";
+        argv[n++] = "--json";
+        argv[n++] = "--ephemeral";
+        argv[n++] = "--skip-git-repo-check";
+        argv[n++] = "-s";
+        argv[n++] = "read-only";
+        argv[n++] = "-c";
+        argv[n++] = "model_reasoning_effort=\"low\"";
+        if (thread->workdir[0]) {
+            argv[n++] = "--cd";
+            argv[n++] = thread->workdir;
+        }
+        if (model[0]) {
+            argv[n++] = "-m";
+            argv[n++] = model;
+        }
+        argv[n++] = mcode_str_cstr(&title_prompt);
+    } else { /* APP_AGENT_AGY */
+        argv[n++] = bin;
+        argv[n++] = "-p";
+        argv[n++] = mcode_str_cstr(&title_prompt);
+        argv[n++] = "--output-format";
+        argv[n++] = "stream-json";
+        argv[n++] = "--disable-slash-commands";
+        argv[n++] = "--print-timeout";
+        argv[n++] = "30s";
+        if (model[0]) {
+            argv[n++] = "--model";
+            argv[n++] = model;
+        }
+    }
+    argv[n] = NULL;
+
+    mcode_title_run *run = calloc(1, sizeof *run);
+    if (!run) {
+        mcode_str_free(&title_prompt);
+        return NULL;
+    }
+    run->agent = thread->agent;
+    run->started_mono = mcode_now_mono();
+    mcode_str_init(&run->stdout_buf);
+    pthread_mutex_init(&run->mu, NULL);
+
+    run->proc = mcode_proc_spawn(&(mcode_proc_desc){
+        .argv = argv,
+        .cwd = thread->workdir[0] ? thread->workdir : NULL,
+        .merge_stderr = false,
+        .on_bytes = on_title_bytes,
+        .on_exit = on_title_exit,
+        .user = run,
+    });
+    mcode_str_free(&title_prompt);
+
+    if (!run->proc) {
+        mcode_str_free(&run->stdout_buf);
+        pthread_mutex_destroy(&run->mu);
+        free(run);
+        return NULL;
+    }
+
+    app_log_info("Requested thread title from %s", mcode_agent_label(thread->agent));
+    return run;
+}
+
+bool mcode_agent_poll_title(mcode_title_run *run, char *out_title, size_t cap, bool *out_ok) {
+    if (out_title && cap > 0) out_title[0] = '\0';
+    if (out_ok) *out_ok = false;
+    if (!run) return true;
+
+    pthread_mutex_lock(&run->mu);
+    bool finished = run->finished;
+    pthread_mutex_unlock(&run->mu);
+
+    if (!finished) {
+        if (!run->timed_out && (mcode_now_mono() - run->started_mono) > 45.0) {
+            run->timed_out = true;
+            if (run->proc) mcode_proc_stop(run->proc);
+        }
+        return false;
+    }
+
+    bool ok = false;
+    if (!run->killed && run->exit_code == 0 && run->stdout_buf.len > 0) {
+        ok = mcode_agent_parse_title_response(run->agent,
+                                              mcode_str_cstr(&run->stdout_buf),
+                                              run->stdout_buf.len,
+                                              out_title, cap);
+    }
+    if (!ok && !run->killed) {
+        app_log_warn("Title generation via %s did not produce a title (exit=%d)",
+                     mcode_agent_label(run->agent), run->exit_code);
+    }
+    if (out_ok) *out_ok = ok;
+    return true;
+}
+
+void mcode_agent_title_stop(mcode_title_run *run) {
+    if (!run || !run->proc) return;
+    mcode_proc_stop(run->proc);
+}
+
+void mcode_agent_title_destroy(mcode_title_run *run) {
+    if (!run) return;
+    if (run->proc) {
+        mcode_proc_destroy(run->proc);
+        run->proc = NULL;
+    }
+    mcode_str_free(&run->stdout_buf);
+    pthread_mutex_destroy(&run->mu);
+    free(run);
+}
+
 void mcode_agent_parse_line_for_test(app_agent_kind agent, mcode_thread *thread,
                                      mcode_turn *turn, const char *line, bool is_stderr) {
     mcode_agent_run run;

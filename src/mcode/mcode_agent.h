@@ -6,6 +6,7 @@
 #include <stdbool.h>
 
 typedef struct mcode_agent_run mcode_agent_run;
+typedef struct mcode_title_run mcode_title_run;
 
 typedef struct {
     bool available[APP_AGENT_COUNT];
@@ -111,6 +112,28 @@ void mcode_agent_stop(mcode_agent_run *run);
 
 /* Destroy an agent run (stops and joins background thread if still active). */
 void mcode_agent_destroy(mcode_agent_run *run);
+
+/* Start an asynchronous one-shot title generation request using `thread->agent`.
+ * Returns a handle owned by the caller (stored on `thread->title_run`), or NULL. */
+mcode_title_run *mcode_agent_start_title(const mcode_thread *thread,
+                                         const app_settings *settings,
+                                         const char *prompt);
+
+/* Poll an active title request. Returns true once finished; if a valid title
+ * was extracted, writes it to `out_title` and sets `*out_ok = true`. */
+bool mcode_agent_poll_title(mcode_title_run *run, char *out_title, size_t cap, bool *out_ok);
+
+/* Non-blocking request to stop a pending title generation subprocess. */
+void mcode_agent_title_stop(mcode_title_run *run);
+
+/* Destroy a title request (stops and joins background process if still running). */
+void mcode_agent_title_destroy(mcode_title_run *run);
+
+/* Pure helpers exposed for unit tests:
+ * Extract and sanitize a thread title from provider CLI output. */
+bool mcode_agent_sanitize_title(const char *raw, char *out, size_t cap);
+bool mcode_agent_parse_title_response(app_agent_kind agent, const char *raw, size_t len,
+                                      char *out, size_t cap);
 
 /* Exposed for unit tests: feed a single output line through a provider's parser
  * directly into a thread & turn (without spawning a subprocess). */

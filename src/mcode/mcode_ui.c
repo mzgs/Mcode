@@ -229,20 +229,34 @@ void mcode_ui_send_prompt(mcode_app *app, cui_ctx *ui, mcode_thread *thread, con
     if (!app || !thread || !prompt || !prompt[0]) return;
     if (thread->active_run) return;
 
-    /* Auto-title fresh threads from the first prompt if still default */
-    if (thread->turn_count == 0 &&
-        (strcmp(thread->title, "New thread") == 0 || thread->title[0] == '\0')) {
-        size_t n = 0;
-        while (prompt[n] && prompt[n] != '\n' && prompt[n] != '\r' && n < 56) ++n;
-        snprintf(thread->title, sizeof thread->title, "%.*s%s",
-                 (int)n, prompt, (prompt[n] != '\0') ? "..." : "");
-    }
+    bool should_auto_title = (thread->turn_count == 0 &&
+        (strcmp(thread->title, "New thread") == 0 || thread->title[0] == '\0'));
 
     thread->state = MCODE_THREAD_ACTIVE;
     char err[256] = "";
-    if (!mcode_agent_start(thread, app_chrome_settings(app->chrome), prompt, err, sizeof err)) {
+    const app_settings *settings = app_chrome_settings(app->chrome);
+    if (!mcode_agent_start(thread, settings, prompt, err, sizeof err)) {
         if (ui) app_chrome_notify(app->chrome, ui, err[0] ? err : "Could not start agent.", CUI_TONE_DANGER);
     } else {
+        /* Set an immediate fallback title and ask the provider for a concise title in parallel. */
+        if (should_auto_title) {
+            const char *p = prompt;
+            while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
+            size_t n = 0;
+            while (p[n] && p[n] != '\n' && p[n] != '\r' && n < 56) ++n;
+            while (n > 0 && ((unsigned char)p[n] & 0xC0) == 0x80) --n;
+            if (n > 0) {
+                snprintf(thread->title, sizeof thread->title, "%.*s%s",
+                         (int)n, p, (p[n] != '\0') ? "..." : "");
+            }
+            snprintf(thread->title_auto_fallback, sizeof thread->title_auto_fallback,
+                     "%s", thread->title);
+            if (thread->title_run) {
+                mcode_agent_title_destroy(thread->title_run);
+                thread->title_run = NULL;
+            }
+            thread->title_run = mcode_agent_start_title(thread, settings, prompt);
+        }
         mcode_ui_mark_dirty(app);
     }
 }
@@ -261,6 +275,10 @@ void mcode_ui_delete_thread(mcode_app *app, cui_ctx *ui, const char *thread_id) 
     if (t->active_run) {
         mcode_agent_destroy(t->active_run);
         t->active_run = NULL;
+    }
+    if (t->title_run) {
+        mcode_agent_title_destroy(t->title_run);
+        t->title_run = NULL;
     }
     if (t->use_worktree && t->workdir[0]) {
         mcode_project *p = mcode_store_find_project(&app->store, t->project_id);
@@ -321,6 +339,10 @@ void mcode_app_shutdown(mcode_app *app) {
             mcode_agent_destroy(app->store.threads[i].active_run);
             app->store.threads[i].active_run = NULL;
         }
+        if (app->store.threads[i].title_run) {
+            mcode_agent_title_destroy(app->store.threads[i].title_run);
+            app->store.threads[i].title_run = NULL;
+        }
     }
     if (app->state_path[0]) {
         mcode_store_save(&app->store, app->state_path);
@@ -336,9 +358,29 @@ void mcode_app_shutdown(mcode_app *app) {
 
 static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_count) {
     int running = 0;
+    int title_running = 0;
     bool any_finished = false;
     for (int i = 0; i < app->store.thread_count; ++i) {
         mcode_thread *t = &app->store.threads[i];
+        if (t->title_run) {
+            char generated[MCODE_NAME_MAX] = "";
+            bool ok = false;
+            if (mcode_agent_poll_title(t->title_run, generated, sizeof generated, &ok)) {
+                mcode_agent_title_destroy(t->title_run);
+                t->title_run = NULL;
+                if (ok && generated[0] &&
+                    t->title_auto_fallback[0] &&
+                    strcmp(t->title, t->title_auto_fallback) == 0) {
+                    snprintf(t->title, sizeof t->title, "%s", generated);
+                    t->updated_at = mcode_now_epoch();
+                    mcode_ui_mark_dirty(app);
+                    any_finished = true;
+                }
+                t->title_auto_fallback[0] = '\0';
+            } else {
+                ++title_running;
+            }
+        }
         if (!t->active_run) continue;
         bool finished = false;
         (void)mcode_agent_poll(t->active_run, t, &finished);
@@ -384,7 +426,7 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
     bool catalog_updated = mcode_model_catalog_poll(&app->models);
     if (running > 0 || term_active) {
         cui_request_wakeup(ui, 0.05f);
-    } else if (app->models.loading_agy) {
+    } else if (title_running > 0 || app->models.loading_agy) {
         cui_request_wakeup(ui, 0.1f);
     } else if (any_finished || catalog_updated) {
         cui_request_redraw(ui);

@@ -418,6 +418,10 @@ static void draw_thread_header(mcode_app *app, cui_ctx *ui, mcode_thread *thread
                     if (cui_inline_edit(ui, "thread-title", thread->title, sizeof thread->title,
                                         .font = CUI_FONT_MEDIUM, .size = 15,
                                         .placeholder = "Untitled thread") & CUI_CHANGED) {
+                        thread->title_auto_fallback[0] = '\0';
+                        if (thread->title_run) {
+                            mcode_agent_title_stop(thread->title_run);
+                        }
                         mcode_ui_mark_dirty(app);
                     }
                     if (running) {

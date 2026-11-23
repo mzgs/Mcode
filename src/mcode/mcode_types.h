@@ -113,6 +113,7 @@ typedef enum {
 } mcode_speed_mode;
 
 struct mcode_agent_run;
+struct mcode_title_run;
 
 typedef struct {
     char id[MCODE_ID_MAX];
@@ -137,6 +138,8 @@ typedef struct {
 
     /* Live runtime state (not persisted) */
     struct mcode_agent_run *active_run;
+    struct mcode_title_run *title_run;
+    char title_auto_fallback[MCODE_NAME_MAX];
     char status_text[160];
     double run_started_mono;
 

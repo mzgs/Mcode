@@ -389,12 +389,116 @@ static void test_model_catalog(void) {
     mcode_model_catalog_free(&cat);
 }
 
+static void test_title_generation(void) {
+    char title[MCODE_NAME_MAX] = "";
+
+    /* Sanitization edge cases */
+    CHECK(mcode_agent_sanitize_title("Fix auth token refresh", title, sizeof title));
+    CHECK(strcmp(title, "Fix auth token refresh") == 0);
+
+    CHECK(mcode_agent_sanitize_title("\n  Title: \"**Add sidebar auto-titling.**\"\nMore details here",
+                                     title, sizeof title));
+    CHECK(strcmp(title, "Add sidebar auto-titling") == 0);
+
+    CHECK(mcode_agent_sanitize_title("###   Refactor   Git\tWorktrees:  \n", title, sizeof title));
+    CHECK(strcmp(title, "Refactor Git Worktrees") == 0);
+
+    CHECK(mcode_agent_sanitize_title("\r\x1b[2K\x1b[36mThinking...\rFix memory leak in parser",
+                                     title, sizeof title));
+    CHECK(strcmp(title, "Fix memory leak in parser") == 0);
+
+    CHECK(!mcode_agent_sanitize_title("   \n\t  ", title, sizeof title));
+    CHECK(!mcode_agent_sanitize_title("?", title, sizeof title));
+
+    /* Claude JSON response */
+    const char *claude_ok =
+        "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"\\\"Fix sidebar thread titling.\\\"\"}";
+    CHECK(mcode_agent_parse_title_response(APP_AGENT_CLAUDE, claude_ok, strlen(claude_ok),
+                                           title, sizeof title));
+    CHECK(strcmp(title, "Fix sidebar thread titling") == 0);
+
+    const char *claude_err =
+        "{\"type\":\"result\",\"subtype\":\"error\",\"is_error\":true,\"result\":\"Invalid API key\"}";
+    CHECK(!mcode_agent_parse_title_response(APP_AGENT_CLAUDE, claude_err, strlen(claude_err),
+                                            title, sizeof title));
+
+    /* Codex JSONL response (reasoning ignored, agent_message extracted) */
+    const char *codex_ok =
+        "{\"type\":\"thread.started\",\"thread_id\":\"thr_1\"}\n"
+        "{\"type\":\"item.completed\",\"item\":{\"id\":\"r1\",\"type\":\"reasoning\",\"text\":\"Should be short\"}}\n"
+        "{\"type\":\"item.completed\",\"item\":{\"id\":\"m1\",\"type\":\"agent_message\",\"text\":\"Add dark mode toggle\"}}\n"
+        "{\"type\":\"turn.completed\"}\n";
+    CHECK(mcode_agent_parse_title_response(APP_AGENT_CODEX, codex_ok, strlen(codex_ok),
+                                           title, sizeof title));
+    CHECK(strcmp(title, "Add dark mode toggle") == 0);
+
+    const char *codex_err =
+        "{\"type\":\"turn.failed\",\"error\":{\"message\":\"Quota exceeded\"}}\n";
+    CHECK(!mcode_agent_parse_title_response(APP_AGENT_CODEX, codex_err, strlen(codex_err),
+                                            title, sizeof title));
+
+    /* Antigravity CLI stream-json response (thinking ignored, deltas joined, result not duplicated) */
+    const char *agy_ok =
+        "{\"type\":\"thinking\",\"delta\":\"Summarizing request...\"}\n"
+        "{\"type\":\"text\",\"delta\":\"Optimize \"}\n"
+        "{\"type\":\"text\",\"delta\":\"diff renderer\"}\n"
+        "{\"type\":\"result\",\"result\":\"Optimize diff renderer\"}\n";
+    CHECK(mcode_agent_parse_title_response(APP_AGENT_AGY, agy_ok, strlen(agy_ok),
+                                           title, sizeof title));
+    CHECK(strcmp(title, "Optimize diff renderer") == 0);
+
+    /* Plain text fallback */
+    const char *plain = "Update CMake build flags\n";
+    CHECK(mcode_agent_parse_title_response(APP_AGENT_AGY, plain, strlen(plain),
+                                           title, sizeof title));
+    CHECK(strcmp(title, "Update CMake build flags") == 0);
+
+#ifndef _WIN32
+    /* End-to-end async title request against a local mock CLI script */
+    char mock_cli[512];
+    snprintf(mock_cli, sizeof mock_cli, "/tmp/mcode_mock_title_cli_%d.sh", (int)getpid());
+    FILE *f = fopen(mock_cli, "wb");
+    CHECK(f != NULL);
+    if (f) {
+        fputs("#!/bin/sh\n"
+              "printf '{\"type\":\"result\",\"is_error\":false,\"result\":\"Implement Auto Thread Titles\"}\\n'\n",
+              f);
+        fclose(f);
+        chmod(mock_cli, 0755);
+
+        app_settings s;
+        memset(&s, 0, sizeof s);
+        snprintf(s.mcode.claude_bin, sizeof s.mcode.claude_bin, "%s", mock_cli);
+
+        mcode_thread t;
+        memset(&t, 0, sizeof t);
+        t.agent = APP_AGENT_CLAUDE;
+
+        mcode_title_run *run = mcode_agent_start_title(&t, &s, "When we start a thread ask provider for title");
+        CHECK(run != NULL);
+        bool done = false;
+        bool ok = false;
+        char generated[MCODE_NAME_MAX] = "";
+        for (int i = 0; i < 100 && !done; ++i) {
+            done = mcode_agent_poll_title(run, generated, sizeof generated, &ok);
+            if (!done) usleep(10000);
+        }
+        CHECK(done);
+        CHECK(ok);
+        CHECK(strcmp(generated, "Implement Auto Thread Titles") == 0);
+        mcode_agent_title_destroy(run);
+        remove(mock_cli);
+    }
+#endif
+}
+
 int main(void) {
     test_helpers();
     test_claude_parser();
     test_codex_parser();
     test_agy_parser();
     test_model_catalog();
+    test_title_generation();
     test_store_roundtrip();
 #ifndef _WIN32
     test_git_worktree_and_diff();
