@@ -349,13 +349,6 @@ static void draw_tool_row(cui_ctx *ui, const mcode_block *b, const char *workdir
     }
 }
 
-static const cui_prompt_suggestion k_suggestions[] = {
-    { CUI_ICON_COMPASS, "Explore this codebase", "Summarize the architecture, entry points, and build setup" },
-    { CUI_ICON_BUG, "Find & fix a bug", "Inspect recent changes and check for edge cases or memory leaks" },
-    { CUI_ICON_LIST_CHECKS, "Write unit tests", "Add thorough tests for the core logic and run the test suite" },
-    { CUI_ICON_CODE, "Refactor cleanly", "Simplify a module while preserving behavior and verifying the build" },
-};
-
 static void draw_empty_workspace(mcode_app *app, cui_ctx *ui) {
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
                .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER,
@@ -844,7 +837,8 @@ static bool draw_picker_list_row(cui_ctx *ui, const char *id, float height, bool
     });
 }
 
-static void draw_thread_model_selector(mcode_app *app, cui_ctx *ui, mcode_thread *thread, bool busy) {
+static void draw_thread_model_selector(mcode_app *app, cui_ctx *ui, mcode_thread *thread,
+                                       bool busy, cui_placement popover_placement) {
     const app_settings *settings = app_chrome_settings(app->chrome);
     const char *eff_model = mcode_agent_effective_model(thread, settings);
     const char *cli_def_model = (thread->agent >= 0 && thread->agent < APP_AGENT_COUNT)
@@ -915,7 +909,7 @@ static void draw_thread_model_selector(mcode_app *app, cui_ctx *ui, mcode_thread
     bool supports_fast = mcode_model_supports_fast(&app->models, thread, settings, &fast_desc);
     bool is_fast = supports_fast && mcode_thread_is_fast_mode(&app->models, thread);
 
-    cui_popover(ui, "model-picker-pop", .placement = CUI_PLACE_TOP_START,
+    cui_popover(ui, "model-picker-pop", .placement = popover_placement,
                 .width = 528, .pad = 1, .gap = 0) {
         cui_column(ui, .width = CUI_FILL, .gap = 0) {
         cui_row(ui, .width = CUI_FILL, .height = CUI_PX(336.0f), .gap = 0,
@@ -1346,6 +1340,118 @@ static void draw_thread_model_selector(mcode_app *app, cui_ctx *ui, mcode_thread
     }
 }
 
+static const char *thread_project_display_name(mcode_app *app, const mcode_thread *thread) {
+    const mcode_project *proj = mcode_store_find_project(&app->store, thread->project_id);
+    if (proj && proj->name[0]) return proj->name;
+    if (thread->workdir[0]) {
+        const char *slash = strrchr(thread->workdir, '/');
+        const char *bslash = strrchr(thread->workdir, '\\');
+        const char *sep = (bslash && (!slash || bslash > slash)) ? bslash : slash;
+        if (sep && sep[1]) return sep + 1;
+        return thread->workdir;
+    }
+    return NULL;
+}
+
+static void draw_composer_options_strip(mcode_app *app, cui_ctx *ui, mcode_thread *thread, bool busy) {
+    const mcode_project *comp_proj = mcode_store_find_project(&app->store, thread->project_id);
+    cui_row(ui, .width = CUI_FILL, .gap = 10, .align = CUI_ALIGN_CENTER, .wrap = true) {
+        if (!app->cli_status.available[thread->agent]) {
+            cui_badge(ui, "CLI not found", .icon = CUI_ICON_TRIANGLE_ALERT,
+                      .tone = CUI_TONE_DANGER, .size = CUI_SIZE_SM);
+        }
+        if (thread->session_id[0]) {
+            char sshort[32];
+            snprintf(sshort, sizeof sshort, "Session %.8s", thread->session_id);
+            cui_muted(ui, sshort);
+        }
+        cui_spacer(ui);
+        if (thread->turn_count == 0 && !busy && comp_proj && comp_proj->is_git_repo) {
+            bool wt = thread->use_worktree;
+            if (cui_chip(ui, "Worktree", &wt)) {
+                mcode_ui_toggle_thread_worktree(app, ui, thread);
+            }
+        }
+        if (cui_chip(ui, "Auto-approve", &thread->auto_approve)) {
+            mcode_ui_mark_dirty(app);
+        }
+    }
+}
+
+static void draw_thread_composer(mcode_app *app, cui_ctx *ui, mcode_thread *thread, bool centered) {
+    bool busy = (thread->active_run != NULL);
+
+    if (!centered) {
+        draw_composer_options_strip(app, ui, thread, busy);
+    }
+
+    static const char *const k_first_placeholders[APP_AGENT_COUNT] = {
+        "Ask Claude Code to implement a feature, fix a bug, or inspect code...",
+        "Ask Codex to implement a feature, fix a bug, or inspect code...",
+        "Ask Antigravity CLI to implement a feature, fix a bug, or inspect code...",
+    };
+    static const char *const k_followup_placeholders[APP_AGENT_COUNT] = {
+        "Send a follow-up to Claude Code...",
+        "Send a follow-up to Codex...",
+        "Send a follow-up to Antigravity CLI...",
+    };
+    const char *placeholder = thread->turn_count == 0
+        ? k_first_placeholders[thread->agent]
+        : k_followup_placeholders[thread->agent];
+
+    int ev = 0;
+    float toolbar_left = 10.0f + cui_theme_get(ui)->control_sm + 6.0f;
+    cui_placement pop_place = centered ? CUI_PLACE_BOTTOM_START : CUI_PLACE_TOP_START;
+    cui_box(ui, .dir = CUI_STACK, .width = CUI_FILL,
+            .align = CUI_ALIGN_START, .justify = CUI_JUSTIFY_END) {
+        ev = cui_chat_composer(ui, "thread-composer",
+                               thread->composer_draft, sizeof thread->composer_draft,
+                               .placeholder = placeholder,
+                               .busy = busy,
+                               .max_lines = 8,
+                               .width = CUI_FILL);
+
+        cui_row(ui, .width = CUI_FILL,
+                .pad_left = toolbar_left, .pad_right = 48.0f, .pad_bottom = 11.0f,
+                .gap = 4, .align = CUI_ALIGN_CENTER, .clip = true) {
+            draw_thread_model_selector(app, ui, thread, busy, pop_place);
+        }
+    }
+
+    if (centered) {
+        draw_composer_options_strip(app, ui, thread, busy);
+    }
+
+    if (ev & CUI_COMPOSER_ATTACH) {
+        char fpath[MCODE_PATH_MAX] = "";
+        if (cui_app_file_dialog(NULL, &(cui_file_dialog_opts){
+                .kind = CUI_FILE_OPEN,
+                .title = "Reference File in Prompt",
+            }, fpath, sizeof fpath)) {
+            size_t cur_len = strlen(thread->composer_draft);
+            const char *rel = fpath;
+            size_t wd_len = strlen(thread->workdir);
+            if (wd_len > 0 && strncmp(fpath, thread->workdir, wd_len) == 0 && fpath[wd_len] == '/') {
+                rel = fpath + wd_len + 1;
+            }
+            snprintf(thread->composer_draft + cur_len,
+                     sizeof thread->composer_draft - cur_len,
+                     "%s@%s ", cur_len > 0 ? " " : "", rel);
+        }
+    }
+    if ((ev & CUI_COMPOSER_SEND) && thread->composer_draft[0]) {
+        char *copy = strdup(thread->composer_draft);
+        thread->composer_draft[0] = '\0';
+        if (copy) {
+            mcode_ui_send_prompt(app, ui, thread, copy);
+            free(copy);
+        }
+    }
+    if (ev & CUI_COMPOSER_STOP) {
+        mcode_ui_stop_thread(app, ui, thread);
+    }
+}
+
 void mcode_ui_draw_chat(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
     if (!thread) {
         draw_empty_workspace(app, ui);
@@ -1355,152 +1461,56 @@ void mcode_ui_draw_chat(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0) {
         draw_thread_header(app, ui, thread);
 
-        /* Scrollable transcript */
-        cui_scroll(ui, .id = "chat-transcript", .width = CUI_FILL, .height = CUI_FILL,
-                   .pad = 16, .gap = 16, .fade_edges = true) {
-            cui_row(ui, .width = CUI_FILL, .justify = CUI_JUSTIFY_CENTER) {
-                cui_column(ui, .width = CUI_FILL, .max_width = 860, .gap = 18) {
-                    if (thread->turn_count == 0) {
-                        cui_column(ui, .width = CUI_FILL, .pad_y = 20, .gap = 14) {
-                            cui_heading(ui, thread->title, 4);
-                            char model_name[128] = "";
-                            char effort_lbl[32] = "";
-                            mcode_model_format_display(&app->models, thread, app_chrome_settings(app->chrome),
-                                                       model_name, sizeof model_name,
-                                                       effort_lbl, sizeof effort_lbl);
-                            char sub[320];
-                            if (model_name[0] && strcmp(model_name, "Default model") != 0) {
-                                if (effort_lbl[0]) {
-                                    snprintf(sub, sizeof sub, "Ready in %s with %s (%s · %s).",
-                                             thread->workdir[0] ? thread->workdir : "project",
-                                             mcode_agent_label(thread->agent),
-                                             model_name, effort_lbl);
-                                } else {
-                                    snprintf(sub, sizeof sub, "Ready in %s with %s (%s).",
-                                             thread->workdir[0] ? thread->workdir : "project",
-                                             mcode_agent_label(thread->agent),
-                                             model_name);
-                                }
-                            } else {
-                                snprintf(sub, sizeof sub, "Ready in %s with %s.",
-                                         thread->workdir[0] ? thread->workdir : "project",
-                                         mcode_agent_label(thread->agent));
-                            }
-                            cui_secondary(ui, sub);
+        if (thread->turn_count == 0) {
+            const char *proj_name = thread_project_display_name(app, thread);
+            char hero_title[MCODE_NAME_MAX + 64];
+            if (proj_name && proj_name[0]) {
+                snprintf(hero_title, sizeof hero_title, "What should we work on in %s?", proj_name);
+            } else {
+                snprintf(hero_title, sizeof hero_title, "What should we work on?");
+            }
 
-                            int pick = cui_prompt_suggestions(ui, "starter-prompts",
-                                                              k_suggestions,
-                                                              (int)(sizeof k_suggestions / sizeof k_suggestions[0]),
-                                                              .columns = 2);
-                            if (pick >= 0 && pick < (int)(sizeof k_suggestions / sizeof k_suggestions[0])) {
-                                char prompt_buf[320];
-                                snprintf(prompt_buf, sizeof prompt_buf, "%s: %s",
-                                         k_suggestions[pick].title, k_suggestions[pick].detail);
-                                mcode_ui_send_prompt(app, ui, thread, prompt_buf);
-                            }
-                        }
-                    } else {
+            cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
+                       .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER,
+                       .pad = 24, .gap = 0) {
+                cui_column(ui, .width = CUI_FILL, .max_width = 760,
+                           .align = CUI_ALIGN_CENTER, .gap = 22) {
+                    cui_text(ui, hero_title,
+                             .font = CUI_FONT_DISPLAY,
+                             .size = 32.0f,
+                             .color = CUI_COLOR_FOREGROUND,
+                             .align = CUI_TEXT_CENTER,
+                             .line_height = 1.18f,
+                             .width = CUI_FILL);
+
+                    cui_column(ui, .width = CUI_FILL, .gap = 8) {
+                        draw_thread_composer(app, ui, thread, true);
+                    }
+                }
+            }
+        } else {
+            /* Scrollable transcript */
+            cui_scroll(ui, .id = "chat-transcript", .width = CUI_FILL, .height = CUI_FILL,
+                       .pad = 16, .gap = 16, .fade_edges = true) {
+                cui_row(ui, .width = CUI_FILL, .justify = CUI_JUSTIFY_CENTER) {
+                    cui_column(ui, .width = CUI_FILL, .max_width = 860, .gap = 18) {
                         for (int i = 0; i < thread->turn_count; ++i) {
                             draw_turn(app, ui, thread, i);
                         }
                     }
                 }
             }
-        }
-        if (thread->scroll_to_bottom_frames > 0) {
-            cui_scroll_to(ui, "chat-transcript", 1e9f);
-            thread->scroll_to_bottom_frames--;
-            if (thread->scroll_to_bottom_frames > 0) cui_request_redraw(ui);
-        }
+            if (thread->scroll_to_bottom_frames > 0) {
+                cui_scroll_to(ui, "chat-transcript", 1e9f);
+                thread->scroll_to_bottom_frames--;
+                if (thread->scroll_to_bottom_frames > 0) cui_request_redraw(ui);
+            }
 
-        /* Composer dock */
-        cui_separator(ui);
-        cui_row(ui, .width = CUI_FILL, .justify = CUI_JUSTIFY_CENTER, .pad_x = 16, .pad_y = 12) {
-            cui_column(ui, .width = CUI_FILL, .max_width = 860, .gap = 8) {
-                bool busy = (thread->active_run != NULL);
-
-                /* Compact pre-composer options strip */
-                const mcode_project *comp_proj = mcode_store_find_project(&app->store, thread->project_id);
-                cui_row(ui, .width = CUI_FILL, .gap = 10, .align = CUI_ALIGN_CENTER, .wrap = true) {
-                    if (!app->cli_status.available[thread->agent]) {
-                        cui_badge(ui, "CLI not found", .icon = CUI_ICON_TRIANGLE_ALERT,
-                                  .tone = CUI_TONE_DANGER, .size = CUI_SIZE_SM);
-                    }
-                    if (thread->session_id[0]) {
-                        char sshort[32];
-                        snprintf(sshort, sizeof sshort, "Session %.8s", thread->session_id);
-                        cui_muted(ui, sshort);
-                    }
-                    cui_spacer(ui);
-                    if (thread->turn_count == 0 && !busy && comp_proj && comp_proj->is_git_repo) {
-                        bool wt = thread->use_worktree;
-                        if (cui_chip(ui, "Worktree", &wt)) {
-                            mcode_ui_toggle_thread_worktree(app, ui, thread);
-                        }
-                    }
-                    if (cui_chip(ui, "Auto-approve", &thread->auto_approve)) {
-                        mcode_ui_mark_dirty(app);
-                    }
-                }
-
-                static const char *const k_first_placeholders[APP_AGENT_COUNT] = {
-                    "Ask Claude Code to implement a feature, fix a bug, or inspect code...",
-                    "Ask Codex to implement a feature, fix a bug, or inspect code...",
-                    "Ask Antigravity CLI to implement a feature, fix a bug, or inspect code...",
-                };
-                static const char *const k_followup_placeholders[APP_AGENT_COUNT] = {
-                    "Send a follow-up to Claude Code...",
-                    "Send a follow-up to Codex...",
-                    "Send a follow-up to Antigravity CLI...",
-                };
-                const char *placeholder = thread->turn_count == 0
-                    ? k_first_placeholders[thread->agent]
-                    : k_followup_placeholders[thread->agent];
-
-                int ev = 0;
-                float toolbar_left = 10.0f + cui_theme_get(ui)->control_sm + 6.0f;
-                cui_box(ui, .dir = CUI_STACK, .width = CUI_FILL,
-                        .align = CUI_ALIGN_START, .justify = CUI_JUSTIFY_END) {
-                    ev = cui_chat_composer(ui, "thread-composer",
-                                           thread->composer_draft, sizeof thread->composer_draft,
-                                           .placeholder = placeholder,
-                                           .busy = busy,
-                                           .max_lines = 8,
-                                           .width = CUI_FILL);
-
-                    cui_row(ui, .width = CUI_FILL,
-                            .pad_left = toolbar_left, .pad_right = 48.0f, .pad_bottom = 11.0f,
-                            .gap = 4, .align = CUI_ALIGN_CENTER, .clip = true) {
-                        draw_thread_model_selector(app, ui, thread, busy);
-                    }
-                }
-                if (ev & CUI_COMPOSER_ATTACH) {
-                    char fpath[MCODE_PATH_MAX] = "";
-                    if (cui_app_file_dialog(NULL, &(cui_file_dialog_opts){
-                            .kind = CUI_FILE_OPEN,
-                            .title = "Reference File in Prompt",
-                        }, fpath, sizeof fpath)) {
-                        size_t cur_len = strlen(thread->composer_draft);
-                        const char *rel = fpath;
-                        size_t wd_len = strlen(thread->workdir);
-                        if (wd_len > 0 && strncmp(fpath, thread->workdir, wd_len) == 0 && fpath[wd_len] == '/') {
-                            rel = fpath + wd_len + 1;
-                        }
-                        snprintf(thread->composer_draft + cur_len,
-                                 sizeof thread->composer_draft - cur_len,
-                                 "%s@%s ", cur_len > 0 ? " " : "", rel);
-                    }
-                }
-                if ((ev & CUI_COMPOSER_SEND) && thread->composer_draft[0]) {
-                    char *copy = strdup(thread->composer_draft);
-                    thread->composer_draft[0] = '\0';
-                    if (copy) {
-                        mcode_ui_send_prompt(app, ui, thread, copy);
-                        free(copy);
-                    }
-                }
-                if (ev & CUI_COMPOSER_STOP) {
-                    mcode_ui_stop_thread(app, ui, thread);
+            /* Composer dock */
+            cui_separator(ui);
+            cui_row(ui, .width = CUI_FILL, .justify = CUI_JUSTIFY_CENTER, .pad_x = 16, .pad_y = 12) {
+                cui_column(ui, .width = CUI_FILL, .max_width = 860, .gap = 8) {
+                    draw_thread_composer(app, ui, thread, false);
                 }
             }
         }
