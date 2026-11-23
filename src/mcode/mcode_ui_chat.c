@@ -444,8 +444,18 @@ static void draw_tool_payload(cui_ctx *ui, const char *id, const char *label,
     if (!body || !body[0]) return;
     cui_text(ui, label, .font = CUI_FONT_MEDIUM, .size = 11.5f,
              .color = is_error ? CUI_COLOR_DANGER : CUI_COLOR_TEXT_MUTED);
-    const char *lang = looks_like_json(body) ? "json" : lang_hint;
-    cui_code_block(ui, id, body, .lang = lang, .max_height = 180, .size = 12, .no_header = true);
+    if (is_error && !looks_like_json(body)) {
+        cui_column(ui, .id = id, .width = CUI_FILL, .max_height = 180, .scroll_y = true,
+                   .pad_x = 12, .pad_y = 10, .radius = 8, .border = 1,
+                   .border_color = cui_alpha(cui_color_of(ui, CUI_COLOR_DANGER), 0.35f),
+                   .bg = cui_alpha(cui_color_of(ui, CUI_COLOR_DANGER), 0.06f)) {
+            cui_text(ui, body, .font = CUI_FONT_MONO, .size = 12,
+                     .color = CUI_COLOR_FOREGROUND, .selectable = true, .width = CUI_FILL);
+        }
+    } else {
+        const char *lang = looks_like_json(body) ? "json" : (lang_hint ? lang_hint : "text");
+        cui_code_block(ui, id, body, .lang = lang, .max_height = 180, .size = 12, .no_header = true);
+    }
 }
 
 static void draw_tool_row(cui_ctx *ui, const mcode_block *b, const char *workdir,
@@ -1515,6 +1525,9 @@ static void draw_composer_options_strip(mcode_app *app, cui_ctx *ui, mcode_threa
         if (cui_chip(ui, "Auto-approve", &thread->auto_approve)) {
             mcode_ui_mark_dirty(app);
         }
+        cui_tooltip(ui, thread->auto_approve
+            ? "Auto-approve enabled: bypasses sandbox and permission prompts"
+            : "Sandboxed execution: click to auto-approve unsandboxed commands and actions");
     }
 }
 

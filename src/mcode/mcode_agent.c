@@ -1084,6 +1084,42 @@ static void parse_agy_result_obj(mcode_agent_run *run, yyjson_val *res) {
         }
     } else if (resp && resp[0]) {
         emit_simple(run, EV_TEXT_FALLBACK, resp);
+    } else if (!run->streamed_text_deltas) {
+        yyjson_val *denied = yyjson_obj_get(res, "denied_actions");
+        if (yyjson_is_arr(denied) && yyjson_arr_size(denied) > 0) {
+            const char *seen[16];
+            int seen_n = 0;
+            char actions[192] = "";
+            size_t pos = 0;
+            size_t idx, max;
+            yyjson_val *item;
+            yyjson_arr_foreach(denied, idx, max, item) {
+                const char *name = jstr(item, "display_name");
+                if (!name || !name[0]) name = jstr(item, "action");
+                if (!name || !name[0]) continue;
+                bool dup = false;
+                for (int j = 0; j < seen_n; ++j) {
+                    if (strcmp(seen[j], name) == 0) { dup = true; break; }
+                }
+                if (dup) continue;
+                if (seen_n < 16) seen[seen_n++] = name;
+                int w = snprintf(actions + pos, sizeof actions - pos, "%s%s",
+                                 pos > 0 ? ", " : "", name);
+                if (w > 0 && (size_t)w < sizeof actions - pos) pos += (size_t)w;
+            }
+            char msg[320];
+            if (actions[0]) {
+                snprintf(msg, sizeof msg,
+                         "Antigravity CLI denied %s in headless mode because it cannot prompt "
+                         "interactively. Enable Auto-approve for this thread to allow unsandboxed actions.",
+                         actions);
+            } else {
+                snprintf(msg, sizeof msg,
+                         "Antigravity CLI denied a tool permission in headless mode. "
+                         "Enable Auto-approve for this thread to allow unsandboxed actions.");
+            }
+            emit_simple(run, EV_ERROR, msg);
+        }
     }
 
     emit_agy_usage(run, yyjson_obj_get(res, "usage"));
@@ -2415,6 +2451,15 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
         }
         if (thread->auto_approve) {
             argv[n++] = "--dangerously-skip-permissions";
+        } else {
+            /* Headless `agy -p` cannot prompt interactively and auto-denies commands under
+             * request-review; run inside the OS terminal sandbox with proceed-in-sandbox
+             * (matching Codex's workspace-write sandbox) while keeping unsandboxed actions gated. */
+            argv[n++] = "--sandbox";
+            argv[n++] = "--mode";
+            argv[n++] = "accept-edits";
+            argv[n++] = "--settings";
+            argv[n++] = "{\"enableTerminalSandbox\":true,\"toolPermission\":\"proceed-in-sandbox\"}";
         }
     }
     argv[n] = NULL;
