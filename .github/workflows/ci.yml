@@ -1,0 +1,146 @@
+name: Release CI
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev xvfb
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test (Linux)
+        if: runner.os == 'Linux'
+        env:
+          CUI_RENDERER: software
+        run: xvfb-run -a ctest --test-dir build -C Release --output-on-failure
+
+      - name: Test (macOS & Windows)
+        if: runner.os != 'Linux'
+        env:
+          CUI_RENDERER: software
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Stage app
+        run: cmake --install build --config Release --component app --prefix build/dist
+
+      - name: Sign app (macOS, optional)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$MACOS_CERT_P12" ] || [ -z "$MACOS_CERT_PASSWORD" ]; then
+            echo "MACOS_CERT_P12 / MACOS_CERT_PASSWORD not set; skipping macOS code signing."
+            exit 0
+          fi
+
+          CERT_PATH="$RUNNER_TEMP/codesign.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASS="$(openssl rand -hex 24)"
+          cleanup() {
+            rm -f "$CERT_PATH"
+            security delete-keychain "$KEYCHAIN_PATH" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          printf '%s' "$MACOS_CERT_P12" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          security import "$CERT_PATH" -P "$MACOS_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH" >/dev/null
+
+          IDENTITY_LINE="$(security find-identity -p codesigning "$KEYCHAIN_PATH" | awk '/1\)/ { print; exit }')"
+          IDENTITY="$(printf '%s\n' "$IDENTITY_LINE" | awk '{ print $2 }')"
+          if [ -z "$IDENTITY" ]; then
+            echo "No code signing identity found in MACOS_CERT_P12." >&2
+            exit 1
+          fi
+
+          SIGN_ARGS=(--force --deep --keychain "$KEYCHAIN_PATH" --sign "$IDENTITY")
+          if printf '%s\n' "$IDENTITY_LINE" | grep -q 'Developer ID Application:'; then
+            SIGN_ARGS+=(--options runtime --timestamp)
+          fi
+
+          shopt -s nullglob
+          for app in build/dist/*.app; do
+            codesign "${SIGN_ARGS[@]}" "$app"
+            codesign --verify --deep --strict "$app"
+          done
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          arch=$(echo "${{ runner.arch }}" | tr '[:upper:]' '[:lower:]')
+          mkdir -p release-assets
+          tar -czf "release-assets/${{ github.event.repository.name }}-${{ github.ref_name }}-linux-${arch}.tar.gz" -C build/dist .
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          arch=$(echo "${{ runner.arch }}" | tr '[:upper:]' '[:lower:]')
+          mkdir -p release-assets
+          ditto -c -k build/dist "release-assets/${{ github.event.repository.name }}-${{ github.ref_name }}-macos-${arch}.zip"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $arch = "${{ runner.arch }}".ToLower()
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          Compress-Archive -Path "build/dist/*" -DestinationPath "release-assets/${{ github.event.repository.name }}-${{ github.ref_name }}-windows-$arch.zip"
+
+      - name: Upload release asset
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.os }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" release-assets/* \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes

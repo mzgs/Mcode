@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=@APP_DESKTOP_NAME@
+Comment=@APP_DESKTOP_DESCRIPTION@
+Exec=@APP_EXEC_NAME@
+Icon=@APP_BUNDLE_ID@
+StartupWMClass=@APP_BUNDLE_ID@
+Terminal=false
+Categories=Utility;

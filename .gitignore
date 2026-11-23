@@ -1,0 +1,13 @@
+/build/
+/build-*/
+cmake-build-*/
+/out/
+compile_commands.json
+CMakeUserPresets.json
+.cache/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.vs/
+*.p12
