@@ -759,6 +759,39 @@ static void draw_thread_header(mcode_app *app, cui_ctx *ui, mcode_thread *thread
     }
 }
 
+static void draw_user_message(cui_ctx *ui, const char *thread_id, const char *text) {
+    if (!text) text = "";
+    cui_push_id(ui, (thread_id && thread_id[0]) ? thread_id : "thread");
+    cui_push_id(ui, "user-msg");
+
+    bool dark = (cui_get_theme_mode(ui) == CUI_THEME_DARK);
+    cui_accent accent = cui_get_accent(ui);
+    cui_color surface = cui_color_of(ui, CUI_COLOR_SURFACE);
+    cui_color bg;
+    cui_color border_col;
+    if (accent == CUI_ACCENT_NEUTRAL) {
+        cui_color fg = cui_color_of(ui, CUI_COLOR_FOREGROUND);
+        bg = cui_mix(surface, fg, dark ? 0.08f : 0.055f);
+        border_col = cui_color_of(ui, dark ? CUI_COLOR_BORDER : CUI_COLOR_BORDER_SUBTLE);
+    } else {
+        cui_color acc = cui_color_of(ui, CUI_COLOR_ACCENT);
+        bg = cui_mix(surface, acc, dark ? 0.14f : 0.09f);
+        border_col = cui_alpha(acc, dark ? 0.30f : 0.22f);
+    }
+
+    cui_row(ui, .width = CUI_FILL, .justify = CUI_JUSTIFY_END, .pad_top = 10) {
+        cui_column(ui, .max_width = 480, .pad_x = 13, .pad_y = 8,
+                   .bg = bg, .border = 1.0f, .border_color = border_col,
+                   .radius_tl = 18, .radius_tr = 18, .radius_br = 6, .radius_bl = 18) {
+            cui_text(ui, text, .color = CUI_COLOR_FOREGROUND,
+                     .line_height = 1.45f, .selectable = true);
+        }
+    }
+
+    cui_pop_id(ui);
+    cui_pop_id(ui);
+}
+
 static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int turn_idx) {
     mcode_turn *turn = &thread->turns[turn_idx];
     bool is_last_turn = (turn_idx == thread->turn_count - 1);
@@ -766,7 +799,7 @@ static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int tur
 
     cui_column(ui, .width = CUI_FILL, .gap = 10) {
         /* User prompt bubble */
-        cui_chat_message(ui, mcode_str_cstr(&turn->prompt), .mine = true);
+        draw_user_message(ui, thread->id, mcode_str_cstr(&turn->prompt));
 
         /* Assistant stream blocks */
         const char *last_text = NULL;
