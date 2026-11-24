@@ -22,7 +22,7 @@ void mcode_store_init(mcode_store *store) {
     memset(store, 0, sizeof *store);
     store->sidebar_ratio = 0.21f;
     store->diff_ratio = 0.74f;
-    store->right_split_ratio = 0.44f;
+    store->right_split_ratio = 0.30f;
     store->terminal_ratio = 0.72f;
     store->show_sidebar = true;
     store->show_diff_panel = true;
