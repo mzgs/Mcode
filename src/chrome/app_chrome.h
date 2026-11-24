@@ -137,6 +137,7 @@ typedef struct {
     bool env_theme_override;
     bool env_accent_override;
     bool env_screenshot_mode;
+    uint64_t focus_generation;
 #ifdef __APPLE__
     int pending_action;
     cui_key pending_edit_key;

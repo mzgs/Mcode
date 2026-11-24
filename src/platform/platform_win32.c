@@ -55,6 +55,8 @@ static LRESULT CALLBACK win32_window_hook_proc(HWND hwnd, UINT msg, WPARAM wp, L
                lstrcmpW((LPCWSTR)lp, L"ImmersiveColorSet") == 0 &&
                hooks.on_theme_changed) {
         hooks.on_theme_changed(hooks.user);
+    } else if (msg == WM_ACTIVATE && LOWORD(wp) != WA_INACTIVE && hooks.on_focused) {
+        hooks.on_focused(hooks.user);
     } else if (msg == WM_NCDESTROY && hwnd == g_hook_hwnd) {
         if (prev) SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)prev);
         g_hook_hwnd = NULL;

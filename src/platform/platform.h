@@ -37,6 +37,7 @@ typedef struct {
     void (*on_moved)(void *user);
     void (*on_closing)(void *user);
     void (*on_theme_changed)(void *user);
+    void (*on_focused)(void *user);
 } app_window_hooks;
 void app_window_set_hooks(void *native_window, const char *backend, const app_window_hooks *hooks);
 

@@ -708,6 +708,13 @@ static void on_window_theme_changed(void *user) {
     if (ui) cui_request_redraw(ui);
 }
 
+static void on_window_focused(void *user) {
+    app_chrome *chrome = user;
+    if (chrome) chrome->focus_generation++;
+    cui_ctx *ui = cui_app_ui(NULL);
+    if (ui) cui_request_redraw(ui);
+}
+
 static void sync_window_state(app_chrome *chrome, cui_ctx *ui) {
     if (cui_app_ui(NULL) != ui) return;
     if (chrome->window_state_ui != ui) {
@@ -729,6 +736,7 @@ static void sync_window_state(app_chrome *chrome, cui_ctx *ui) {
             .on_moved = on_window_moved,
             .on_closing = on_window_closing,
             .on_theme_changed = on_window_theme_changed,
+            .on_focused = on_window_focused,
         });
         if (chrome->settings.window.has_pos) {
             app_window_set_pos(native, backend,

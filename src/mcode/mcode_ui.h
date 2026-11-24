@@ -118,6 +118,8 @@ typedef struct {
     int git_diff_change_idx;
     int git_diff_change_count;
     bool staged_expanded;
+    uint64_t last_focus_generation;
+    double last_focus_refresh_at;
     char sidebar_commit_msg[512];
     bool inspector_open;
     mcode_inspector_mode inspector_mode;

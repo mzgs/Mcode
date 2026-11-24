@@ -907,6 +907,8 @@ void mcode_app_init(mcode_app *app, app_chrome *chrome) {
     mcode_file_tree_init(&app->file_tree);
     app->git_selected_idx = -1;
     app->staged_expanded = true;
+    if (chrome) app->last_focus_generation = chrome->focus_generation;
+    app->last_focus_refresh_at = mcode_now_mono();
     pthread_mutex_init(&app->term_mu, NULL);
     pthread_mutex_init(&app->clone_mu, NULL);
     mcode_str_init(&app->term_pending);
@@ -1122,8 +1124,25 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
         cui_request_redraw(ui);
     }
 
-    /* Refresh CLI availability periodically when settings dialog closes or every 30s */
     double now = mcode_now_mono();
+
+    /* Refresh active project's Git changes & files when the window regains focus */
+    if (app->chrome && app->chrome->focus_generation != app->last_focus_generation) {
+        app->last_focus_generation = app->chrome->focus_generation;
+        if (!app->chrome->env_screenshot_mode && (now - app->last_focus_refresh_at) >= 0.4) {
+            app->last_focus_refresh_at = now;
+            if (app->store.project_count > 0 || mcode_store_selected_thread(&app->store)) {
+                mcode_ui_refresh_workspace_git(app);
+                if (app->inspector_open && app->inspector_mode == MCODE_INSPECTOR_FILE &&
+                    app->preview_workdir[0] && app->preview_rel_path[0]) {
+                    mcode_ui_open_file_preview(app, NULL, app->preview_workdir,
+                                               app->preview_rel_path);
+                }
+            }
+        }
+    }
+
+    /* Refresh CLI availability periodically when settings dialog closes or every 30s */
     if (now - app->cli_checked_at > 30.0) {
         bool had_agy = app->cli_status.available[APP_AGENT_AGY];
         mcode_agent_detect_clis(app_chrome_settings(app->chrome), &app->cli_status);

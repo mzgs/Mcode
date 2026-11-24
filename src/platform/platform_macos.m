@@ -183,6 +183,7 @@ static BOOL macos_content_view_cannot_move_window(id self, SEL _cmd) {
 - (void)windowDidResize:(NSNotification *)note;
 - (void)windowDidExitFullScreen:(NSNotification *)note;
 - (void)windowDidUpdate:(NSNotification *)note;
+- (void)windowDidBecomeKey:(NSNotification *)note;
 - (void)windowWillClose:(NSNotification *)note;
 @end
 
@@ -224,6 +225,13 @@ static BOOL macos_content_view_cannot_move_window(id self, SEL _cmd) {
 - (void)windowDidUpdate:(NSNotification *)note {
     if (g_integrated_titlebar_height > 0.0 && [note.object isKindOfClass:[NSWindow class]]) {
         macos_layout_traffic_lights((NSWindow *)note.object, g_integrated_titlebar_height);
+    }
+}
+
+- (void)windowDidBecomeKey:(NSNotification *)note {
+    (void)note;
+    if (_hooks.on_focused) {
+        _hooks.on_focused(_hooks.user);
     }
 }
 
@@ -294,6 +302,8 @@ void app_window_set_hooks(void *native_window, const char *backend, const app_wi
                    name:NSWindowDidExitFullScreenNotification object:win];
         [nc addObserver:obs selector:@selector(windowDidUpdate:)
                    name:NSWindowDidUpdateNotification object:win];
+        [nc addObserver:obs selector:@selector(windowDidBecomeKey:)
+                   name:NSWindowDidBecomeKeyNotification object:win];
         [nc addObserver:obs selector:@selector(windowWillClose:)
                    name:NSWindowWillCloseNotification object:win];
         if (@available(macOS 10.14, *)) {
