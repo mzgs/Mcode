@@ -1,4 +1,5 @@
 #import <Cocoa/Cocoa.h>
+#import <objc/runtime.h>
 #include "app_config.h"
 #include "platform.h"
 #include <math.h>
@@ -122,12 +123,66 @@ void app_window_apply_metadata(void *native_window, const char *backend) {
 }
 
 static char kMacOSAppearanceContext;
+static CGFloat g_integrated_titlebar_height = 0.0;
+
+static void macos_layout_traffic_lights(NSWindow *win, CGFloat titlebar_height) {
+    if (!win || titlebar_height <= 0.0) return;
+    if ((win.styleMask & NSWindowStyleMaskFullScreen) != 0) return;
+
+    NSButton *closeBtn = [win standardWindowButton:NSWindowCloseButton];
+    NSButton *minBtn = [win standardWindowButton:NSWindowMiniaturizeButton];
+    NSButton *zoomBtn = [win standardWindowButton:NSWindowZoomButton];
+    if (!closeBtn || !minBtn || !zoomBtn) return;
+    NSView *titlebarView = closeBtn.superview;
+    if (!titlebarView) return;
+
+    NSView *container = titlebarView.superview;
+    if (container && container.superview) {
+        NSRect tfBounds = container.superview.bounds;
+        NSRect cf = container.frame;
+        if (fabs(cf.size.height - titlebar_height) > 0.5 ||
+            fabs(NSMaxY(cf) - NSMaxY(tfBounds)) > 0.5) {
+            cf.origin.y = NSMaxY(tfBounds) - titlebar_height;
+            cf.size.height = titlebar_height;
+            container.frame = cf;
+        }
+        NSRect tvf = titlebarView.frame;
+        if (fabs(tvf.size.height - titlebar_height) > 0.5 || fabs(tvf.origin.y) > 0.5) {
+            tvf.origin.y = 0.0;
+            tvf.size.height = titlebar_height;
+            titlebarView.frame = tvf;
+        }
+    }
+
+    CGFloat viewH = titlebarView.bounds.size.height;
+    NSButton *btns[3] = { closeBtn, minBtn, zoomBtn };
+    CGFloat leftX = 14.0;
+    CGFloat spacing = 20.0;
+    for (int i = 0; i < 3; ++i) {
+        NSRect bf = btns[i].frame;
+        CGFloat btnH = bf.size.height;
+        CGFloat topOffset = floor((titlebar_height - btnH) * 0.5);
+        bf.origin.x = leftX + (CGFloat)i * spacing;
+        bf.origin.y = titlebarView.isFlipped ? topOffset : (viewH - topOffset - btnH);
+        btns[i].frame = bf;
+    }
+    [titlebarView updateTrackingAreas];
+}
+
+static BOOL macos_content_view_cannot_move_window(id self, SEL _cmd) {
+    (void)self;
+    (void)_cmd;
+    return NO;
+}
 
 @interface AppWindowObserver : NSObject
 @property(nonatomic, assign) app_window_hooks hooks;
 @property(nonatomic, assign) bool observingAppearance;
 - (void)detach;
 - (void)windowDidMove:(NSNotification *)note;
+- (void)windowDidResize:(NSNotification *)note;
+- (void)windowDidExitFullScreen:(NSNotification *)note;
+- (void)windowDidUpdate:(NSNotification *)note;
 - (void)windowWillClose:(NSNotification *)note;
 @end
 
@@ -147,6 +202,28 @@ static char kMacOSAppearanceContext;
     (void)note;
     if (_hooks.on_moved) {
         _hooks.on_moved(_hooks.user);
+    }
+}
+
+- (void)windowDidResize:(NSNotification *)note {
+    if (g_integrated_titlebar_height > 0.0 && [note.object isKindOfClass:[NSWindow class]]) {
+        macos_layout_traffic_lights((NSWindow *)note.object, g_integrated_titlebar_height);
+    }
+}
+
+- (void)windowDidExitFullScreen:(NSNotification *)note {
+    if (g_integrated_titlebar_height > 0.0 && [note.object isKindOfClass:[NSWindow class]]) {
+        NSWindow *win = (NSWindow *)note.object;
+        macos_layout_traffic_lights(win, g_integrated_titlebar_height);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            macos_layout_traffic_lights(win, g_integrated_titlebar_height);
+        });
+    }
+}
+
+- (void)windowDidUpdate:(NSNotification *)note {
+    if (g_integrated_titlebar_height > 0.0 && [note.object isKindOfClass:[NSWindow class]]) {
+        macos_layout_traffic_lights((NSWindow *)note.object, g_integrated_titlebar_height);
     }
 }
 
@@ -211,6 +288,12 @@ void app_window_set_hooks(void *native_window, const char *backend, const app_wi
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
         [nc addObserver:obs selector:@selector(windowDidMove:)
                    name:NSWindowDidMoveNotification object:win];
+        [nc addObserver:obs selector:@selector(windowDidResize:)
+                   name:NSWindowDidResizeNotification object:win];
+        [nc addObserver:obs selector:@selector(windowDidExitFullScreen:)
+                   name:NSWindowDidExitFullScreenNotification object:win];
+        [nc addObserver:obs selector:@selector(windowDidUpdate:)
+                   name:NSWindowDidUpdateNotification object:win];
         [nc addObserver:obs selector:@selector(windowWillClose:)
                    name:NSWindowWillCloseNotification object:win];
         if (@available(macOS 10.14, *)) {
@@ -244,6 +327,90 @@ void app_window_set_dark(void *native_window, const char *backend, bool dark) {
             if (![win.appearance.name isEqualToString:desired]) {
                 win.appearance = [NSAppearance appearanceNamed:desired];
             }
+        }
+    }
+}
+
+bool app_window_enable_integrated_titlebar(void *native_window, const char *backend, float height) {
+    if (!native_window || !backend || strcmp(backend, "cocoa") != 0) return false;
+    @autoreleasepool {
+        NSWindow *win = (__bridge NSWindow *)native_window;
+        if ((win.styleMask & NSWindowStyleMaskFullSizeContentView) == 0) {
+            NSSize prevContentSize = win.contentView ? win.contentView.frame.size
+                                                     : [win contentRectForFrameRect:win.frame].size;
+            NSRect prevFrame = win.frame;
+            win.styleMask |= NSWindowStyleMaskFullSizeContentView;
+            NSRect nextFrame = [win frameRectForContentRect:NSMakeRect(0, 0,
+                                                                       prevContentSize.width,
+                                                                       prevContentSize.height)];
+            nextFrame.origin.x = prevFrame.origin.x;
+            nextFrame.origin.y = NSMaxY(prevFrame) - nextFrame.size.height;
+            [win setFrame:nextFrame display:NO];
+        }
+        win.titlebarAppearsTransparent = YES;
+        win.titleVisibility = NSWindowTitleHidden;
+        win.movableByWindowBackground = NO;
+
+        /* Ensure CUIView receives clicks inside the transparent titlebar band
+         * instead of AppKit swallowing mouseDown to drag the window. */
+        if (win.contentView) {
+            Class viewClass = [win.contentView class];
+            if (viewClass && viewClass != [NSView class]) {
+                class_replaceMethod(viewClass,
+                                    @selector(mouseDownCanMoveWindow),
+                                    (IMP)macos_content_view_cannot_move_window,
+                                    "c@:");
+            }
+        }
+
+        g_integrated_titlebar_height = height > 28.0f ? (CGFloat)height : 40.0;
+        macos_layout_traffic_lights(win, g_integrated_titlebar_height);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            macos_layout_traffic_lights(win, g_integrated_titlebar_height);
+        });
+        return true;
+    }
+}
+
+float app_window_titlebar_left_inset(void *native_window, const char *backend) {
+    if (!native_window || !backend || strcmp(backend, "cocoa") != 0) return 0.0f;
+    @autoreleasepool {
+        NSWindow *win = (__bridge NSWindow *)native_window;
+        if ((win.styleMask & NSWindowStyleMaskFullScreen) != 0) return 0.0f;
+        NSButton *zoomBtn = [win standardWindowButton:NSWindowZoomButton];
+        if (zoomBtn && zoomBtn.superview && win.contentView) {
+            NSRect r = [zoomBtn convertRect:zoomBtn.bounds toView:win.contentView];
+            CGFloat rightEdge = NSMaxX(r);
+            if (rightEdge > 40.0 && rightEdge < 120.0) {
+                return (float)(rightEdge + 12.0);
+            }
+        }
+        return 78.0f;
+    }
+}
+
+void app_window_start_drag(void *native_window, const char *backend) {
+    if (!native_window || !backend || strcmp(backend, "cocoa") != 0) return;
+    @autoreleasepool {
+        NSWindow *win = (__bridge NSWindow *)native_window;
+        NSEvent *ev = NSApp.currentEvent;
+        if (!ev) return;
+        if (ev.type == NSEventTypeLeftMouseDown || ev.type == NSEventTypeLeftMouseDragged) {
+            [win performWindowDragWithEvent:ev];
+        }
+    }
+}
+
+void app_window_titlebar_double_click(void *native_window, const char *backend) {
+    if (!native_window || !backend || strcmp(backend, "cocoa") != 0) return;
+    @autoreleasepool {
+        NSWindow *win = (__bridge NSWindow *)native_window;
+        NSString *action = [[NSUserDefaults standardUserDefaults] stringForKey:@"AppleActionOnDoubleClick"];
+        if ([action isEqualToString:@"None"]) return;
+        if ([action isEqualToString:@"Minimize"]) {
+            [win performMiniaturize:nil];
+        } else {
+            [win performZoom:nil];
         }
     }
 }

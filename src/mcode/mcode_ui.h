@@ -11,6 +11,7 @@
 
 enum {
     MCODE_MAX_DISCOVERED_REPOS = 32,
+    MCODE_NAV_HISTORY_MAX = 64,
 };
 
 typedef enum {
@@ -39,6 +40,14 @@ typedef struct {
 
     /* Sidebar search & filter */
     char thread_search[128];
+
+    /* Thread navigation history (top bar Back / Forward) */
+    char nav_history[MCODE_NAV_HISTORY_MAX][MCODE_ID_MAX];
+    int nav_count;
+    int nav_index;
+
+    /* Integrated titlebar double-click tracking */
+    double titlebar_last_click_at;
 
     /* Add / Create / Clone Project dialog state */
     bool project_dialog_open;
@@ -115,6 +124,7 @@ void mcode_app_palette_provider(app_palette_builder *builder, void *user);
 /* Top-level menu / shortcut actions */
 void mcode_app_action_add_project(cui_ctx *ui, void *user);
 void mcode_app_action_new_thread(cui_ctx *ui, void *user);
+void mcode_app_action_toggle_sidebar(cui_ctx *ui, void *user);
 void mcode_app_action_toggle_diff(cui_ctx *ui, void *user);
 void mcode_app_action_toggle_terminal(cui_ctx *ui, void *user);
 void mcode_app_action_commit(cui_ctx *ui, void *user);

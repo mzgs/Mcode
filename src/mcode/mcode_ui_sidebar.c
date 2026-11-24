@@ -340,26 +340,56 @@ static bool draw_project_section(mcode_app *app, cui_ctx *ui, int proj_idx) {
     return !removed;
 }
 
-void mcode_ui_draw_sidebar(mcode_app *app, cui_ctx *ui) {
-    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
-               .bg = CUI_COLOR_SURFACE_MUTED, .pad = 10, .gap = 10) {
+typedef struct {
+    bool hovered;
+    bool pressed;
+} folder_plus_paint;
 
-        /* Brand & primary "+ Project" button */
+static void paint_folder_plus_btn(cui_ctx *ui, cui_rect r, void *user) {
+    const folder_plus_paint *p = (const folder_plus_paint *)user;
+    cui_color fg = cui_color_of(ui, CUI_COLOR_FOREGROUND);
+    cui_color base_bg = cui_color_of(ui, CUI_COLOR_SURFACE);
+    cui_color bg = p->pressed ? cui_mix(base_bg, fg, 0.12f)
+                 : p->hovered ? cui_mix(base_bg, fg, 0.07f)
+                              : base_bg;
+    cui_color bdr = cui_color_of(ui, CUI_COLOR_BORDER);
+    cui_draw_rect_border(ui, r, CUI_CORNERS(8.0f), bg, bdr, 1.0f);
+
+    cui_color ic = p->hovered ? fg : cui_color_of(ui, CUI_COLOR_TEXT_SECONDARY);
+    cui_draw_icon(ui, CUI_ICON_FOLDER, r, 16.0f, ic);
+
+    /* Centered "+" inside the Lucide folder body (matching Lucide folder-plus) */
+    float cx = r.x + r.w * 0.5f;
+    float cy = r.y + r.h * 0.5f + 1.1f;
+    float arm = 2.1f;
+    cui_draw_line(ui, (cui_vec2){ cx - arm, cy }, (cui_vec2){ cx + arm, cy }, 1.25f, ic);
+    cui_draw_line(ui, (cui_vec2){ cx, cy - arm }, (cui_vec2){ cx, cy + arm }, 1.25f, ic);
+}
+
+void mcode_ui_draw_sidebar(mcode_app *app, cui_ctx *ui) {
+    cui_color sidebar_bg = (cui_get_theme_mode(ui) == CUI_THEME_DARK)
+        ? CUI_RGBA(0x000000ffu)
+        : CUI_COLOR_SURFACE_MUTED;
+    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
+               .bg = sidebar_bg, .pad = 10, .gap = 10) {
+
+        /* Filter projects & threads + quick "+ Project" folder-plus action */
         cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
-            cui_icon(ui, CUI_ICON_SPARKLES, 16, CUI_COLOR_ACCENT);
-            cui_text(ui, "Mcode", .font = CUI_FONT_MEDIUM, .size = 15);
-            cui_spacer(ui);
-            if (cui_button(ui, "Project", .variant = CUI_BUTTON_SECONDARY, .size = CUI_SIZE_SM,
-                           .icon = CUI_ICON_PLUS,
-                           .tooltip = "Open, create, or clone a project",
-                           .shortcut = "Cmd Shift O")) {
+            cui_search(ui, "thread-search", app->thread_search, sizeof app->thread_search,
+                       .placeholder = "Filter projects & threads...", .width = CUI_FILL);
+            cui_id aid = cui_make_id(ui, "add-project-btn");
+            cui_rect ar = cui_get_rect(ui, aid);
+            cui_vec2 mp = cui_mouse_pos(ui);
+            bool ahov = ar.w > 0.0f && mp.x >= ar.x && mp.x <= ar.x + ar.w &&
+                        mp.y >= ar.y && mp.y <= ar.y + ar.h;
+            folder_plus_paint fpp = { ahov, ahov && cui_mouse_down(ui, CUI_MOUSE_LEFT) };
+            cui_canvas_result acr = cui_canvas(ui, "add-project-btn", CUI_PX(30), CUI_PX(30),
+                                               paint_folder_plus_btn, &fpp, sizeof fpp);
+            cui_tooltip(ui, "Open, create, or clone a project  (Cmd Shift O)");
+            if (acr.clicked) {
                 mcode_ui_open_project_dialog(app, MCODE_PROJ_DIALOG_OPEN);
             }
         }
-
-        /* Filter projects & threads */
-        cui_search(ui, "thread-search", app->thread_search, sizeof app->thread_search,
-                   .placeholder = "Filter projects & threads...", .width = CUI_FILL);
 
         /* Project tree + settled footer */
         cui_scroll(ui, .id = "sidebar-threads", .width = CUI_FILL, .height = CUI_FILL, .gap = 8) {

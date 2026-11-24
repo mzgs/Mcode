@@ -26,6 +26,10 @@ bool app_window_set_pos(void *native_window, const char *backend, int x, int y);
 void app_window_center(void *native_window, const char *backend, int width, int height);
 void app_window_apply_metadata(void *native_window, const char *backend);
 void app_window_set_dark(void *native_window, const char *backend, bool dark);
+bool app_window_enable_integrated_titlebar(void *native_window, const char *backend, float height);
+float app_window_titlebar_left_inset(void *native_window, const char *backend);
+void app_window_start_drag(void *native_window, const char *backend);
+void app_window_titlebar_double_click(void *native_window, const char *backend);
 void app_platform_shutdown(void);
 
 typedef struct {

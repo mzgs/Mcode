@@ -23,6 +23,7 @@ void mcode_store_init(mcode_store *store) {
     store->sidebar_ratio = 0.21f;
     store->diff_ratio = 0.64f;
     store->terminal_ratio = 0.72f;
+    store->show_sidebar = true;
     store->show_diff_panel = true;
     store->show_terminal_panel = false;
     store->diff_inline_mode = false;
@@ -294,6 +295,7 @@ bool mcode_store_load(mcode_store *store, const char *path) {
         if (sr >= 0.10f && sr <= 0.45f) store->sidebar_ratio = sr;
         if (dr >= 0.30f && dr <= 0.85f) store->diff_ratio = dr;
         if (tr >= 0.35f && tr <= 0.88f) store->terminal_ratio = tr;
+        store->show_sidebar = jbool_or(layout, "show_sidebar", store->show_sidebar);
         store->show_diff_panel = jbool_or(layout, "show_diff_panel", store->show_diff_panel);
         store->show_terminal_panel = jbool_or(layout, "show_terminal_panel", store->show_terminal_panel);
         store->diff_inline_mode = jbool_or(layout, "diff_inline_mode", store->diff_inline_mode);
@@ -466,6 +468,7 @@ bool mcode_store_save(const mcode_store *store, const char *path) {
     yyjson_mut_obj_add_real(doc, layout, "sidebar_ratio", store->sidebar_ratio);
     yyjson_mut_obj_add_real(doc, layout, "diff_ratio", store->diff_ratio);
     yyjson_mut_obj_add_real(doc, layout, "terminal_ratio", store->terminal_ratio);
+    yyjson_mut_obj_add_bool(doc, layout, "show_sidebar", store->show_sidebar);
     yyjson_mut_obj_add_bool(doc, layout, "show_diff_panel", store->show_diff_panel);
     yyjson_mut_obj_add_bool(doc, layout, "show_terminal_panel", store->show_terminal_panel);
     yyjson_mut_obj_add_bool(doc, layout, "diff_inline_mode", store->diff_inline_mode);

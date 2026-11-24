@@ -22,6 +22,7 @@ typedef struct {
     float sidebar_ratio;
     float diff_ratio;
     float terminal_ratio;
+    bool show_sidebar;
     bool show_diff_panel;
     bool show_terminal_panel;
     bool diff_inline_mode;

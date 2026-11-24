@@ -81,6 +81,16 @@ int main(int argc, char **argv) {
             .on_trigger = mcode_app_action_refresh_diff,
         },
         {
+            .id = "toggle_sidebar",
+            .title = "Toggle Sidebar",
+            .icon = CUI_ICON_PANEL_LEFT,
+            .group = "View",
+            .menu = APP_MENU_VIEW,
+            .default_combo = { CUI_MOD_PRIMARY, CUI_KEY_B },
+            .checked = true,
+            .on_trigger = mcode_app_action_toggle_sidebar,
+        },
+        {
             .id = "toggle_diff",
             .title = "Toggle Diff Panel",
             .icon = CUI_ICON_LAYERS,

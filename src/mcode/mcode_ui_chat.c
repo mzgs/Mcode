@@ -660,105 +660,6 @@ static void draw_empty_workspace(mcode_app *app, cui_ctx *ui) {
     }
 }
 
-static void draw_thread_header(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
-    const mcode_project *proj = mcode_store_find_project(&app->store, thread->project_id);
-
-    cui_column(ui, .width = CUI_FILL, .gap = 0) {
-        cui_row(ui, .width = CUI_FILL, .pad_x = 16, .pad_y = 10, .gap = 10,
-                .align = CUI_ALIGN_CENTER) {
-            /* Editable thread title & branch metadata */
-            cui_column(ui, .width = CUI_FILL, .gap = 4) {
-                cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
-                    if (cui_inline_edit(ui, "thread-title", thread->title, sizeof thread->title,
-                                        .font = CUI_FONT_MEDIUM, .size = 15,
-                                        .placeholder = "Untitled thread") & CUI_CHANGED) {
-                        thread->title_auto_fallback[0] = '\0';
-                        thread->title_pending = false;
-                        if (thread->title_run) {
-                            mcode_agent_title_stop(thread->title_run);
-                        }
-                        mcode_ui_mark_dirty(app);
-                    }
-                    if (!thread->active_run && thread->state == MCODE_THREAD_SETTLED) {
-                        cui_badge(ui, "Settled", .tone = CUI_TONE_SUCCESS, .icon = CUI_ICON_CHECK,
-                                  .size = CUI_SIZE_SM);
-                    }
-                }
-                cui_row(ui, .gap = 8, .align = CUI_ALIGN_CENTER, .wrap = true) {
-                    if (proj) {
-                        cui_text(ui, proj->name, .size = 12, .color = CUI_COLOR_TEXT_SECONDARY);
-                    }
-                    if (thread->branch[0]) {
-                        cui_badge(ui, thread->branch, .icon = CUI_ICON_GIT_BRANCH,
-                                  .tone = thread->use_worktree ? CUI_TONE_INFO : CUI_TONE_NEUTRAL,
-                                  .size = CUI_SIZE_SM);
-                    }
-                    if (thread->use_worktree) {
-                        cui_muted(ui, "Isolated worktree");
-                    }
-                }
-            }
-
-            /* Right-side Git & panel actions (T3 Code top-right controls) */
-            cui_row(ui, .gap = 6, .align = CUI_ALIGN_CENTER) {
-                if (thread->state != MCODE_THREAD_SETTLED) {
-                    if (cui_icon_button(ui, CUI_ICON_CHECK, .tooltip = "Mark thread settled")) {
-                        thread->state = MCODE_THREAD_SETTLED;
-                        mcode_ui_mark_dirty(app);
-                    }
-                } else {
-                    if (cui_icon_button(ui, CUI_ICON_INBOX, .tooltip = "Reopen thread")) {
-                        thread->state = MCODE_THREAD_ACTIVE;
-                        mcode_ui_mark_dirty(app);
-                    }
-                }
-
-                if (proj && proj->is_git_repo) {
-                    if (cui_button(ui, "Commit", .variant = CUI_BUTTON_OUTLINE, .size = CUI_SIZE_SM,
-                                   .icon = CUI_ICON_CHECK)) {
-                        mcode_app_action_commit(ui, app);
-                    }
-                    if (cui_button(ui, "PR", .variant = CUI_BUTTON_SECONDARY, .size = CUI_SIZE_SM,
-                                   .icon = CUI_ICON_ARROW_UP_RIGHT)) {
-                        mcode_app_action_create_pr(ui, app);
-                    }
-                } else if (proj && !proj->is_git_repo) {
-                    if (cui_button(ui, "Init Git", .variant = CUI_BUTTON_OUTLINE, .size = CUI_SIZE_SM,
-                                   .icon = CUI_ICON_GIT_BRANCH,
-                                   .tooltip = "Initialize a Git repository to enable diffs and worktrees")) {
-                        mcode_project *mut_proj = mcode_store_find_project(&app->store, proj->id);
-                        if (mut_proj) mcode_ui_init_project_git(app, ui, mut_proj);
-                    }
-                }
-
-                char diff_lbl[32];
-                if (thread->diff_file_count > 0) {
-                    snprintf(diff_lbl, sizeof diff_lbl, "Diff (%d)###hdr-diff", thread->diff_file_count);
-                } else {
-                    snprintf(diff_lbl, sizeof diff_lbl, "Diff###hdr-diff");
-                }
-                if (cui_button(ui, diff_lbl, .variant = CUI_BUTTON_GHOST, .size = CUI_SIZE_SM,
-                               .icon = CUI_ICON_LAYERS, .selected = app->store.show_diff_panel,
-                               .tooltip = "Toggle Diff Panel", .shortcut = "Cmd D")) {
-                    mcode_app_action_toggle_diff(ui, app);
-                }
-                if (cui_icon_button(ui, CUI_ICON_FOLDER_OPEN,
-                                    .tooltip = "Open Folder in Finder",
-                                    .shortcut = "Cmd Shift F")) {
-                    mcode_app_action_open_folder(ui, app);
-                }
-                if (cui_icon_button(ui, CUI_ICON_SQUARE_TERMINAL,
-                                    .selected = app->store.show_terminal_panel,
-                                    .tooltip = "Toggle Integrated Terminal",
-                                    .shortcut = "Cmd J")) {
-                    mcode_app_action_toggle_terminal(ui, app);
-                }
-            }
-        }
-        cui_separator(ui);
-    }
-}
-
 static void draw_user_message(cui_ctx *ui, const char *thread_id, const char *text) {
     if (!text) text = "";
     cui_push_id(ui, (thread_id && thread_id[0]) ? thread_id : "thread");
@@ -1832,8 +1733,6 @@ void mcode_ui_draw_chat(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
     }
 
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0) {
-        draw_thread_header(app, ui, thread);
-
         if (thread->turn_count == 0) {
             const char *proj_name = thread_project_display_name(app, thread);
             char hero_title[MCODE_NAME_MAX + 64];

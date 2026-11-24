@@ -721,6 +721,7 @@ static void sync_window_state(app_chrome *chrome, cui_ctx *ui) {
                      backend ? backend : "unknown",
                      cui_app_is_software(NULL) ? "Software" : "OpenGL");
         app_window_apply_metadata(native, backend);
+        app_window_enable_integrated_titlebar(native, backend, 40.0f);
         app_window_set_hooks(native, backend, &(app_window_hooks){
             .user = chrome,
             .on_moved = on_window_moved,

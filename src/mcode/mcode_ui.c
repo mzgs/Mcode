@@ -6,8 +6,10 @@
 #include "mcode_git.h"
 #include "mcode_provider_icons.h"
 #include "app_log.h"
+#include "platform.h"
 
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -133,11 +135,57 @@ void mcode_ui_refresh_thread_diff(mcode_thread *thread) {
     mcode_ui_load_selected_diff(thread);
 }
 
+static void nav_history_push(mcode_app *app, const char *thread_id) {
+    if (!app || !thread_id || !thread_id[0]) return;
+    if (app->nav_count > 0 && app->nav_index >= 0 && app->nav_index < app->nav_count &&
+        strcmp(app->nav_history[app->nav_index], thread_id) == 0) {
+        return;
+    }
+    int next_pos = (app->nav_count > 0 && app->nav_index >= 0) ? (app->nav_index + 1) : 0;
+    if (next_pos >= MCODE_NAV_HISTORY_MAX) {
+        memmove(app->nav_history[0], app->nav_history[1],
+                (size_t)(MCODE_NAV_HISTORY_MAX - 1) * sizeof app->nav_history[0]);
+        next_pos = MCODE_NAV_HISTORY_MAX - 1;
+    }
+    snprintf(app->nav_history[next_pos], sizeof app->nav_history[next_pos], "%s", thread_id);
+    app->nav_index = next_pos;
+    app->nav_count = next_pos + 1;
+}
+
+static int nav_history_find_prev(mcode_app *app) {
+    if (!app || app->nav_count <= 1 || app->nav_index <= 0) return -1;
+    for (int i = app->nav_index - 1; i >= 0; --i) {
+        if (mcode_store_find_thread(&app->store, app->nav_history[i])) return i;
+    }
+    return -1;
+}
+
+static int nav_history_find_next(mcode_app *app) {
+    if (!app || app->nav_count <= 1 || app->nav_index < 0) return -1;
+    for (int i = app->nav_index + 1; i < app->nav_count; ++i) {
+        if (mcode_store_find_thread(&app->store, app->nav_history[i])) return i;
+    }
+    return -1;
+}
+
+static void nav_history_jump(mcode_app *app, int target_idx) {
+    if (!app || target_idx < 0 || target_idx >= app->nav_count) return;
+    mcode_thread *t = mcode_store_find_thread(&app->store, app->nav_history[target_idx]);
+    if (!t) return;
+    app->nav_index = target_idx;
+    if (strcmp(app->store.selected_thread_id, t->id) != 0) {
+        snprintf(app->store.selected_thread_id, sizeof app->store.selected_thread_id, "%s", t->id);
+        mcode_ui_refresh_thread_diff(t);
+        mcode_ui_mark_dirty(app);
+    }
+}
+
 void mcode_ui_select_thread(mcode_app *app, const char *thread_id) {
     if (!app || !thread_id || !thread_id[0]) return;
-    if (strcmp(app->store.selected_thread_id, thread_id) == 0) return;
     mcode_thread *t = mcode_store_find_thread(&app->store, thread_id);
     if (!t) return;
+    nav_history_push(app, t->id);
+    if (strcmp(app->store.selected_thread_id, t->id) == 0) return;
     snprintf(app->store.selected_thread_id, sizeof app->store.selected_thread_id, "%s", t->id);
     mcode_ui_refresh_thread_diff(t);
     mcode_ui_mark_dirty(app);
@@ -527,6 +575,7 @@ mcode_thread *mcode_ui_create_thread(mcode_app *app, cui_ctx *ui, mcode_project 
         proj->collapsed = false;
         snprintf(app->store.selected_project_id, sizeof app->store.selected_project_id,
                  "%s", proj->id);
+        nav_history_push(app, t->id);
         mcode_ui_refresh_thread_diff(t);
         mcode_ui_mark_dirty(app);
     }
@@ -711,7 +760,10 @@ void mcode_app_init(mcode_app *app, app_chrome *chrome) {
         snprintf(app->state_path, sizeof app->state_path, "%s/mcode-state.json", dir);
         if (mcode_store_load(&app->store, app->state_path)) {
             mcode_thread *sel = mcode_store_selected_thread(&app->store);
-            if (sel) mcode_ui_refresh_thread_diff(sel);
+            if (sel) {
+                nav_history_push(app, sel->id);
+                mcode_ui_refresh_thread_diff(sel);
+            }
         }
     }
 
@@ -962,6 +1014,480 @@ static void draw_status_bar(mcode_app *app, cui_ctx *ui, mcode_thread *thread, i
     }
 }
 
+enum {
+    TOPBAR_ICON_SIDEBAR_OPEN = 0,
+    TOPBAR_ICON_SIDEBAR_CLOSED,
+    TOPBAR_ICON_ACTIONS,
+    TOPBAR_ICON_BOTTOM_PANEL,
+    TOPBAR_ICON_RIGHT_PANEL,
+};
+
+typedef struct {
+    int kind;
+    bool active;
+    bool hovered;
+    bool pressed;
+} topbar_icon_paint;
+
+static void paint_topbar_icon_btn(cui_ctx *ui, cui_rect r, void *user) {
+    const topbar_icon_paint *p = (const topbar_icon_paint *)user;
+    bool dark = (cui_get_theme_mode(ui) == CUI_THEME_DARK);
+    cui_color fg = cui_color_of(ui, CUI_COLOR_FOREGROUND);
+
+    if (p->active) {
+        cui_color fill = cui_alpha(fg, dark ? (p->hovered ? 0.13f : 0.09f)
+                                            : (p->hovered ? 0.10f : 0.07f));
+        cui_color bdr = cui_alpha(fg, dark ? 0.12f : 0.10f);
+        cui_draw_rect_border(ui, r, CUI_CORNERS(7.0f), fill, bdr, 1.0f);
+    } else if (p->pressed || p->hovered) {
+        cui_color fill = cui_alpha(fg, p->pressed ? 0.10f : 0.06f);
+        cui_draw_rect(ui, r, CUI_CORNERS(7.0f), fill);
+    }
+
+    cui_color stroke = p->active
+        ? fg
+        : (p->hovered ? cui_color_of(ui, CUI_COLOR_TEXT_SECONDARY)
+                      : cui_color_of(ui, CUI_COLOR_TEXT_MUTED));
+    cui_color clear = { 0, 0, 0, 0 };
+    float t = 1.35f;
+
+    if (p->kind == TOPBAR_ICON_ACTIONS) {
+        float w = 14.0f, h = 14.0f;
+        float x = floorf(r.x + (r.w - w) * 0.5f) + 0.5f;
+        float y = floorf(r.y + (r.h - h) * 0.5f) + 0.5f;
+        cui_draw_rect_border(ui, (cui_rect){ x, y, w, h }, CUI_CORNERS(3.2f), clear, stroke, t);
+        cui_draw_line(ui, (cui_vec2){ x + 3.4f, y + 4.2f }, (cui_vec2){ x + w - 3.4f, y + 4.2f }, t, stroke);
+        cui_draw_line(ui, (cui_vec2){ x + 3.4f, y + 7.0f }, (cui_vec2){ x + w - 3.4f, y + 7.0f }, t, stroke);
+        cui_draw_line(ui, (cui_vec2){ x + 3.4f, y + 9.8f }, (cui_vec2){ x + w - 3.4f, y + 9.8f }, t, stroke);
+        return;
+    }
+
+    float w = 15.0f, h = 13.0f;
+    float x = floorf(r.x + (r.w - w) * 0.5f) + 0.5f;
+    float y = floorf(r.y + (r.h - h) * 0.5f) + 0.5f;
+    cui_draw_rect_border(ui, (cui_rect){ x, y, w, h }, CUI_CORNERS(3.0f), clear, stroke, t);
+
+    if (p->kind == TOPBAR_ICON_SIDEBAR_OPEN || p->kind == TOPBAR_ICON_SIDEBAR_CLOSED) {
+        float sx = x + 4.8f;
+        cui_draw_line(ui, (cui_vec2){ sx, y + 1.0f }, (cui_vec2){ sx, y + h - 1.0f }, t, stroke);
+        float cy = y + h * 0.5f;
+        if (p->kind == TOPBAR_ICON_SIDEBAR_OPEN) {
+            cui_vec2 chev[3] = {
+                { x + 10.8f, cy - 2.4f },
+                { x + 8.3f,  cy },
+                { x + 10.8f, cy + 2.4f },
+            };
+            cui_draw_polyline(ui, chev, 3, 1.25f, stroke, false);
+        } else {
+            cui_vec2 chev[3] = {
+                { x + 8.6f,  cy - 2.4f },
+                { x + 11.1f, cy },
+                { x + 8.6f,  cy + 2.4f },
+            };
+            cui_draw_polyline(ui, chev, 3, 1.25f, stroke, false);
+        }
+    } else if (p->kind == TOPBAR_ICON_BOTTOM_PANEL) {
+        float sy = y + h - 4.2f;
+        cui_draw_line(ui, (cui_vec2){ x + 1.0f, sy }, (cui_vec2){ x + w - 1.0f, sy }, t, stroke);
+    } else if (p->kind == TOPBAR_ICON_RIGHT_PANEL) {
+        float sx = x + w - 4.8f;
+        cui_draw_line(ui, (cui_vec2){ sx, y + 1.0f }, (cui_vec2){ sx, y + h - 1.0f }, t, stroke);
+    }
+}
+
+static bool draw_topbar_icon_btn(cui_ctx *ui, const char *id, int kind, bool active,
+                                 const char *tooltip, const char *shortcut) {
+    cui_id cid = cui_make_id(ui, id);
+    cui_rect prev = cui_get_rect(ui, cid);
+    cui_vec2 mp = cui_mouse_pos(ui);
+    bool hov = prev.w > 0.0f &&
+               mp.x >= prev.x && mp.x <= prev.x + prev.w &&
+               mp.y >= prev.y && mp.y <= prev.y + prev.h;
+    bool prs = hov && cui_mouse_down(ui, CUI_MOUSE_LEFT);
+    topbar_icon_paint spec = { kind, active, hov, prs };
+    cui_canvas_result cr = cui_canvas(ui, id, CUI_PX(28), CUI_PX(28),
+                                      paint_topbar_icon_btn, &spec, sizeof spec);
+    if (tooltip && tooltip[0]) {
+        if (shortcut && shortcut[0]) {
+            char tip[160];
+            snprintf(tip, sizeof tip, "%s  (%s)", tooltip, shortcut);
+            cui_tooltip(ui, tip);
+        } else {
+            cui_tooltip(ui, tooltip);
+        }
+    }
+    return cr.clicked;
+}
+
+static void handle_topbar_drag_zone(mcode_app *app, cui_ctx *ui, const char *id,
+                                    cui_size width) {
+    cui_canvas_result cr = cui_canvas(ui, id, width, CUI_FILL, NULL, NULL, 0);
+    if (cr.hovered && cui_mouse_clicked(ui, CUI_MOUSE_LEFT)) {
+        void *native = cui_app_ui(NULL) ? cui_app_native_window(NULL) : NULL;
+        const char *backend = cui_app_ui(NULL) ? cui_app_backend(NULL) : NULL;
+        double now = cui_time(ui);
+        if (app->titlebar_last_click_at > 0.0 && (now - app->titlebar_last_click_at) < 0.32) {
+            app->titlebar_last_click_at = 0.0;
+            app_window_titlebar_double_click(native, backend);
+        } else {
+            app->titlebar_last_click_at = now;
+            app_window_start_drag(native, backend);
+            cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+        }
+    }
+}
+
+static cui_color project_badge_color(const char *name) {
+    static const uint32_t k_palette[] = {
+        0x0099b8ffu, /* cyan / teal */
+        0x2f7cf6ffu, /* blue */
+        0x7c5cf6ffu, /* violet */
+        0x159e6dffu, /* emerald */
+        0xd98218ffu, /* amber */
+        0xd9467bffu, /* rose */
+        0x4f66f0ffu, /* indigo */
+    };
+    uint32_t h = 2166136261u;
+    if (name) {
+        for (const unsigned char *p = (const unsigned char *)name; *p; ++p) {
+            h ^= (uint32_t)(*p);
+            h *= 16777619u;
+        }
+    }
+    return CUI_RGBA(k_palette[h % (sizeof k_palette / sizeof k_palette[0])]);
+}
+
+static void draw_project_badge(cui_ctx *ui, const char *name) {
+    char letter[2] = "P";
+    if (name) {
+        for (const char *p = name; *p; ++p) {
+            if (isalnum((unsigned char)*p)) {
+                letter[0] = (char)toupper((unsigned char)*p);
+                break;
+            }
+        }
+    }
+    cui_box(ui, .width = CUI_PX(18), .height = CUI_PX(18), .radius = 5,
+            .bg = project_badge_color(name),
+            .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER) {
+        cui_text(ui, letter, .font = CUI_FONT_MEDIUM, .size = 10.5f,
+                 .color = CUI_RGBA(0xffffffffu), .nowrap = true);
+    }
+}
+
+static void draw_topbar_left_controls(mcode_app *app, cui_ctx *ui, bool fill_width) {
+    void *native = cui_app_ui(NULL) ? cui_app_native_window(NULL) : NULL;
+    const char *backend = cui_app_ui(NULL) ? cui_app_backend(NULL) : NULL;
+    float left_inset = app_window_titlebar_left_inset(native, backend);
+    float pad_left = left_inset > 10.0f ? left_inset : 10.0f;
+
+    int prev_idx = nav_history_find_prev(app);
+    int next_idx = nav_history_find_next(app);
+
+    cui_row(ui, .width = fill_width ? CUI_FILL : CUI_FIT, .height = CUI_PX(40),
+            .pad_left = pad_left, .pad_right = 8, .gap = 4,
+            .align = CUI_ALIGN_CENTER) {
+        if (draw_topbar_icon_btn(ui, "tb-sidebar",
+                                 app->store.show_sidebar ? TOPBAR_ICON_SIDEBAR_OPEN
+                                                         : TOPBAR_ICON_SIDEBAR_CLOSED,
+                                 false,
+                                 app->store.show_sidebar ? "Hide Sidebar" : "Show Sidebar",
+                                 "Cmd B")) {
+            mcode_app_action_toggle_sidebar(ui, app);
+        }
+
+        cui_row(ui, .pad_left = 4, .pad_right = 4, .gap = 0, .align = CUI_ALIGN_CENTER) {
+            cui_text(ui, "M", .font = CUI_FONT_MEDIUM, .size = 13.5f,
+                     .color = CUI_COLOR_FOREGROUND, .nowrap = true);
+            cui_text(ui, "code", .font = CUI_FONT_BODY, .size = 13.5f,
+                     .color = CUI_COLOR_TEXT_SECONDARY, .nowrap = true);
+        }
+
+        if (fill_width) {
+            handle_topbar_drag_zone(app, ui, "tb-drag-left", CUI_FILL);
+        } else {
+            cui_gap(ui, 4);
+        }
+
+        cui_row(ui, .gap = 0, .align = CUI_ALIGN_CENTER) {
+            if (cui_icon_button(ui, CUI_ICON_ARROW_LEFT, .size = CUI_SIZE_SM,
+                                .variant = CUI_BUTTON_GHOST,
+                                .width = CUI_PX(26),
+                                .disabled = (prev_idx < 0),
+                                .color = (prev_idx >= 0) ? CUI_COLOR_TEXT_SECONDARY
+                                                         : CUI_COLOR_TEXT_MUTED,
+                                .tooltip = "Previous Thread")) {
+                nav_history_jump(app, prev_idx);
+            }
+            if (cui_icon_button(ui, CUI_ICON_ARROW_RIGHT, .size = CUI_SIZE_SM,
+                                .variant = CUI_BUTTON_GHOST,
+                                .width = CUI_PX(26),
+                                .disabled = (next_idx < 0),
+                                .color = (next_idx >= 0) ? CUI_COLOR_TEXT_SECONDARY
+                                                         : CUI_COLOR_TEXT_MUTED,
+                                .tooltip = "Next Thread")) {
+                nav_history_jump(app, next_idx);
+            }
+        }
+    }
+}
+
+static bool draw_actions_pop_item(cui_ctx *ui, const char *id, const char *icon,
+                                  const char *label, const char *shortcut, bool danger) {
+    cui_id cid = cui_make_id(ui, id);
+    cui_rect r = cui_get_rect(ui, cid);
+    cui_vec2 mp = cui_mouse_pos(ui);
+    bool hov = r.w > 0.0f && mp.x >= r.x && mp.x <= r.x + r.w &&
+               mp.y >= r.y && mp.y <= r.y + r.h;
+    cui_color bg = hov
+        ? cui_alpha(cui_color_of(ui, danger ? CUI_COLOR_DANGER : CUI_COLOR_FOREGROUND), 0.08f)
+        : CUI_RGBA(0x00000001u);
+    cui_color fg = danger ? CUI_COLOR_DANGER : CUI_COLOR_FOREGROUND;
+    cui_color ic = danger ? CUI_COLOR_DANGER : CUI_COLOR_TEXT_SECONDARY;
+
+    bool clicked = cui_card_begin(ui, &(cui_card_opts){
+        .id = id,
+        .dir = CUI_ROW,
+        .align = CUI_ALIGN_CENTER,
+        .width = CUI_FILL,
+        .pad_x = 9,
+        .pad_y = 6,
+        .gap = 8,
+        .hoverable = true,
+        .border = -1.0f,
+        .radius = 6,
+        .bg = bg,
+    });
+    if (icon && icon[0]) {
+        cui_icon(ui, icon, 14, ic);
+    }
+    cui_text(ui, label, .size = 12.5f, .color = fg, .width = CUI_FILL, .nowrap = true);
+    if (shortcut && shortcut[0]) {
+        cui_text(ui, shortcut, .size = 11.0f, .color = CUI_COLOR_TEXT_MUTED, .nowrap = true);
+    }
+    cui_card_end(ui);
+    return clicked;
+}
+
+static void draw_topbar_main_segment(mcode_app *app, cui_ctx *ui, mcode_thread *thread,
+                                     bool include_left_controls) {
+    mcode_project *proj = thread ? mcode_store_find_project(&app->store, thread->project_id) : NULL;
+    if (!proj && app->store.selected_project_id[0]) {
+        proj = mcode_store_find_project(&app->store, app->store.selected_project_id);
+    }
+
+    cui_row(ui, .width = CUI_FILL, .height = CUI_PX(40),
+            .bg = CUI_COLOR_BACKGROUND,
+            .pad_left = include_left_controls ? 0 : 14, .pad_right = 10,
+            .gap = 0, .align = CUI_ALIGN_CENTER) {
+        if (include_left_controls) {
+            draw_topbar_left_controls(app, ui, false);
+            cui_box(ui, .width = CUI_PX(1), .height = CUI_PX(20),
+                    .bg = CUI_COLOR_BORDER) {}
+            cui_gap(ui, 12);
+        }
+
+        /* Breadcrumb: [Project Badge] project / Thread title */
+        if (thread) {
+            cui_row(ui, .gap = 8, .align = CUI_ALIGN_CENTER, .max_width = 620, .clip = true) {
+                if (proj) {
+                    draw_project_badge(ui, proj->name);
+                    cui_text(ui, proj->name, .font = CUI_FONT_BODY, .size = 13.0f,
+                             .color = CUI_COLOR_TEXT_SECONDARY, .nowrap = true);
+                    char tip[MCODE_PATH_MAX + 64];
+                    mcode_git_shorten_home_path(proj->path, tip, sizeof tip);
+                    cui_tooltip(ui, tip);
+                    cui_text(ui, "/", .font = CUI_FONT_BODY, .size = 13.0f,
+                             .color = CUI_COLOR_TEXT_MUTED, .nowrap = true);
+                }
+
+                cui_box(ui, .max_width = 420, .clip = true) {
+                    if (cui_inline_edit(ui, "thread-title", thread->title, sizeof thread->title,
+                                        .font = CUI_FONT_MEDIUM, .size = 13.0f,
+                                        .placeholder = "Untitled thread") & CUI_CHANGED) {
+                        thread->title_auto_fallback[0] = '\0';
+                        thread->title_pending = false;
+                        if (thread->title_run) {
+                            mcode_agent_title_stop(thread->title_run);
+                        }
+                        mcode_ui_mark_dirty(app);
+                    }
+                }
+
+                if (!thread->active_run && thread->state == MCODE_THREAD_SETTLED) {
+                    cui_badge(ui, "Settled", .tone = CUI_TONE_SUCCESS, .icon = CUI_ICON_CHECK,
+                              .size = CUI_SIZE_SM);
+                }
+            }
+        } else if (proj) {
+            cui_row(ui, .gap = 8, .align = CUI_ALIGN_CENTER) {
+                draw_project_badge(ui, proj->name);
+                cui_text(ui, proj->name, .font = CUI_FONT_BODY, .size = 13.0f,
+                         .color = CUI_COLOR_TEXT_SECONDARY, .nowrap = true);
+            }
+        }
+
+        /* Draggable empty space */
+        handle_topbar_drag_zone(app, ui, "tb-drag-main", CUI_FILL);
+
+        /* Right-side 3-icon cluster: Actions / Terminal / Diff */
+        cui_row(ui, .gap = 4, .align = CUI_ALIGN_CENTER) {
+            bool actions_open = cui_popover_is_open(ui, "topbar-actions-pop");
+            if (draw_topbar_icon_btn(ui, "tb-actions", TOPBAR_ICON_ACTIONS, actions_open,
+                                     thread ? "Thread & Git Actions" : "Workspace Actions", NULL)) {
+                cui_popover_toggle(ui, "topbar-actions-pop");
+            }
+
+            bool close_actions = false;
+            cui_popover(ui, "topbar-actions-pop", .placement = CUI_PLACE_BOTTOM_END,
+                        .width = 252, .pad = 6, .gap = 2) {
+                cui_column(ui, .width = CUI_FILL, .gap = 2) {
+                    if (thread) {
+                        if (thread->branch[0] || thread->diff_file_count > 0) {
+                            cui_row(ui, .width = CUI_FILL, .pad_x = 9, .pad_y = 6, .gap = 6,
+                                    .align = CUI_ALIGN_CENTER, .wrap = true) {
+                                if (thread->branch[0]) {
+                                    cui_badge(ui, thread->branch, .icon = CUI_ICON_GIT_BRANCH,
+                                              .tone = thread->use_worktree ? CUI_TONE_INFO : CUI_TONE_NEUTRAL,
+                                              .size = CUI_SIZE_SM);
+                                }
+                                if (thread->diff_file_count > 0) {
+                                    char dstat[48];
+                                    snprintf(dstat, sizeof dstat, "+%d -%d",
+                                             thread->total_added, thread->total_removed);
+                                    cui_text(ui, dstat, .font = CUI_FONT_MONO, .size = 11.0f,
+                                             .color = CUI_COLOR_TEXT_MUTED, .tabular = true);
+                                }
+                            }
+                            cui_separator(ui);
+                        }
+
+                        if (proj && proj->is_git_repo) {
+                            if (draw_actions_pop_item(ui, "act-commit", CUI_ICON_CHECK,
+                                                      "Commit Changes...", "Cmd Shift C", false)) {
+                                mcode_app_action_commit(ui, app);
+                                close_actions = true;
+                            }
+                            if (draw_actions_pop_item(ui, "act-pr", CUI_ICON_ARROW_UP_RIGHT,
+                                                      "Push & Create PR...", "Cmd Shift P", false)) {
+                                mcode_app_action_create_pr(ui, app);
+                                close_actions = true;
+                            }
+                            if (draw_actions_pop_item(ui, "act-rdiff", CUI_ICON_REFRESH_CW,
+                                                      "Refresh Diff", "Cmd R", false)) {
+                                mcode_app_action_refresh_diff(ui, app);
+                                close_actions = true;
+                            }
+                        } else if (proj && !proj->is_git_repo) {
+                            if (draw_actions_pop_item(ui, "act-init-git", CUI_ICON_GIT_BRANCH,
+                                                      "Initialize Git Repository", NULL, false)) {
+                                mcode_ui_init_project_git(app, ui, proj);
+                                close_actions = true;
+                            }
+                        }
+
+                        if (draw_actions_pop_item(ui, "act-finder", CUI_ICON_FOLDER_OPEN,
+                                                  "Open Folder in Finder", "Cmd Shift F", false)) {
+                            mcode_app_action_open_folder(ui, app);
+                            close_actions = true;
+                        }
+                        if (thread->state != MCODE_THREAD_SETTLED) {
+                            if (draw_actions_pop_item(ui, "act-settle", CUI_ICON_CIRCLE_CHECK,
+                                                      "Mark Thread Settled", NULL, false)) {
+                                thread->state = MCODE_THREAD_SETTLED;
+                                mcode_ui_mark_dirty(app);
+                                close_actions = true;
+                            }
+                        } else {
+                            if (draw_actions_pop_item(ui, "act-reopen", CUI_ICON_INBOX,
+                                                      "Reopen Thread", NULL, false)) {
+                                thread->state = MCODE_THREAD_ACTIVE;
+                                mcode_ui_mark_dirty(app);
+                                close_actions = true;
+                            }
+                        }
+                        if (proj) {
+                            if (draw_actions_pop_item(ui, "act-qa", CUI_ICON_SLIDERS_HORIZONTAL,
+                                                      "Quick Actions & Setup...", NULL, false)) {
+                                mcode_ui_open_project_actions_for(app, ui, proj->id);
+                                close_actions = true;
+                            }
+                        }
+                        cui_separator(ui);
+                    }
+
+                    if (draw_actions_pop_item(ui, "act-palette", CUI_ICON_COMMAND,
+                                              "Command Palette...", "Cmd K", false)) {
+                        app->chrome->palette_open = true;
+                        close_actions = true;
+                    }
+                    if (draw_actions_pop_item(ui, "act-settings", CUI_ICON_SETTINGS,
+                                              "Settings...", "Cmd ,", false)) {
+                        app->chrome->settings_open = true;
+                        app->chrome->settings_section = SETTINGS_SECTION_GENERAL;
+                        close_actions = true;
+                    }
+                }
+            }
+            if (close_actions) {
+                cui_popover_close(ui, "topbar-actions-pop");
+            }
+
+            if (draw_topbar_icon_btn(ui, "tb-terminal", TOPBAR_ICON_BOTTOM_PANEL,
+                                     app->store.show_terminal_panel,
+                                     "Toggle Terminal", "Cmd J")) {
+                mcode_app_action_toggle_terminal(ui, app);
+            }
+
+            char diff_tip[64];
+            if (thread && thread->diff_file_count > 0) {
+                snprintf(diff_tip, sizeof diff_tip, "Toggle Diff Panel (%d %s)",
+                         thread->diff_file_count,
+                         thread->diff_file_count == 1 ? "file" : "files");
+            } else {
+                snprintf(diff_tip, sizeof diff_tip, "Toggle Diff Panel");
+            }
+            if (draw_topbar_icon_btn(ui, "tb-diff", TOPBAR_ICON_RIGHT_PANEL,
+                                     app->store.show_diff_panel && (thread != NULL),
+                                     diff_tip, "Cmd D")) {
+                mcode_app_action_toggle_diff(ui, app);
+            }
+        }
+    }
+}
+
+static void draw_main_workspace_body(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
+    if (app->store.show_diff_panel && thread) {
+        cui_split(ui, "mcode-diff-split", &app->store.diff_ratio,
+                  .min_first = 360, .min_second = 280,
+                  .width = CUI_FILL, .height = CUI_FILL) {
+            if (app->store.show_terminal_panel) {
+                cui_split(ui, "mcode-term-split", &app->store.terminal_ratio,
+                          .vertical = true, .min_first = 220, .min_second = 150,
+                          .width = CUI_FILL, .height = CUI_FILL) {
+                    mcode_ui_draw_chat(app, ui, thread);
+                    cui_split_next(ui);
+                    mcode_ui_draw_terminal(app, ui, thread);
+                }
+            } else {
+                mcode_ui_draw_chat(app, ui, thread);
+            }
+            cui_split_next(ui);
+            mcode_ui_draw_diff(app, ui, thread);
+        }
+    } else if (app->store.show_terminal_panel) {
+        cui_split(ui, "mcode-term-split-wide", &app->store.terminal_ratio,
+                  .vertical = true, .min_first = 220, .min_second = 150,
+                  .width = CUI_FILL, .height = CUI_FILL) {
+            mcode_ui_draw_chat(app, ui, thread);
+            cui_split_next(ui);
+            mcode_ui_draw_terminal(app, ui, thread);
+        }
+    } else {
+        mcode_ui_draw_chat(app, ui, thread);
+    }
+}
+
 void mcode_app_frame(mcode_app *app, cui_ctx *ui) {
     if (!app || !ui) return;
     int running_count = 0;
@@ -970,6 +1496,7 @@ void mcode_app_frame(mcode_app *app, cui_ctx *ui) {
     mcode_thread *thread = mcode_store_selected_thread(&app->store);
 
     /* Keep menu checkmarks in sync */
+    app_chrome_set_action_checked(app->chrome, "toggle_sidebar", app->store.show_sidebar);
     app_chrome_set_action_checked(app->chrome, "toggle_diff", app->store.show_diff_panel);
     app_chrome_set_action_checked(app->chrome, "toggle_terminal", app->store.show_terminal_panel);
     app_chrome_set_action_enabled(app->chrome, "commit", thread != NULL);
@@ -978,40 +1505,32 @@ void mcode_app_frame(mcode_app *app, cui_ctx *ui) {
 
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0) {
         cui_box(ui, .width = CUI_FILL, .height = CUI_FILL) {
-            cui_split(ui, "mcode-main-split", &app->store.sidebar_ratio,
-                      .min_first = 220, .min_second = 420,
-                      .width = CUI_FILL, .height = CUI_FILL) {
-                mcode_ui_draw_sidebar(app, ui);
-                cui_split_next(ui);
+            if (app->store.show_sidebar) {
+                cui_color sidebar_bg = (cui_get_theme_mode(ui) == CUI_THEME_DARK)
+                    ? CUI_RGBA(0x000000ffu)
+                    : CUI_COLOR_SURFACE_MUTED;
+                cui_split(ui, "mcode-main-split", &app->store.sidebar_ratio,
+                          .min_first = 248, .min_second = 420,
+                          .width = CUI_FILL, .height = CUI_FILL) {
+                    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
+                               .bg = sidebar_bg, .gap = 0) {
+                        draw_topbar_left_controls(app, ui, true);
+                        cui_separator(ui);
+                        mcode_ui_draw_sidebar(app, ui);
+                    }
+                    cui_split_next(ui);
 
-                if (app->store.show_diff_panel && thread) {
-                    cui_split(ui, "mcode-diff-split", &app->store.diff_ratio,
-                              .min_first = 360, .min_second = 280,
-                              .width = CUI_FILL, .height = CUI_FILL) {
-                        if (app->store.show_terminal_panel) {
-                            cui_split(ui, "mcode-term-split", &app->store.terminal_ratio,
-                                      .vertical = true, .min_first = 220, .min_second = 150,
-                                      .width = CUI_FILL, .height = CUI_FILL) {
-                                mcode_ui_draw_chat(app, ui, thread);
-                                cui_split_next(ui);
-                                mcode_ui_draw_terminal(app, ui, thread);
-                            }
-                        } else {
-                            mcode_ui_draw_chat(app, ui, thread);
-                        }
-                        cui_split_next(ui);
-                        mcode_ui_draw_diff(app, ui, thread);
+                    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0) {
+                        draw_topbar_main_segment(app, ui, thread, false);
+                        cui_separator(ui);
+                        draw_main_workspace_body(app, ui, thread);
                     }
-                } else if (app->store.show_terminal_panel) {
-                    cui_split(ui, "mcode-term-split-wide", &app->store.terminal_ratio,
-                              .vertical = true, .min_first = 220, .min_second = 150,
-                              .width = CUI_FILL, .height = CUI_FILL) {
-                        mcode_ui_draw_chat(app, ui, thread);
-                        cui_split_next(ui);
-                        mcode_ui_draw_terminal(app, ui, thread);
-                    }
-                } else {
-                    mcode_ui_draw_chat(app, ui, thread);
+                }
+            } else {
+                cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0) {
+                    draw_topbar_main_segment(app, ui, thread, true);
+                    cui_separator(ui);
+                    draw_main_workspace_body(app, ui, thread);
                 }
             }
         }
@@ -1044,6 +1563,14 @@ void mcode_app_action_new_thread(cui_ctx *ui, void *user) {
     }
     if (!proj) proj = &app->store.projects[0];
     mcode_ui_quick_new_thread(app, ui, proj);
+}
+
+void mcode_app_action_toggle_sidebar(cui_ctx *ui, void *user) {
+    (void)ui;
+    mcode_app *app = (mcode_app *)user;
+    if (!app) return;
+    app->store.show_sidebar = !app->store.show_sidebar;
+    mcode_ui_mark_dirty(app);
 }
 
 void mcode_app_action_toggle_diff(cui_ctx *ui, void *user) {
