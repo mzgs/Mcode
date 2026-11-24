@@ -12,7 +12,8 @@ static cui_tone tone_for_git_status(const char *st) {
 }
 
 void mcode_ui_draw_diff(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
-    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0) {
+    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
+               .bg = CUI_COLOR_BACKGROUND, .gap = 0) {
         /* Diff header */
         cui_row(ui, .width = CUI_FILL, .pad_x = 12, .pad_y = 8, .gap = 8, .align = CUI_ALIGN_CENTER) {
             cui_text(ui, "Changes", .font = CUI_FONT_MEDIUM, .size = 13.5f);

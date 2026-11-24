@@ -327,6 +327,7 @@ void app_window_set_dark(void *native_window, const char *backend, bool dark) {
             if (![win.appearance.name isEqualToString:desired]) {
                 win.appearance = [NSAppearance appearanceNamed:desired];
             }
+            win.backgroundColor = dark ? [NSColor blackColor] : [NSColor whiteColor];
         }
     }
 }

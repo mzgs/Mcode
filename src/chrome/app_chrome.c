@@ -359,6 +359,9 @@ void chrome_apply_appearance(app_chrome *chrome, cui_ctx *ui) {
     if (!chrome->env_accent_override) {
         cui_set_accent(ui, chrome->settings.appearance.accent);
     }
+    if (cui_get_theme_mode(ui) == CUI_THEME_DARK) {
+        cui_theme_get(ui)->colors[CUI_TOKEN_BACKGROUND] = CUI_RGBA(0x000000ffu);
+    }
     float scale = chrome->settings.appearance.font_scale;
     if (scale < FONT_SCALE_MIN || scale > FONT_SCALE_MAX || !isfinite(scale)) scale = 1.0f;
     cui_theme_get(ui)->font_scale = scale;
