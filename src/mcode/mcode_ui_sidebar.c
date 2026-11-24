@@ -376,7 +376,8 @@ void mcode_ui_draw_sidebar(mcode_app *app, cui_ctx *ui) {
         /* Filter projects & threads + quick "+ Project" folder-plus action */
         cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
             cui_search(ui, "thread-search", app->thread_search, sizeof app->thread_search,
-                       .placeholder = "Filter projects & threads...", .width = CUI_FILL);
+                       .placeholder = "Filter projects & threads...", .size = CUI_SIZE_SM,
+                       .width = CUI_FILL);
             cui_id aid = cui_make_id(ui, "add-project-btn");
             cui_rect ar = cui_get_rect(ui, aid);
             cui_vec2 mp = cui_mouse_pos(ui);
