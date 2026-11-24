@@ -523,10 +523,10 @@ void mcode_ui_draw_sidebar(mcode_app *app, cui_ctx *ui) {
     cui_color sidebar_bg = sidebar_surface_bg(ui);
 
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
-               .bg = sidebar_bg, .pad_x = 10, .pad_top = 10, .pad_bottom = 8, .gap = 10) {
+               .bg = sidebar_bg, .pad_top = 10, .pad_bottom = 0, .gap = 10) {
 
         /* Unified filter input + add-project button */
-        cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
+        cui_row(ui, .width = CUI_FILL, .pad_x = 10, .gap = 6, .align = CUI_ALIGN_CENTER) {
             cui_color search_bg = dark ? CUI_RGBA(0x0e0e11ffu)
                                        : cui_color_of(ui, CUI_COLOR_SURFACE);
             cui_color search_bdr = dark ? CUI_RGBA(0x202026ffu)
@@ -550,9 +550,14 @@ void mcode_ui_draw_sidebar(mcode_app *app, cui_ctx *ui) {
             }
         }
 
-        /* Project tree + settled section */
+        /* Project tree + settled section.
+         * Span the scroll area across the full sidebar width and reserve a 14px
+         * right gutter inside its content so the 12px overlay scrollbar zone never
+         * overlaps or intercepts project "+" buttons. */
         cui_scroll(ui, .id = "sidebar-threads", .width = CUI_FILL, .height = CUI_FILL,
-                   .gap = 6, .fade_edges = true, .fade_color = sidebar_bg) {
+                   .gap = 0, .fade_edges = true, .fade_color = sidebar_bg) {
+            cui_column(ui, .width = CUI_FILL,
+                       .pad_left = 10, .pad_right = 14, .pad_bottom = 8, .gap = 6) {
             bool searching = (app->thread_search[0] != '\0');
             bool any_visible = false;
 
@@ -688,6 +693,7 @@ void mcode_ui_draw_sidebar(mcode_app *app, cui_ctx *ui) {
                         app->thread_search[0] = '\0';
                     }
                 }
+            }
             }
         }
     }
