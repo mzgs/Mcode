@@ -162,6 +162,7 @@ typedef struct {
     int turn_cap;
 
     /* Live runtime state (not persisted) */
+    bool is_draft;
     struct mcode_agent_run *active_run;
     struct mcode_title_run *title_run;
     bool title_pending;

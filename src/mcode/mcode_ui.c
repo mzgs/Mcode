@@ -152,10 +152,45 @@ static void nav_history_push(mcode_app *app, const char *thread_id) {
     app->nav_count = next_pos + 1;
 }
 
+static void discard_draft_threads(mcode_app *app, const char *keep_id) {
+    if (!app) return;
+    for (int i = app->store.thread_count - 1; i >= 0; --i) {
+        mcode_thread *t = &app->store.threads[i];
+        if (!t->is_draft) continue;
+        if (keep_id && keep_id[0] && strcmp(t->id, keep_id) == 0) continue;
+        if (t->active_run || t->turn_count > 0) {
+            t->is_draft = false;
+            continue;
+        }
+        if (t->use_worktree && t->workdir[0]) {
+            mcode_project *p = mcode_store_find_project(&app->store, t->project_id);
+            if (p && p->is_git_repo && strcmp(p->path, t->workdir) != 0) {
+                char err[256] = "";
+                if (!mcode_git_remove_worktree(p->path, t->workdir, err, sizeof err)) {
+                    app_log_warn("Could not remove unused draft worktree %s: %s", t->workdir, err);
+                }
+            }
+        }
+        char tid[MCODE_ID_MAX];
+        snprintf(tid, sizeof tid, "%s", t->id);
+        mcode_store_remove_thread(&app->store, tid);
+    }
+}
+
 static int nav_history_find_prev(mcode_app *app) {
-    if (!app || app->nav_count <= 1 || app->nav_index <= 0) return -1;
+    if (!app || app->nav_count <= 0 || app->nav_index < 0) return -1;
+    mcode_thread *sel = mcode_store_selected_thread(&app->store);
+    if (sel && sel->is_draft) {
+        for (int i = app->nav_index; i >= 0; --i) {
+            mcode_thread *t = mcode_store_find_thread(&app->store, app->nav_history[i]);
+            if (t && !t->is_draft) return i;
+        }
+        return -1;
+    }
+    if (app->nav_count <= 1 || app->nav_index <= 0) return -1;
     for (int i = app->nav_index - 1; i >= 0; --i) {
-        if (mcode_store_find_thread(&app->store, app->nav_history[i])) return i;
+        mcode_thread *t = mcode_store_find_thread(&app->store, app->nav_history[i]);
+        if (t && !t->is_draft) return i;
     }
     return -1;
 }
@@ -163,32 +198,41 @@ static int nav_history_find_prev(mcode_app *app) {
 static int nav_history_find_next(mcode_app *app) {
     if (!app || app->nav_count <= 1 || app->nav_index < 0) return -1;
     for (int i = app->nav_index + 1; i < app->nav_count; ++i) {
-        if (mcode_store_find_thread(&app->store, app->nav_history[i])) return i;
+        mcode_thread *t = mcode_store_find_thread(&app->store, app->nav_history[i]);
+        if (t && !t->is_draft) return i;
     }
     return -1;
 }
 
 static void nav_history_jump(mcode_app *app, int target_idx) {
     if (!app || target_idx < 0 || target_idx >= app->nav_count) return;
-    mcode_thread *t = mcode_store_find_thread(&app->store, app->nav_history[target_idx]);
+    char target_id[MCODE_ID_MAX];
+    snprintf(target_id, sizeof target_id, "%s", app->nav_history[target_idx]);
+    bool was_selected = (strcmp(app->store.selected_thread_id, target_id) == 0);
+    discard_draft_threads(app, target_id);
+    mcode_thread *t = mcode_store_find_thread(&app->store, target_id);
     if (!t) return;
     app->nav_index = target_idx;
-    if (strcmp(app->store.selected_thread_id, t->id) != 0) {
+    if (!was_selected || strcmp(app->store.selected_thread_id, t->id) != 0) {
         snprintf(app->store.selected_thread_id, sizeof app->store.selected_thread_id, "%s", t->id);
         mcode_ui_refresh_thread_diff(t);
-        mcode_ui_mark_dirty(app);
+        if (!t->is_draft) mcode_ui_mark_dirty(app);
     }
 }
 
 void mcode_ui_select_thread(mcode_app *app, const char *thread_id) {
     if (!app || !thread_id || !thread_id[0]) return;
-    mcode_thread *t = mcode_store_find_thread(&app->store, thread_id);
+    char target_id[MCODE_ID_MAX];
+    snprintf(target_id, sizeof target_id, "%s", thread_id);
+    bool was_selected = (strcmp(app->store.selected_thread_id, target_id) == 0);
+    discard_draft_threads(app, target_id);
+    mcode_thread *t = mcode_store_find_thread(&app->store, target_id);
     if (!t) return;
-    nav_history_push(app, t->id);
-    if (strcmp(app->store.selected_thread_id, t->id) == 0) return;
+    if (!t->is_draft) nav_history_push(app, t->id);
+    if (was_selected && strcmp(app->store.selected_thread_id, t->id) == 0) return;
     snprintf(app->store.selected_thread_id, sizeof app->store.selected_thread_id, "%s", t->id);
     mcode_ui_refresh_thread_diff(t);
-    mcode_ui_mark_dirty(app);
+    if (!t->is_draft) mcode_ui_mark_dirty(app);
 }
 
 static void on_term_bytes(const char *data, size_t len, bool is_stderr, void *user) {
@@ -300,10 +344,11 @@ mcode_project *mcode_ui_add_project_and_open(mcode_app *app, cui_ctx *ui,
     snprintf(app->store.selected_project_id, sizeof app->store.selected_project_id, "%s", p->id);
     remember_parent_dir(app, p->path);
 
-    /* Jump straight into an active thread for this project (or create one immediately) */
+    /* Jump straight into an active thread for this project (or open a draft thread) */
     const char *existing_tid = NULL;
     for (int i = app->store.thread_count - 1; i >= 0; --i) {
-        if (strcmp(app->store.threads[i].project_id, p->id) == 0 &&
+        if (!app->store.threads[i].is_draft &&
+            strcmp(app->store.threads[i].project_id, p->id) == 0 &&
             app->store.threads[i].state != MCODE_THREAD_SETTLED) {
             existing_tid = app->store.threads[i].id;
             break;
@@ -542,48 +587,45 @@ void mcode_ui_cancel_clone(mcode_app *app) {
 mcode_thread *mcode_ui_create_thread(mcode_app *app, cui_ctx *ui, mcode_project *proj,
                                      const char *title, app_agent_kind agent,
                                      const char *model, bool use_worktree, bool auto_approve) {
+    (void)ui;
     if (!app || !proj) return NULL;
     const char *final_title = (title && title[0]) ? title : "New thread";
+
+    /* Discard any prior unsent draft before opening a fresh one. */
+    discard_draft_threads(app, NULL);
 
     char workdir[MCODE_PATH_MAX];
     char branch[MCODE_BRANCH_MAX];
     snprintf(workdir, sizeof workdir, "%s", proj->path);
     snprintf(branch, sizeof branch, "%s", proj->default_branch);
 
-    bool actual_worktree = false;
-    if (use_worktree && proj->is_git_repo && mcode_git_has_commits(proj->path)) {
-        char err[256] = "";
-        if (mcode_git_create_worktree(proj->path, proj->name, final_title,
-                                      workdir, sizeof workdir,
-                                      branch, sizeof branch,
-                                      err, sizeof err)) {
-            actual_worktree = true;
-            if (proj->setup_script[0]) {
-                mcode_ui_run_terminal_cmd(app, ui, proj->setup_script, workdir);
-            }
-        } else {
-            char msg[320];
-            snprintf(msg, sizeof msg, "Worktree failed (using repo root): %s", err);
-            if (ui) app_chrome_notify(app->chrome, ui, msg, CUI_TONE_WARNING);
-        }
-    }
+    /* Keep new threads as unsent drafts until the first message is sent.
+     * Worktree creation is deferred to mcode_ui_send_prompt() so opening a
+     * new thread never leaves orphan worktrees or saves empty threads. */
+    bool want_worktree = (use_worktree && proj->is_git_repo && mcode_git_has_commits(proj->path));
 
     mcode_thread *t = mcode_store_add_thread(&app->store, proj, final_title,
-                                             agent, model, actual_worktree, auto_approve,
+                                             agent, model, want_worktree, auto_approve,
                                              workdir, branch);
     if (t) {
+        t->is_draft = true;
         proj->collapsed = false;
         snprintf(app->store.selected_project_id, sizeof app->store.selected_project_id,
                  "%s", proj->id);
-        nav_history_push(app, t->id);
         mcode_ui_refresh_thread_diff(t);
-        mcode_ui_mark_dirty(app);
     }
     return t;
 }
 
 mcode_thread *mcode_ui_quick_new_thread(mcode_app *app, cui_ctx *ui, mcode_project *proj) {
     if (!app || !proj) return NULL;
+    mcode_thread *sel = mcode_store_selected_thread(&app->store);
+    if (sel && sel->is_draft && strcmp(sel->project_id, proj->id) == 0) {
+        proj->collapsed = false;
+        snprintf(app->store.selected_project_id, sizeof app->store.selected_project_id,
+                 "%s", proj->id);
+        return sel;
+    }
     const app_settings *s = app_chrome_settings(app->chrome);
     bool use_wt = s && s->mcode.use_worktrees_by_default && proj->is_git_repo;
     bool auto_app = s ? s->mcode.auto_approve_permissions : false;
@@ -627,6 +669,10 @@ void mcode_ui_toggle_thread_worktree(mcode_app *app, cui_ctx *ui, mcode_thread *
             }
             return;
         }
+        if (thread->is_draft) {
+            thread->use_worktree = true;
+            return;
+        }
         char wt_dir[MCODE_PATH_MAX] = "";
         char wt_branch[MCODE_BRANCH_MAX] = "";
         char err[256] = "";
@@ -655,8 +701,10 @@ void mcode_ui_toggle_thread_worktree(mcode_app *app, cui_ctx *ui, mcode_thread *
         snprintf(thread->workdir, sizeof thread->workdir, "%s", proj->path);
         snprintf(thread->branch, sizeof thread->branch, "%s", proj->default_branch);
         thread->use_worktree = false;
-        mcode_ui_refresh_thread_diff(thread);
-        mcode_ui_mark_dirty(app);
+        if (!thread->is_draft) {
+            mcode_ui_refresh_thread_diff(thread);
+            mcode_ui_mark_dirty(app);
+        }
     }
 }
 
@@ -666,13 +714,59 @@ void mcode_ui_send_prompt(mcode_app *app, cui_ctx *ui, mcode_thread *thread, con
 
     bool should_auto_title = (thread->turn_count == 0 &&
         (strcmp(thread->title, "New thread") == 0 || thread->title[0] == '\0'));
+    bool was_draft = thread->is_draft;
+    bool created_worktree_now = false;
+    mcode_project *proj = mcode_store_find_project(&app->store, thread->project_id);
+
+    if (was_draft && thread->use_worktree && proj && proj->is_git_repo &&
+        strcmp(thread->workdir, proj->path) == 0) {
+        if (mcode_git_has_commits(proj->path)) {
+            char wt_dir[MCODE_PATH_MAX] = "";
+            char wt_branch[MCODE_BRANCH_MAX] = "";
+            char wt_err[256] = "";
+            const char *slug_src = (!should_auto_title && thread->title[0]) ? thread->title : prompt;
+            if (mcode_git_create_worktree(proj->path, proj->name, slug_src,
+                                          wt_dir, sizeof wt_dir,
+                                          wt_branch, sizeof wt_branch,
+                                          wt_err, sizeof wt_err)) {
+                snprintf(thread->workdir, sizeof thread->workdir, "%s", wt_dir);
+                snprintf(thread->branch, sizeof thread->branch, "%s", wt_branch);
+                created_worktree_now = true;
+            } else {
+                thread->use_worktree = false;
+                char msg[320];
+                snprintf(msg, sizeof msg, "Worktree failed (using repo root): %s", wt_err);
+                if (ui) app_chrome_notify(app->chrome, ui, msg, CUI_TONE_WARNING);
+            }
+        } else {
+            thread->use_worktree = false;
+        }
+    }
 
     thread->state = MCODE_THREAD_ACTIVE;
     char err[256] = "";
     const app_settings *settings = app_chrome_settings(app->chrome);
     if (!mcode_agent_start(thread, settings, prompt, err, sizeof err)) {
+        if (created_worktree_now && proj && strcmp(proj->path, thread->workdir) != 0) {
+            char rm_err[256] = "";
+            if (!mcode_git_remove_worktree(proj->path, thread->workdir, rm_err, sizeof rm_err)) {
+                app_log_warn("Could not remove unused worktree %s: %s", thread->workdir, rm_err);
+            }
+            snprintf(thread->workdir, sizeof thread->workdir, "%s", proj->path);
+            snprintf(thread->branch, sizeof thread->branch, "%s", proj->default_branch);
+        }
         if (ui) app_chrome_notify(app->chrome, ui, err[0] ? err : "Could not start agent.", CUI_TONE_DANGER);
     } else {
+        if (was_draft) {
+            thread->is_draft = false;
+            thread->created_at = mcode_now_epoch();
+            thread->updated_at = thread->created_at;
+            if (created_worktree_now && proj && proj->setup_script[0]) {
+                mcode_ui_run_terminal_cmd(app, ui, proj->setup_script, thread->workdir);
+            }
+            nav_history_push(app, thread->id);
+            mcode_ui_refresh_thread_diff(thread);
+        }
         /* Set an immediate fallback title and ask the provider for a concise title in parallel. */
         if (should_auto_title) {
             const char *p = prompt;
@@ -1310,7 +1404,7 @@ static void draw_topbar_main_segment(mcode_app *app, cui_ctx *ui, mcode_thread *
                         if (thread->title_run) {
                             mcode_agent_title_stop(thread->title_run);
                         }
-                        mcode_ui_mark_dirty(app);
+                        if (!thread->is_draft) mcode_ui_mark_dirty(app);
                     }
                 }
 
@@ -1391,19 +1485,21 @@ static void draw_topbar_main_segment(mcode_app *app, cui_ctx *ui, mcode_thread *
                             mcode_app_action_open_folder(ui, app);
                             close_actions = true;
                         }
-                        if (thread->state != MCODE_THREAD_SETTLED) {
-                            if (draw_actions_pop_item(ui, "act-settle", CUI_ICON_CIRCLE_CHECK,
-                                                      "Mark Thread Settled", NULL, false)) {
-                                thread->state = MCODE_THREAD_SETTLED;
-                                mcode_ui_mark_dirty(app);
-                                close_actions = true;
-                            }
-                        } else {
-                            if (draw_actions_pop_item(ui, "act-reopen", CUI_ICON_INBOX,
-                                                      "Reopen Thread", NULL, false)) {
-                                thread->state = MCODE_THREAD_ACTIVE;
-                                mcode_ui_mark_dirty(app);
-                                close_actions = true;
+                        if (!thread->is_draft) {
+                            if (thread->state != MCODE_THREAD_SETTLED) {
+                                if (draw_actions_pop_item(ui, "act-settle", CUI_ICON_CIRCLE_CHECK,
+                                                          "Mark Thread Settled", NULL, false)) {
+                                    thread->state = MCODE_THREAD_SETTLED;
+                                    mcode_ui_mark_dirty(app);
+                                    close_actions = true;
+                                }
+                            } else {
+                                if (draw_actions_pop_item(ui, "act-reopen", CUI_ICON_INBOX,
+                                                          "Reopen Thread", NULL, false)) {
+                                    thread->state = MCODE_THREAD_ACTIVE;
+                                    mcode_ui_mark_dirty(app);
+                                    close_actions = true;
+                                }
                             }
                         }
                         if (proj) {
@@ -1742,6 +1838,7 @@ void mcode_app_palette_provider(app_palette_builder *builder, void *user) {
     int max_threads = app->store.thread_count < 64 ? app->store.thread_count : 64;
     for (int i = 0; i < max_threads; ++i) {
         const mcode_thread *t = &app->store.threads[i];
+        if (t->is_draft) continue;
         const mcode_project *p = mcode_store_find_project(&app->store, t->project_id);
         s_thread_targets[i] = (palette_target){ app, i };
         char title[240];

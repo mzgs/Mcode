@@ -457,9 +457,26 @@ bool mcode_store_save(const mcode_store *store, const char *path) {
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
 
+    const char *saved_sel_id = store->selected_thread_id;
+    for (int i = 0; i < store->thread_count; ++i) {
+        if (strcmp(store->threads[i].id, store->selected_thread_id) == 0) {
+            if (store->threads[i].is_draft) {
+                saved_sel_id = "";
+                for (int j = store->thread_count - 1; j >= 0; --j) {
+                    if (!store->threads[j].is_draft &&
+                        strcmp(store->threads[j].project_id, store->threads[i].project_id) == 0) {
+                        saved_sel_id = store->threads[j].id;
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+    }
+
     yyjson_mut_obj_add_int(doc, root, "version", 1);
     yyjson_mut_obj_add_str(doc, root, "selected_project_id", store->selected_project_id);
-    yyjson_mut_obj_add_str(doc, root, "selected_thread_id", store->selected_thread_id);
+    yyjson_mut_obj_add_str(doc, root, "selected_thread_id", saved_sel_id);
     if (store->default_project_dir[0]) {
         yyjson_mut_obj_add_str(doc, root, "default_project_dir", store->default_project_dir);
     }
@@ -503,6 +520,7 @@ bool mcode_store_save(const mcode_store *store, const char *path) {
     yyjson_mut_val *threads = yyjson_mut_arr(doc);
     for (int i = 0; i < store->thread_count; ++i) {
         const mcode_thread *t = &store->threads[i];
+        if (t->is_draft) continue;
         yyjson_mut_val *to = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_str(doc, to, "id", t->id);
         yyjson_mut_obj_add_str(doc, to, "project_id", t->project_id);
