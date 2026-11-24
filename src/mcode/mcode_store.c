@@ -128,10 +128,33 @@ static void add_default_quick_actions(mcode_project *p) {
     p->action_count++;
 }
 
+mcode_project *mcode_store_move_project_to_top(mcode_store *store, const char *id) {
+    if (!store || !id || !id[0]) return NULL;
+    int idx = -1;
+    for (int i = 0; i < store->project_count; ++i) {
+        if (strcmp(store->projects[i].id, id) == 0) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0) return NULL;
+    if (idx > 0) {
+        mcode_project tmp = store->projects[idx];
+        memmove(&store->projects[1], &store->projects[0],
+                (size_t)idx * sizeof store->projects[0]);
+        store->projects[0] = tmp;
+    }
+    return &store->projects[0];
+}
+
 mcode_project *mcode_store_add_project(mcode_store *store, const char *path, const char *name) {
     if (!store || !path || !path[0]) return NULL;
     mcode_project *existing = mcode_store_find_project_by_path(store, path);
-    if (existing) return existing;
+    if (existing) {
+        char existing_id[MCODE_ID_MAX];
+        snprintf(existing_id, sizeof existing_id, "%s", existing->id);
+        return mcode_store_move_project_to_top(store, existing_id);
+    }
 
     if (store->project_count >= store->project_cap) {
         int new_cap = store->project_cap ? store->project_cap * 2 : 8;
@@ -141,7 +164,13 @@ mcode_project *mcode_store_add_project(mcode_store *store, const char *path, con
         store->project_cap = new_cap;
     }
 
-    mcode_project *p = &store->projects[store->project_count++];
+    if (store->project_count > 0) {
+        memmove(&store->projects[1], &store->projects[0],
+                (size_t)store->project_count * sizeof store->projects[0]);
+    }
+    store->project_count++;
+
+    mcode_project *p = &store->projects[0];
     memset(p, 0, sizeof *p);
     mcode_gen_id(p->id, sizeof p->id, "proj");
     snprintf(p->path, sizeof p->path, "%s", path);

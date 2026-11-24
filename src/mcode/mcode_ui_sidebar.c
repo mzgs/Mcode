@@ -391,8 +391,10 @@ static bool draw_project_section(mcode_app *app, cui_ctx *ui, int proj_idx, bool
             }
 
             if (!removed) {
+                mcode_project *cur_for_add = mcode_store_find_project(&app->store, proj_id);
                 char add_tip[192];
-                snprintf(add_tip, sizeof add_tip, "New thread in %s", p->name);
+                snprintf(add_tip, sizeof add_tip, "New thread in %s",
+                         cur_for_add ? cur_for_add->name : "Project");
                 cui_color add_bg = add_hov
                     ? sidebar_hover_bg(ui, dark ? 0.12f : 0.08f)
                     : CUI_RGBA(0x00000001u);

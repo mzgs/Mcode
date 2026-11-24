@@ -44,6 +44,15 @@ void mcode_ui_mark_dirty(mcode_app *app) {
     app->state_dirty_since = mcode_now_mono();
 }
 
+void mcode_ui_promote_project(mcode_app *app, const char *project_id) {
+    if (!app || !project_id || !project_id[0]) return;
+    bool already_top = (app->store.project_count > 0 &&
+                        strcmp(app->store.projects[0].id, project_id) == 0);
+    if (mcode_store_move_project_to_top(&app->store, project_id) && !already_top) {
+        mcode_ui_mark_dirty(app);
+    }
+}
+
 void mcode_ui_draw_provider_icon(mcode_app *app, cui_ctx *ui, app_agent_kind agent,
                                  float size, cui_color tint) {
     if (!ui) return;
@@ -596,6 +605,8 @@ void mcode_ui_remove_project(mcode_app *app, cui_ctx *ui, const char *project_id
 
 void mcode_ui_init_project_git(mcode_app *app, cui_ctx *ui, mcode_project *proj) {
     if (!app || !proj) return;
+    char proj_id[MCODE_ID_MAX];
+    snprintf(proj_id, sizeof proj_id, "%s", proj->id);
     char err[256] = "";
     if (!mcode_git_init_repo(proj->path, err, sizeof err)) {
         if (ui) app_chrome_notify(app->chrome, ui, err[0] ? err : "git init failed.", CUI_TONE_DANGER);
@@ -606,10 +617,11 @@ void mcode_ui_init_project_git(mcode_app *app, cui_ctx *ui, mcode_project *proj)
                            proj->remote_url, sizeof proj->remote_url);
     for (int i = 0; i < app->store.thread_count; ++i) {
         mcode_thread *t = &app->store.threads[i];
-        if (strcmp(t->project_id, proj->id) == 0 && !t->branch[0] && proj->default_branch[0]) {
+        if (strcmp(t->project_id, proj_id) == 0 && !t->branch[0] && proj->default_branch[0]) {
             snprintf(t->branch, sizeof t->branch, "%s", proj->default_branch);
         }
     }
+    mcode_ui_promote_project(app, proj_id);
     mcode_ui_refresh_workspace_git(app);
     mcode_ui_mark_dirty(app);
     if (ui) app_chrome_notify(app->chrome, ui, "Initialized Git repository.", CUI_TONE_SUCCESS);
@@ -869,6 +881,7 @@ void mcode_ui_send_prompt(mcode_app *app, cui_ctx *ui, mcode_thread *thread, con
                 thread->title_run = mcode_agent_start_title(thread, settings, prompt);
             }
         }
+        mcode_ui_promote_project(app, thread->project_id);
         mcode_ui_mark_dirty(app);
     }
 }
@@ -1507,7 +1520,10 @@ static void draw_topbar_main_segment(mcode_app *app, cui_ctx *ui, mcode_thread *
                         if (thread->title_run) {
                             mcode_agent_title_stop(thread->title_run);
                         }
-                        if (!thread->is_draft) mcode_ui_mark_dirty(app);
+                        if (!thread->is_draft) {
+                            mcode_ui_promote_project(app, thread->project_id);
+                            mcode_ui_mark_dirty(app);
+                        }
                     }
                 }
 
@@ -1578,7 +1594,10 @@ static void draw_topbar_main_segment(mcode_app *app, cui_ctx *ui, mcode_thread *
                         } else if (proj && !proj->is_git_repo) {
                             if (draw_actions_pop_item(ui, "act-init-git", CUI_ICON_GIT_BRANCH,
                                                       "Initialize Git Repository", NULL, false)) {
+                                char pid[MCODE_ID_MAX];
+                                snprintf(pid, sizeof pid, "%s", proj->id);
                                 mcode_ui_init_project_git(app, ui, proj);
+                                proj = mcode_store_find_project(&app->store, pid);
                                 close_actions = true;
                             }
                         }

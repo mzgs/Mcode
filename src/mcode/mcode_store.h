@@ -39,6 +39,7 @@ void mcode_store_free(mcode_store *store);
 mcode_project *mcode_store_find_project(mcode_store *store, const char *id);
 mcode_project *mcode_store_find_project_by_path(mcode_store *store, const char *path);
 mcode_project *mcode_store_add_project(mcode_store *store, const char *path, const char *name);
+mcode_project *mcode_store_move_project_to_top(mcode_store *store, const char *id);
 bool mcode_store_remove_project(mcode_store *store, const char *id);
 
 mcode_thread *mcode_store_find_thread(mcode_store *store, const char *id);

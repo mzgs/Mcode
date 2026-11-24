@@ -247,6 +247,25 @@ static bool draw_commit_menu_item(cui_ctx *ui, const char *id, const char *icon,
     return clicked && !disabled;
 }
 
+static void promote_project_for_workdir(mcode_app *app, const char *workdir) {
+    if (!app) return;
+    if (workdir && workdir[0]) {
+        mcode_project *p = mcode_store_find_project_by_path(&app->store, workdir);
+        if (p) {
+            char pid[MCODE_ID_MAX];
+            snprintf(pid, sizeof pid, "%s", p->id);
+            mcode_ui_promote_project(app, pid);
+            return;
+        }
+    }
+    mcode_thread *t = mcode_store_selected_thread(&app->store);
+    if (t && t->project_id[0]) {
+        mcode_ui_promote_project(app, t->project_id);
+    } else if (app->store.selected_project_id[0]) {
+        mcode_ui_promote_project(app, app->store.selected_project_id);
+    }
+}
+
 static void perform_sidebar_commit(mcode_app *app, cui_ctx *ui, const char *workdir,
                                    bool also_push) {
     if (!app || !workdir || !workdir[0]) return;
@@ -271,6 +290,7 @@ static void perform_sidebar_commit(mcode_app *app, cui_ctx *ui, const char *work
     }
     if (ok) {
         app->sidebar_commit_msg[0] = '\0';
+        promote_project_for_workdir(app, workdir);
         mcode_ui_refresh_workspace_git(app);
         if (app->inspector_open && app->inspector_mode == MCODE_INSPECTOR_DIFF &&
             app->git_file_count == 0) {
@@ -435,6 +455,7 @@ static void draw_source_control_commit_box(mcode_app *app, cui_ctx *ui,
                                               "Stage All Changes", unstaged_count == 0)) {
                         char err[256] = "";
                         if (mcode_git_stage_all(workdir, err, sizeof err)) {
+                            promote_project_for_workdir(app, workdir);
                             mcode_ui_refresh_workspace_git(app);
                         } else if (err[0]) {
                             app_chrome_notify(app->chrome, ui, err, CUI_TONE_DANGER);
@@ -445,6 +466,7 @@ static void draw_source_control_commit_box(mcode_app *app, cui_ctx *ui,
                                               "Unstage All Changes", staged_count == 0)) {
                         char err[256] = "";
                         if (mcode_git_unstage_all(workdir, err, sizeof err)) {
+                            promote_project_for_workdir(app, workdir);
                             mcode_ui_refresh_workspace_git(app);
                         } else if (err[0]) {
                             app_chrome_notify(app->chrome, ui, err, CUI_TONE_DANGER);
@@ -531,6 +553,7 @@ static void draw_change_group_header(mcode_app *app, cui_ctx *ui, const char *wo
                     ? mcode_git_unstage_all(workdir, err, sizeof err)
                     : mcode_git_stage_all(workdir, err, sizeof err);
                 if (ok) {
+                    promote_project_for_workdir(app, workdir);
                     mcode_ui_refresh_workspace_git(app);
                 } else if (err[0]) {
                     app_chrome_notify(app->chrome, ui, err, CUI_TONE_DANGER);
@@ -655,6 +678,7 @@ static bool draw_change_file_rows(mcode_app *app, cui_ctx *ui, const char *workd
                         ? mcode_git_unstage_file(workdir, path_copy, err, sizeof err)
                         : mcode_git_stage_file(workdir, path_copy, err, sizeof err);
                     if (ok) {
+                        promote_project_for_workdir(app, workdir);
                         mcode_ui_refresh_workspace_git(app);
                         mutated = true;
                     } else if (err[0]) {
@@ -694,6 +718,7 @@ static bool draw_change_file_rows(mcode_app *app, cui_ctx *ui, const char *workd
                         ? mcode_git_unstage_file(workdir, path_copy, err, sizeof err)
                         : mcode_git_stage_file(workdir, path_copy, err, sizeof err);
                     if (ok) {
+                        promote_project_for_workdir(app, workdir);
                         mcode_ui_refresh_workspace_git(app);
                         mutated = true;
                     } else if (err[0]) {
@@ -1046,15 +1071,21 @@ void mcode_ui_draw_diff(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
     if (!proj && app->store.project_count > 0) {
         proj = &app->store.projects[0];
     }
-    const char *workdir = (thread && thread->workdir[0]) ? thread->workdir
-                        : (proj && proj->path[0]) ? proj->path
-                        : NULL;
-    const char *proj_name = proj ? proj->name : "Project";
+    char proj_id[MCODE_ID_MAX] = "";
+    if (proj) snprintf(proj_id, sizeof proj_id, "%s", proj->id);
+    char workdir[MCODE_PATH_MAX] = "";
+    if (thread && thread->workdir[0]) {
+        snprintf(workdir, sizeof workdir, "%s", thread->workdir);
+    } else if (proj && proj->path[0]) {
+        snprintf(workdir, sizeof workdir, "%s", proj->path);
+    }
+    char proj_name[MCODE_NAME_MAX];
+    snprintf(proj_name, sizeof proj_name, "%s", proj ? proj->name : "Project");
 
     cui_color bg = right_sidebar_bg(ui);
 
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .bg = bg, .gap = 0) {
-        if (!workdir || !workdir[0]) {
+        if (!workdir[0]) {
             cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
                        .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER,
                        .pad = 20, .gap = 8) {
@@ -1092,6 +1123,7 @@ void mcode_ui_draw_diff(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
                                                      "Changes", unstaged_count,
                                                      &app->store.changes_expanded, false, true);
                         }
+                        proj = proj_id[0] ? mcode_store_find_project(&app->store, proj_id) : NULL;
                         draw_source_control_lists(app, ui, proj, workdir);
                     }
                     cui_split_next(ui);
@@ -1112,6 +1144,7 @@ void mcode_ui_draw_diff(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
                                                  "Changes", unstaged_count,
                                                  &app->store.changes_expanded, false, true);
                     }
+                    proj = proj_id[0] ? mcode_store_find_project(&app->store, proj_id) : NULL;
                     draw_source_control_lists(app, ui, proj, workdir);
                 }
                 cui_separator(ui);

@@ -16,6 +16,7 @@ void mcode_ui_open_file_preview(mcode_app *app, cui_ctx *ui, const char *root_pa
 void mcode_ui_close_inspector(mcode_app *app);
 
 /* Project lifecycle & dialogs */
+void mcode_ui_promote_project(mcode_app *app, const char *project_id);
 void mcode_ui_open_project_dialog(mcode_app *app, mcode_project_dialog_mode mode);
 void mcode_ui_refresh_discovered_repos(mcode_app *app);
 mcode_project *mcode_ui_add_project_and_open(mcode_app *app, cui_ctx *ui,

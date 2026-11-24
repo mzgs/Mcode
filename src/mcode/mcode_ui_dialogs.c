@@ -359,6 +359,7 @@ static void draw_rename_project_dialog(mcode_app *app, cui_ctx *ui) {
 
         if (save) {
             snprintf(proj->name, sizeof proj->name, "%s", app->rename_project_buf);
+            mcode_ui_promote_project(app, app->rename_project_id);
             mcode_ui_mark_dirty(app);
             app->rename_project_open = false;
         }
@@ -516,6 +517,7 @@ static void draw_git_dialog(mcode_app *app, cui_ctx *ui) {
                                .disabled = !app->commit_msg[0] || t->diff_file_count == 0)) {
                     char err[256] = "";
                     if (mcode_git_commit_all(t->workdir, app->commit_msg, err, sizeof err)) {
+                        mcode_ui_promote_project(app, t->project_id);
                         mcode_ui_refresh_workspace_git(app);
                         app_chrome_notify(app->chrome, ui, "Changes committed.", CUI_TONE_SUCCESS);
                         app->git_dialog_open = false;
@@ -533,6 +535,7 @@ static void draw_git_dialog(mcode_app *app, cui_ctx *ui) {
                     }
                     if (ok) ok = mcode_git_push(t->workdir, err, sizeof err);
                     if (ok) {
+                        mcode_ui_promote_project(app, t->project_id);
                         mcode_ui_refresh_workspace_git(app);
                         app_chrome_notify(app->chrome, ui, "Committed and pushed.", CUI_TONE_SUCCESS);
                         app->git_dialog_open = false;
@@ -555,6 +558,7 @@ static void draw_git_dialog(mcode_app *app, cui_ctx *ui) {
                                                  url, sizeof url, &used_gh, err, sizeof err);
                     }
                     if (ok) {
+                        mcode_ui_promote_project(app, t->project_id);
                         mcode_ui_refresh_workspace_git(app);
                         if (url[0]) cui_app_open_url(url);
                         app_chrome_notify(app->chrome, ui,
@@ -583,8 +587,15 @@ static void draw_project_actions_dialog(mcode_app *app, cui_ctx *ui) {
     }
     if (!proj && app->store.project_count > 0) proj = &app->store.projects[0];
 
+    char proj_id[MCODE_ID_MAX] = "";
+    char proj_name[MCODE_NAME_MAX] = "";
+    if (proj) {
+        snprintf(proj_id, sizeof proj_id, "%s", proj->id);
+        snprintf(proj_name, sizeof proj_name, "%s", proj->name);
+    }
+
     cui_dialog(ui, "Project Quick Actions", &app->actions_dialog_open,
-               .description = proj ? proj->name : NULL,
+               .description = proj_name[0] ? proj_name : NULL,
                .width = 520) {
         if (proj) {
             char short_p[MCODE_PATH_MAX];
@@ -601,49 +612,56 @@ static void draw_project_actions_dialog(mcode_app *app, cui_ctx *ui) {
                     if (cui_button(ui, "Init Git", .variant = CUI_BUTTON_OUTLINE,
                                    .size = CUI_SIZE_SM, .icon = CUI_ICON_GIT_BRANCH)) {
                         mcode_ui_init_project_git(app, ui, proj);
+                        proj = mcode_store_find_project(&app->store, proj_id);
                     }
                 }
             }
 
-            cui_separator(ui);
-            cui_text(ui, "Quick Actions", .font = CUI_FONT_MEDIUM);
+            if (proj) {
+                cui_separator(ui);
+                cui_text(ui, "Quick Actions", .font = CUI_FONT_MEDIUM);
 
-            int remove_idx = -1;
-            for (int i = 0; i < proj->action_count; ++i) {
-                cui_push_id_int(ui, i);
-                cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
-                    cui_badge(ui, proj->actions[i].name, .size = CUI_SIZE_SM);
-                    cui_text(ui, proj->actions[i].command, .font = CUI_FONT_MONO, .size = 12,
-                             .width = CUI_FILL, .nowrap = true);
-                    if (cui_icon_button(ui, CUI_ICON_TRASH_2, .tooltip = "Remove action")) {
-                        remove_idx = i;
+                int remove_idx = -1;
+                for (int i = 0; i < proj->action_count; ++i) {
+                    cui_push_id_int(ui, i);
+                    cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
+                        cui_badge(ui, proj->actions[i].name, .size = CUI_SIZE_SM);
+                        cui_text(ui, proj->actions[i].command, .font = CUI_FONT_MONO, .size = 12,
+                                 .width = CUI_FILL, .nowrap = true);
+                        if (cui_icon_button(ui, CUI_ICON_TRASH_2, .tooltip = "Remove action")) {
+                            remove_idx = i;
+                        }
                     }
+                    cui_pop_id(ui);
                 }
-                cui_pop_id(ui);
-            }
-            if (remove_idx >= 0) {
-                if (remove_idx + 1 < proj->action_count) {
-                    memmove(&proj->actions[remove_idx], &proj->actions[remove_idx + 1],
-                            (size_t)(proj->action_count - remove_idx - 1) * sizeof proj->actions[0]);
+                if (remove_idx >= 0) {
+                    if (remove_idx + 1 < proj->action_count) {
+                        memmove(&proj->actions[remove_idx], &proj->actions[remove_idx + 1],
+                                (size_t)(proj->action_count - remove_idx - 1) * sizeof proj->actions[0]);
+                    }
+                    proj->action_count--;
+                    mcode_ui_promote_project(app, proj_id);
+                    proj = mcode_store_find_project(&app->store, proj_id);
+                    mcode_ui_mark_dirty(app);
                 }
-                proj->action_count--;
-                mcode_ui_mark_dirty(app);
-            }
 
-            if (proj->action_count < MCODE_MAX_QUICK_ACTIONS) {
-                cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_END) {
-                    cui_input(ui, "qa-name", app->qa_new_name, sizeof app->qa_new_name,
-                              .label = "Label", .placeholder = "Lint", .width = CUI_PX(120));
-                    cui_input(ui, "qa-cmd", app->qa_new_cmd, sizeof app->qa_new_cmd,
-                              .label = "Shell command", .placeholder = "npm run lint", .width = CUI_FILL);
-                    if (cui_button(ui, "Add", .variant = CUI_BUTTON_SECONDARY,
-                                   .disabled = !app->qa_new_name[0] || !app->qa_new_cmd[0])) {
-                        mcode_quick_action *a = &proj->actions[proj->action_count++];
-                        snprintf(a->name, sizeof a->name, "%s", app->qa_new_name);
-                        snprintf(a->command, sizeof a->command, "%s", app->qa_new_cmd);
-                        app->qa_new_name[0] = '\0';
-                        app->qa_new_cmd[0] = '\0';
-                        mcode_ui_mark_dirty(app);
+                if (proj && proj->action_count < MCODE_MAX_QUICK_ACTIONS) {
+                    cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_END) {
+                        cui_input(ui, "qa-name", app->qa_new_name, sizeof app->qa_new_name,
+                                  .label = "Label", .placeholder = "Lint", .width = CUI_PX(120));
+                        cui_input(ui, "qa-cmd", app->qa_new_cmd, sizeof app->qa_new_cmd,
+                                  .label = "Shell command", .placeholder = "npm run lint", .width = CUI_FILL);
+                        if (cui_button(ui, "Add", .variant = CUI_BUTTON_SECONDARY,
+                                       .disabled = !app->qa_new_name[0] || !app->qa_new_cmd[0])) {
+                            mcode_quick_action *a = &proj->actions[proj->action_count++];
+                            snprintf(a->name, sizeof a->name, "%s", app->qa_new_name);
+                            snprintf(a->command, sizeof a->command, "%s", app->qa_new_cmd);
+                            app->qa_new_name[0] = '\0';
+                            app->qa_new_cmd[0] = '\0';
+                            mcode_ui_promote_project(app, proj_id);
+                            proj = mcode_store_find_project(&app->store, proj_id);
+                            mcode_ui_mark_dirty(app);
+                        }
                     }
                 }
             }
