@@ -516,7 +516,7 @@ static void draw_git_dialog(mcode_app *app, cui_ctx *ui) {
                                .disabled = !app->commit_msg[0] || t->diff_file_count == 0)) {
                     char err[256] = "";
                     if (mcode_git_commit_all(t->workdir, app->commit_msg, err, sizeof err)) {
-                        mcode_ui_refresh_thread_diff(t);
+                        mcode_ui_refresh_workspace_git(app);
                         app_chrome_notify(app->chrome, ui, "Changes committed.", CUI_TONE_SUCCESS);
                         app->git_dialog_open = false;
                     } else {
@@ -533,7 +533,7 @@ static void draw_git_dialog(mcode_app *app, cui_ctx *ui) {
                     }
                     if (ok) ok = mcode_git_push(t->workdir, err, sizeof err);
                     if (ok) {
-                        mcode_ui_refresh_thread_diff(t);
+                        mcode_ui_refresh_workspace_git(app);
                         app_chrome_notify(app->chrome, ui, "Committed and pushed.", CUI_TONE_SUCCESS);
                         app->git_dialog_open = false;
                     } else {
@@ -555,7 +555,7 @@ static void draw_git_dialog(mcode_app *app, cui_ctx *ui) {
                                                  url, sizeof url, &used_gh, err, sizeof err);
                     }
                     if (ok) {
-                        mcode_ui_refresh_thread_diff(t);
+                        mcode_ui_refresh_workspace_git(app);
                         if (url[0]) cui_app_open_url(url);
                         app_chrome_notify(app->chrome, ui,
                                           used_gh ? "Pull Request created and opened."

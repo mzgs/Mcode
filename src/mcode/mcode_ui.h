@@ -3,6 +3,7 @@
 
 #include "app_chrome.h"
 #include "mcode_agent.h"
+#include "mcode_files.h"
 #include "mcode_git.h"
 #include "mcode_proc.h"
 #include "mcode_store.h"
@@ -19,6 +20,12 @@ typedef enum {
     MCODE_PROJ_DIALOG_CREATE,
     MCODE_PROJ_DIALOG_CLONE,
 } mcode_project_dialog_mode;
+
+typedef enum {
+    MCODE_INSPECTOR_CHAT = 0,
+    MCODE_INSPECTOR_DIFF,
+    MCODE_INSPECTOR_FILE,
+} mcode_inspector_mode;
 
 typedef struct {
     app_chrome *chrome;
@@ -95,6 +102,33 @@ typedef struct {
     char commit_msg[512];
     char pr_title[160];
     char pr_body[2048];
+
+    /* Right sidebar (Source Control + Project Files Tree) & Center Inspector */
+    mcode_file_tree file_tree;
+    char git_workdir[MCODE_PATH_MAX];
+    mcode_diff_file *git_files;
+    int git_file_count;
+    int git_total_added;
+    int git_total_removed;
+    int git_selected_idx;
+    char *git_diff_old_text;
+    char *git_diff_new_text;
+    char git_diff_loaded_path[512];
+    bool git_diff_loaded_staged;
+    int git_diff_change_idx;
+    int git_diff_change_count;
+    bool staged_expanded;
+    char sidebar_commit_msg[512];
+    bool inspector_open;
+    mcode_inspector_mode inspector_mode;
+    bool inspector_showing_chat;
+    char preview_rel_path[512];
+    char preview_workdir[MCODE_PATH_MAX];
+    char *preview_text;
+    size_t preview_buf_cap;
+    bool preview_is_binary;
+    bool preview_truncated;
+    int64_t preview_file_size;
 
     /* Project Quick Actions dialog */
     bool actions_dialog_open;

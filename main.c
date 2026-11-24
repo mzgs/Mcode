@@ -92,7 +92,7 @@ int main(int argc, char **argv) {
         },
         {
             .id = "toggle_diff",
-            .title = "Toggle Diff Panel",
+            .title = "Toggle Changes & Files",
             .icon = CUI_ICON_LAYERS,
             .group = "View",
             .menu = APP_MENU_VIEW,

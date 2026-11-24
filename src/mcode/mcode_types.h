@@ -98,6 +98,8 @@ typedef struct {
     int added;
     int removed;
     bool untracked;
+    bool staged;
+    bool unstaged;
 } mcode_diff_file;
 
 typedef enum {

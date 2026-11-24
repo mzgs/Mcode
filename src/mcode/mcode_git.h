@@ -54,6 +54,18 @@ const char *mcode_lang_from_path(const char *path);
 bool mcode_git_commit_all(const char *workdir, const char *message,
                           char *err, size_t err_cap);
 
+/* Commit currently staged changes only (`git commit -m <message>`). */
+bool mcode_git_commit_staged(const char *workdir, const char *message,
+                             char *err, size_t err_cap);
+
+/* Stage / unstage individual files or all files. */
+bool mcode_git_stage_file(const char *workdir, const char *rel_path,
+                          char *err, size_t err_cap);
+bool mcode_git_unstage_file(const char *workdir, const char *rel_path,
+                            char *err, size_t err_cap);
+bool mcode_git_stage_all(const char *workdir, char *err, size_t err_cap);
+bool mcode_git_unstage_all(const char *workdir, char *err, size_t err_cap);
+
 /* Push current branch to origin (`git push -u origin HEAD`). */
 bool mcode_git_push(const char *workdir, char *err, size_t err_cap);
 

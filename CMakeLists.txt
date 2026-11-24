@@ -122,6 +122,7 @@ add_library(app_mcode STATIC
     src/mcode/mcode_types.c
     src/mcode/mcode_proc.c
     src/mcode/mcode_git.c
+    src/mcode/mcode_files.c
     src/mcode/mcode_agent.c
     src/mcode/mcode_store.c
     src/mcode/mcode_ui.c

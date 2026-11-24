@@ -7,6 +7,13 @@ void mcode_ui_mark_dirty(mcode_app *app);
 void mcode_ui_select_thread(mcode_app *app, const char *thread_id);
 void mcode_ui_refresh_thread_diff(mcode_thread *thread);
 void mcode_ui_load_selected_diff(mcode_thread *thread);
+void mcode_ui_refresh_workspace_git(mcode_app *app);
+void mcode_ui_load_workspace_diff(mcode_app *app);
+void mcode_ui_refresh_file_tree(mcode_app *app);
+void mcode_ui_open_diff_file(mcode_app *app, int file_idx);
+void mcode_ui_open_file_preview(mcode_app *app, cui_ctx *ui, const char *root_path,
+                                const char *rel_path);
+void mcode_ui_close_inspector(mcode_app *app);
 
 /* Project lifecycle & dialogs */
 void mcode_ui_open_project_dialog(mcode_app *app, mcode_project_dialog_mode mode);
@@ -42,6 +49,7 @@ void mcode_ui_draw_provider_icon(mcode_app *app, cui_ctx *ui, app_agent_kind age
 /* Panel renderers */
 void mcode_ui_draw_sidebar(mcode_app *app, cui_ctx *ui);
 void mcode_ui_draw_chat(mcode_app *app, cui_ctx *ui, mcode_thread *thread);
+void mcode_ui_draw_workspace_main(mcode_app *app, cui_ctx *ui, mcode_thread *thread);
 void mcode_ui_draw_diff(mcode_app *app, cui_ctx *ui, mcode_thread *thread);
 void mcode_ui_draw_terminal(mcode_app *app, cui_ctx *ui, mcode_thread *thread);
 void mcode_ui_draw_dialogs(mcode_app *app, cui_ctx *ui);

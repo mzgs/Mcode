@@ -21,13 +21,16 @@ void mcode_store_init(mcode_store *store) {
     if (!store) return;
     memset(store, 0, sizeof *store);
     store->sidebar_ratio = 0.21f;
-    store->diff_ratio = 0.64f;
+    store->diff_ratio = 0.74f;
+    store->right_split_ratio = 0.44f;
     store->terminal_ratio = 0.72f;
     store->show_sidebar = true;
     store->show_diff_panel = true;
     store->show_terminal_panel = false;
     store->diff_inline_mode = false;
     store->settled_expanded = false;
+    store->changes_expanded = true;
+    store->files_expanded = true;
 }
 
 void mcode_store_free(mcode_store *store) {
@@ -290,15 +293,19 @@ bool mcode_store_load(mcode_store *store, const char *path) {
     if (yyjson_is_obj(layout)) {
         float sr = (float)jnum_or(layout, "sidebar_ratio", store->sidebar_ratio);
         float dr = (float)jnum_or(layout, "diff_ratio", store->diff_ratio);
+        float rsr = (float)jnum_or(layout, "right_split_ratio", store->right_split_ratio);
         float tr = (float)jnum_or(layout, "terminal_ratio", store->terminal_ratio);
         if (sr >= 0.10f && sr <= 0.45f) store->sidebar_ratio = sr;
-        if (dr >= 0.30f && dr <= 0.85f) store->diff_ratio = dr;
+        if (dr >= 0.30f && dr <= 0.88f) store->diff_ratio = dr;
+        if (rsr >= 0.12f && rsr <= 0.88f) store->right_split_ratio = rsr;
         if (tr >= 0.35f && tr <= 0.88f) store->terminal_ratio = tr;
         store->show_sidebar = jbool_or(layout, "show_sidebar", store->show_sidebar);
         store->show_diff_panel = jbool_or(layout, "show_diff_panel", store->show_diff_panel);
         store->show_terminal_panel = jbool_or(layout, "show_terminal_panel", store->show_terminal_panel);
         store->diff_inline_mode = jbool_or(layout, "diff_inline_mode", store->diff_inline_mode);
         store->settled_expanded = jbool_or(layout, "settled_expanded", store->settled_expanded);
+        store->changes_expanded = jbool_or(layout, "changes_expanded", store->changes_expanded);
+        store->files_expanded = jbool_or(layout, "files_expanded", store->files_expanded);
     }
 
     yyjson_val *projects = yyjson_obj_get(root, "projects");
@@ -481,12 +488,15 @@ bool mcode_store_save(const mcode_store *store, const char *path) {
     yyjson_mut_val *layout = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_real(doc, layout, "sidebar_ratio", store->sidebar_ratio);
     yyjson_mut_obj_add_real(doc, layout, "diff_ratio", store->diff_ratio);
+    yyjson_mut_obj_add_real(doc, layout, "right_split_ratio", store->right_split_ratio);
     yyjson_mut_obj_add_real(doc, layout, "terminal_ratio", store->terminal_ratio);
     yyjson_mut_obj_add_bool(doc, layout, "show_sidebar", store->show_sidebar);
     yyjson_mut_obj_add_bool(doc, layout, "show_diff_panel", store->show_diff_panel);
     yyjson_mut_obj_add_bool(doc, layout, "show_terminal_panel", store->show_terminal_panel);
     yyjson_mut_obj_add_bool(doc, layout, "diff_inline_mode", store->diff_inline_mode);
     yyjson_mut_obj_add_bool(doc, layout, "settled_expanded", store->settled_expanded);
+    yyjson_mut_obj_add_bool(doc, layout, "changes_expanded", store->changes_expanded);
+    yyjson_mut_obj_add_bool(doc, layout, "files_expanded", store->files_expanded);
     yyjson_mut_obj_add_val(doc, root, "layout", layout);
 
     yyjson_mut_val *projects = yyjson_mut_arr(doc);

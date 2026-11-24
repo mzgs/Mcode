@@ -135,6 +135,189 @@ void mcode_ui_refresh_thread_diff(mcode_thread *thread) {
     mcode_ui_load_selected_diff(thread);
 }
 
+static void resolve_active_project_root(mcode_app *app, const char **out_root,
+                                        bool *out_is_git) {
+    if (out_root) *out_root = NULL;
+    if (out_is_git) *out_is_git = false;
+    if (!app) return;
+
+    mcode_thread *t = mcode_store_selected_thread(&app->store);
+    mcode_project *p = t ? mcode_store_find_project(&app->store, t->project_id) : NULL;
+    if (!p && app->store.selected_project_id[0]) {
+        p = mcode_store_find_project(&app->store, app->store.selected_project_id);
+    }
+    if (!p && app->store.project_count > 0) {
+        p = &app->store.projects[0];
+    }
+
+    const char *root = (t && t->workdir[0]) ? t->workdir
+                     : (p && p->path[0]) ? p->path
+                     : NULL;
+    if (out_root) *out_root = root;
+    if (out_is_git) *out_is_git = p ? p->is_git_repo : false;
+}
+
+void mcode_ui_load_workspace_diff(mcode_app *app) {
+    if (!app) return;
+    if (app->git_file_count <= 0 || !app->git_workdir[0]) {
+        app->git_selected_idx = -1;
+        free(app->git_diff_old_text);
+        app->git_diff_old_text = NULL;
+        free(app->git_diff_new_text);
+        app->git_diff_new_text = NULL;
+        app->git_diff_loaded_path[0] = '\0';
+        app->git_diff_loaded_staged = false;
+        app->git_diff_change_count = 0;
+        return;
+    }
+    if (app->git_selected_idx < 0 || app->git_selected_idx >= app->git_file_count) {
+        app->git_selected_idx = 0;
+    }
+    const mcode_diff_file *f = &app->git_files[app->git_selected_idx];
+    char *old_t = NULL;
+    char *new_t = NULL;
+    if (mcode_git_load_file_diff(app->git_workdir, f, &old_t, &new_t)) {
+        free(app->git_diff_old_text);
+        free(app->git_diff_new_text);
+        app->git_diff_old_text = old_t;
+        app->git_diff_new_text = new_t;
+        snprintf(app->git_diff_loaded_path, sizeof app->git_diff_loaded_path, "%s", f->path);
+        app->git_diff_loaded_staged = f->staged;
+        app->git_diff_change_idx = 0;
+        app->git_diff_change_count = 0;
+    } else {
+        free(old_t);
+        free(new_t);
+    }
+}
+
+void mcode_ui_refresh_workspace_git(mcode_app *app) {
+    if (!app) return;
+    const char *root = NULL;
+    bool is_git = false;
+    resolve_active_project_root(app, &root, &is_git);
+
+    char prev_path[512] = "";
+    bool prev_staged = false;
+    if (app->git_selected_idx >= 0 && app->git_selected_idx < app->git_file_count) {
+        snprintf(prev_path, sizeof prev_path, "%s", app->git_files[app->git_selected_idx].path);
+        prev_staged = app->git_files[app->git_selected_idx].staged;
+    }
+
+    if (!root || !root[0]) {
+        app->git_workdir[0] = '\0';
+        free(app->git_files);
+        app->git_files = NULL;
+        app->git_file_count = 0;
+        app->git_total_added = 0;
+        app->git_total_removed = 0;
+        app->git_selected_idx = -1;
+        mcode_ui_load_workspace_diff(app);
+        mcode_file_tree_clear(&app->file_tree);
+        return;
+    }
+
+    snprintf(app->git_workdir, sizeof app->git_workdir, "%s", root);
+
+    mcode_diff_file *files = NULL;
+    int count = 0, add = 0, rem = 0;
+    if (!mcode_git_list_changes(root, &files, &count, &add, &rem)) {
+        free(files);
+        files = NULL;
+        count = 0;
+        add = 0;
+        rem = 0;
+    }
+
+    free(app->git_files);
+    app->git_files = files;
+    app->git_file_count = count;
+    app->git_total_added = add;
+    app->git_total_removed = rem;
+
+    int next_sel = (count > 0) ? 0 : -1;
+    if (prev_path[0]) {
+        for (int i = 0; i < count; ++i) {
+            if (strcmp(files[i].path, prev_path) == 0 && files[i].staged == prev_staged) {
+                next_sel = i;
+                break;
+            }
+        }
+    }
+    app->git_selected_idx = next_sel;
+    if (app->inspector_open && app->inspector_mode == MCODE_INSPECTOR_DIFF) {
+        mcode_ui_load_workspace_diff(app);
+    }
+
+    /* Keep selected thread's diff snapshot mirrored for topbar & commit dialog */
+    mcode_thread *t = mcode_store_selected_thread(&app->store);
+    if (t && strcmp(t->workdir, root) == 0) {
+        free(t->diff_files);
+        t->diff_files = NULL;
+        if (count > 0) {
+            t->diff_files = malloc((size_t)count * sizeof *t->diff_files);
+            if (t->diff_files) {
+                memcpy(t->diff_files, files, (size_t)count * sizeof *t->diff_files);
+            }
+        }
+        t->diff_file_count = t->diff_files ? count : 0;
+        t->total_added = add;
+        t->total_removed = rem;
+        t->selected_diff_file = (t->diff_file_count > 0) ? next_sel : -1;
+    }
+
+    mcode_file_tree_refresh(&app->file_tree, root, is_git, app->git_files, app->git_file_count);
+}
+
+void mcode_ui_refresh_file_tree(mcode_app *app) {
+    if (!app) return;
+    const char *root = NULL;
+    bool is_git = false;
+    resolve_active_project_root(app, &root, &is_git);
+    mcode_file_tree_refresh(&app->file_tree, root, is_git, app->git_files, app->git_file_count);
+}
+
+void mcode_ui_close_inspector(mcode_app *app) {
+    if (!app) return;
+    app->inspector_open = false;
+    app->inspector_showing_chat = false;
+    app->inspector_mode = MCODE_INSPECTOR_CHAT;
+}
+
+void mcode_ui_open_diff_file(mcode_app *app, int file_idx) {
+    if (!app || file_idx < 0 || file_idx >= app->git_file_count) return;
+    app->git_selected_idx = file_idx;
+    mcode_ui_load_workspace_diff(app);
+    app->inspector_open = true;
+    app->inspector_mode = MCODE_INSPECTOR_DIFF;
+    app->inspector_showing_chat = false;
+}
+
+void mcode_ui_open_file_preview(mcode_app *app, cui_ctx *ui, const char *root_path,
+                                const char *rel_path) {
+    if (!app || !root_path || !root_path[0] || !rel_path || !rel_path[0]) return;
+    char *buf = NULL;
+    size_t cap = 0;
+    bool is_bin = false;
+    bool trunc = false;
+    int64_t fsz = 0;
+    if (!mcode_file_read_preview(root_path, rel_path, &buf, &cap, &is_bin, &trunc, &fsz)) {
+        if (ui) app_chrome_notify(app->chrome, ui, "Could not read file.", CUI_TONE_DANGER);
+        return;
+    }
+    free(app->preview_text);
+    app->preview_text = buf;
+    app->preview_buf_cap = cap;
+    app->preview_is_binary = is_bin;
+    app->preview_truncated = trunc;
+    app->preview_file_size = fsz;
+    snprintf(app->preview_rel_path, sizeof app->preview_rel_path, "%s", rel_path);
+    snprintf(app->preview_workdir, sizeof app->preview_workdir, "%s", root_path);
+    app->inspector_open = true;
+    app->inspector_mode = MCODE_INSPECTOR_FILE;
+    app->inspector_showing_chat = false;
+}
+
 static void nav_history_push(mcode_app *app, const char *thread_id) {
     if (!app || !thread_id || !thread_id[0]) return;
     if (app->nav_count > 0 && app->nav_index >= 0 && app->nav_index < app->nav_count &&
@@ -206,7 +389,8 @@ static void nav_history_jump(mcode_app *app, int target_idx) {
     app->nav_index = target_idx;
     if (!was_selected || strcmp(app->store.selected_thread_id, t->id) != 0) {
         snprintf(app->store.selected_thread_id, sizeof app->store.selected_thread_id, "%s", t->id);
-        mcode_ui_refresh_thread_diff(t);
+        mcode_ui_close_inspector(app);
+        mcode_ui_refresh_workspace_git(app);
         if (!t->is_draft) mcode_ui_mark_dirty(app);
     }
 }
@@ -220,9 +404,13 @@ void mcode_ui_select_thread(mcode_app *app, const char *thread_id) {
     mcode_thread *t = mcode_store_find_thread(&app->store, target_id);
     if (!t) return;
     if (!t->is_draft) nav_history_push(app, t->id);
-    if (was_selected && strcmp(app->store.selected_thread_id, t->id) == 0) return;
+    if (was_selected && strcmp(app->store.selected_thread_id, t->id) == 0) {
+        app->inspector_showing_chat = true;
+        return;
+    }
     snprintf(app->store.selected_thread_id, sizeof app->store.selected_thread_id, "%s", t->id);
-    mcode_ui_refresh_thread_diff(t);
+    mcode_ui_close_inspector(app);
+    mcode_ui_refresh_workspace_git(app);
     if (!t->is_draft) mcode_ui_mark_dirty(app);
 }
 
@@ -396,8 +584,8 @@ void mcode_ui_remove_project(mcode_app *app, cui_ctx *ui, const char *project_id
         app->rename_project_open = false;
     }
 
-    mcode_thread *next = mcode_store_selected_thread(&app->store);
-    if (next) mcode_ui_refresh_thread_diff(next);
+    mcode_ui_close_inspector(app);
+    mcode_ui_refresh_workspace_git(app);
     mcode_ui_refresh_discovered_repos(app);
     mcode_ui_mark_dirty(app);
 
@@ -422,10 +610,7 @@ void mcode_ui_init_project_git(mcode_app *app, cui_ctx *ui, mcode_project *proj)
             snprintf(t->branch, sizeof t->branch, "%s", proj->default_branch);
         }
     }
-    mcode_thread *sel = mcode_store_selected_thread(&app->store);
-    if (sel && strcmp(sel->project_id, proj->id) == 0) {
-        mcode_ui_refresh_thread_diff(sel);
-    }
+    mcode_ui_refresh_workspace_git(app);
     mcode_ui_mark_dirty(app);
     if (ui) app_chrome_notify(app->chrome, ui, "Initialized Git repository.", CUI_TONE_SUCCESS);
 }
@@ -595,7 +780,8 @@ mcode_thread *mcode_ui_create_thread(mcode_app *app, cui_ctx *ui, mcode_project 
         proj->collapsed = false;
         snprintf(app->store.selected_project_id, sizeof app->store.selected_project_id,
                  "%s", proj->id);
-        mcode_ui_refresh_thread_diff(t);
+        mcode_ui_close_inspector(app);
+        mcode_ui_refresh_workspace_git(app);
     }
     return t;
 }
@@ -718,6 +904,9 @@ void mcode_app_init(mcode_app *app, app_chrome *chrome) {
     memset(app, 0, sizeof *app);
     app->chrome = chrome;
     mcode_store_init(&app->store);
+    mcode_file_tree_init(&app->file_tree);
+    app->git_selected_idx = -1;
+    app->staged_expanded = true;
     pthread_mutex_init(&app->term_mu, NULL);
     pthread_mutex_init(&app->clone_mu, NULL);
     mcode_str_init(&app->term_pending);
@@ -737,8 +926,8 @@ void mcode_app_init(mcode_app *app, app_chrome *chrome) {
             mcode_thread *sel = mcode_store_selected_thread(&app->store);
             if (sel) {
                 nav_history_push(app, sel->id);
-                mcode_ui_refresh_thread_diff(sel);
             }
+            mcode_ui_refresh_workspace_git(app);
         }
     }
 
@@ -776,6 +965,17 @@ void mcode_app_shutdown(mcode_app *app) {
         mcode_store_save(&app->store, app->state_path);
     }
     mcode_store_free(&app->store);
+    mcode_file_tree_free(&app->file_tree);
+    free(app->git_files);
+    app->git_files = NULL;
+    app->git_file_count = 0;
+    free(app->git_diff_old_text);
+    app->git_diff_old_text = NULL;
+    free(app->git_diff_new_text);
+    app->git_diff_new_text = NULL;
+    free(app->preview_text);
+    app->preview_text = NULL;
+    app->preview_buf_cap = 0;
     mcode_str_free(&app->term_pending);
     pthread_mutex_destroy(&app->clone_mu);
     pthread_mutex_destroy(&app->term_mu);
@@ -816,7 +1016,11 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
         if (finished) {
             mcode_agent_destroy(t->active_run);
             t->active_run = NULL;
-            mcode_ui_refresh_thread_diff(t);
+            if (strcmp(app->store.selected_thread_id, t->id) == 0) {
+                mcode_ui_refresh_workspace_git(app);
+            } else {
+                mcode_ui_refresh_thread_diff(t);
+            }
             mcode_ui_mark_dirty(app);
             any_finished = true;
             char msg[220];
@@ -876,8 +1080,7 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
         } else {
             cui_terminal_printf(&app->term_buf, "\x1b[31m[exit %d]\x1b[0m\n", tcode);
         }
-        mcode_thread *sel = mcode_store_selected_thread(&app->store);
-        if (sel) mcode_ui_refresh_thread_diff(sel);
+        mcode_ui_refresh_workspace_git(app);
     }
 
     /* Poll async git clone */
@@ -1416,16 +1619,17 @@ static void draw_topbar_main_segment(mcode_app *app, cui_ctx *ui, mcode_thread *
                 mcode_app_action_toggle_terminal(ui, app);
             }
 
-            char diff_tip[64];
+            char diff_tip[80];
             if (thread && thread->diff_file_count > 0) {
-                snprintf(diff_tip, sizeof diff_tip, "Toggle Diff Panel (%d %s)",
+                snprintf(diff_tip, sizeof diff_tip, "Toggle Changes & Files (%d %s)",
                          thread->diff_file_count,
-                         thread->diff_file_count == 1 ? "file" : "files");
+                         thread->diff_file_count == 1 ? "change" : "changes");
             } else {
-                snprintf(diff_tip, sizeof diff_tip, "Toggle Diff Panel");
+                snprintf(diff_tip, sizeof diff_tip, "Toggle Changes & Files");
             }
+            bool has_project = (thread != NULL || app->store.project_count > 0);
             if (draw_topbar_icon_btn(ui, "tb-diff", TOPBAR_ICON_RIGHT_PANEL,
-                                     app->store.show_diff_panel && (thread != NULL),
+                                     app->store.show_diff_panel && has_project,
                                      diff_tip, "Cmd D")) {
                 mcode_app_action_toggle_diff(ui, app);
             }
@@ -1434,20 +1638,21 @@ static void draw_topbar_main_segment(mcode_app *app, cui_ctx *ui, mcode_thread *
 }
 
 static void draw_main_workspace_body(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
-    if (app->store.show_diff_panel && thread) {
+    bool has_project = (thread != NULL || app->store.project_count > 0);
+    if (app->store.show_diff_panel && has_project) {
         cui_split(ui, "mcode-diff-split", &app->store.diff_ratio,
-                  .min_first = 360, .min_second = 280,
+                  .min_first = 360, .min_second = 248,
                   .width = CUI_FILL, .height = CUI_FILL) {
             if (app->store.show_terminal_panel) {
                 cui_split(ui, "mcode-term-split", &app->store.terminal_ratio,
                           .vertical = true, .min_first = 220, .min_second = 150,
                           .width = CUI_FILL, .height = CUI_FILL) {
-                    mcode_ui_draw_chat(app, ui, thread);
+                    mcode_ui_draw_workspace_main(app, ui, thread);
                     cui_split_next(ui);
                     mcode_ui_draw_terminal(app, ui, thread);
                 }
             } else {
-                mcode_ui_draw_chat(app, ui, thread);
+                mcode_ui_draw_workspace_main(app, ui, thread);
             }
             cui_split_next(ui);
             mcode_ui_draw_diff(app, ui, thread);
@@ -1456,12 +1661,12 @@ static void draw_main_workspace_body(mcode_app *app, cui_ctx *ui, mcode_thread *
         cui_split(ui, "mcode-term-split-wide", &app->store.terminal_ratio,
                   .vertical = true, .min_first = 220, .min_second = 150,
                   .width = CUI_FILL, .height = CUI_FILL) {
-            mcode_ui_draw_chat(app, ui, thread);
+            mcode_ui_draw_workspace_main(app, ui, thread);
             cui_split_next(ui);
             mcode_ui_draw_terminal(app, ui, thread);
         }
     } else {
-        mcode_ui_draw_chat(app, ui, thread);
+        mcode_ui_draw_workspace_main(app, ui, thread);
     }
 }
 
@@ -1556,8 +1761,7 @@ void mcode_app_action_toggle_diff(cui_ctx *ui, void *user) {
     if (!app) return;
     app->store.show_diff_panel = !app->store.show_diff_panel;
     if (app->store.show_diff_panel) {
-        mcode_thread *t = mcode_store_selected_thread(&app->store);
-        if (t) mcode_ui_refresh_thread_diff(t);
+        mcode_ui_refresh_workspace_git(app);
     }
     mcode_ui_mark_dirty(app);
 }
@@ -1605,10 +1809,9 @@ void mcode_app_action_create_pr(cui_ctx *ui, void *user) {
 void mcode_app_action_refresh_diff(cui_ctx *ui, void *user) {
     mcode_app *app = (mcode_app *)user;
     if (!app) return;
-    mcode_thread *t = mcode_store_selected_thread(&app->store);
-    if (t) {
-        mcode_ui_refresh_thread_diff(t);
-        if (ui) app_chrome_notify(app->chrome, ui, "Diff refreshed.", CUI_TONE_INFO);
+    mcode_ui_refresh_workspace_git(app);
+    if (ui && (mcode_store_selected_thread(&app->store) || app->store.project_count > 0)) {
+        app_chrome_notify(app->chrome, ui, "Changes and files refreshed.", CUI_TONE_INFO);
     }
 }
 

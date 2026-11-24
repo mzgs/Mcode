@@ -394,11 +394,68 @@ int mcode_git_discover_repos(const char *extra_dir, mcode_discovered_repo *out, 
 #endif
 }
 
-static int find_diff_file(mcode_diff_file *files, int count, const char *path) {
+static int find_diff_file_staged(mcode_diff_file *files, int count, const char *path, bool staged) {
     for (int i = 0; i < count; ++i) {
-        if (strcmp(files[i].path, path) == 0) return i;
+        if (files[i].staged == staged && strcmp(files[i].path, path) == 0) return i;
     }
     return -1;
+}
+
+static void status_str_from_xy_char(char c, char out[4]) {
+    if (c == 'D') strcpy(out, "D");
+    else if (c == 'A') strcpy(out, "A");
+    else if (c == 'R' || c == 'C') strcpy(out, "R");
+    else strcpy(out, "M");
+}
+
+static bool append_diff_entry(mcode_diff_file **files_p, int *count_p, int *cap_p,
+                              const char *path, size_t path_len,
+                              const char *status, bool untracked,
+                              bool staged, bool unstaged) {
+    if (*count_p >= *cap_p) {
+        int ncap = (*cap_p) * 2;
+        mcode_diff_file *grown = realloc(*files_p, (size_t)ncap * sizeof *grown);
+        if (!grown) return false;
+        *files_p = grown;
+        *cap_p = ncap;
+    }
+    mcode_diff_file *df = &(*files_p)[*count_p];
+    memset(df, 0, sizeof *df);
+    memcpy(df->path, path, path_len);
+    df->path[path_len] = '\0';
+    snprintf(df->status, sizeof df->status, "%s", status);
+    df->untracked = untracked;
+    df->staged = staged;
+    df->unstaged = unstaged;
+    (*count_p)++;
+    return true;
+}
+
+static void apply_numstat_output(char *numstat_out, mcode_diff_file *files, int count, bool staged) {
+    if (!numstat_out) return;
+    char *q = numstat_out;
+    while (*q) {
+        char *eol = strchr(q, '\n');
+        if (eol) *eol = '\0';
+        size_t len = strlen(q);
+        if (len > 0 && q[len - 1] == '\r') q[--len] = '\0';
+        char *t1 = strchr(q, '\t');
+        char *t2 = t1 ? strchr(t1 + 1, '\t') : NULL;
+        if (t1 && t2) {
+            *t1 = '\0';
+            *t2 = '\0';
+            const char *fpath = t2 + 1;
+            int add = (q[0] == '-') ? 0 : atoi(q);
+            int rem = (t1[1] == '-') ? 0 : atoi(t1 + 1);
+            int idx = find_diff_file_staged(files, count, fpath, staged);
+            if (idx >= 0) {
+                files[idx].added = add;
+                files[idx].removed = rem;
+            }
+        }
+        if (!eol) break;
+        q = eol + 1;
+    }
 }
 
 static int count_file_lines(const char *workdir, const char *rel_path) {
@@ -453,6 +510,7 @@ bool mcode_git_list_changes(const char *workdir,
     while (*p) {
         char *eol = strchr(p, '\n');
         size_t line_len = eol ? (size_t)(eol - p) : strlen(p);
+        while (line_len > 0 && p[line_len - 1] == '\r') --line_len;
         if (line_len >= 4) {
             char x = p[0];
             char y = p[1];
@@ -477,29 +535,23 @@ bool mcode_git_list_changes(const char *workdir,
                 path_len -= 2;
             }
             if (path_len > 0 && path_len < sizeof(files[0].path)) {
-                if (count >= cap) {
-                    cap *= 2;
-                    mcode_diff_file *grown = realloc(files, (size_t)cap * sizeof *files);
-                    if (!grown) break;
-                    files = grown;
-                }
-                mcode_diff_file *df = &files[count];
-                memset(df, 0, sizeof *df);
-                memcpy(df->path, path_start, path_len);
-                df->path[path_len] = '\0';
                 if (x == '?' && y == '?') {
-                    strcpy(df->status, "?");
-                    df->untracked = true;
-                } else if (x == 'D' || y == 'D') {
-                    strcpy(df->status, "D");
-                } else if (x == 'A' || y == 'A') {
-                    strcpy(df->status, "A");
-                } else if (x == 'R' || y == 'R') {
-                    strcpy(df->status, "R");
-                } else {
-                    strcpy(df->status, "M");
+                    append_diff_entry(&files, &count, &cap, path_start, path_len,
+                                      "?", true, false, true);
+                } else if (x != '!' && y != '!') {
+                    if (x != ' ' && x != '?') {
+                        char st[4];
+                        status_str_from_xy_char(x, st);
+                        append_diff_entry(&files, &count, &cap, path_start, path_len,
+                                          st, false, true, false);
+                    }
+                    if (y != ' ' && y != '?') {
+                        char st[4];
+                        status_str_from_xy_char(y, st);
+                        append_diff_entry(&files, &count, &cap, path_start, path_len,
+                                          st, false, false, true);
+                    }
                 }
-                ++count;
             }
         }
         if (!eol) break;
@@ -507,40 +559,21 @@ bool mcode_git_list_changes(const char *workdir,
     }
     free(status_out);
 
-    /* Parse numstat against HEAD (fallback to plain git diff if unborn HEAD) */
-    const char *argv_numstat[] = { "git", "diff", "HEAD", "--numstat", NULL };
-    char *numstat_out = NULL;
-    if (!mcode_proc_run_capture(argv_numstat, workdir, false, &rc, &numstat_out, NULL) || rc != 0) {
-        free(numstat_out);
-        numstat_out = NULL;
-        const char *argv_numstat_fb[] = { "git", "diff", "--numstat", NULL };
-        (void)mcode_proc_run_capture(argv_numstat_fb, workdir, false, &rc, &numstat_out, NULL);
+    /* Unstaged numstat (working tree vs index) */
+    const char *argv_unstaged[] = { "git", "diff", "--numstat", NULL };
+    char *unstaged_out = NULL;
+    if (mcode_proc_run_capture(argv_unstaged, workdir, false, &rc, &unstaged_out, NULL) && rc == 0) {
+        apply_numstat_output(unstaged_out, files, count, false);
     }
+    free(unstaged_out);
 
-    if (numstat_out) {
-        char *q = numstat_out;
-        while (*q) {
-            char *eol = strchr(q, '\n');
-            if (eol) *eol = '\0';
-            char *t1 = strchr(q, '\t');
-            char *t2 = t1 ? strchr(t1 + 1, '\t') : NULL;
-            if (t1 && t2) {
-                *t1 = '\0';
-                *t2 = '\0';
-                const char *fpath = t2 + 1;
-                int add = (q[0] == '-') ? 0 : atoi(q);
-                int rem = (t1[1] == '-') ? 0 : atoi(t1 + 1);
-                int idx = find_diff_file(files, count, fpath);
-                if (idx >= 0) {
-                    files[idx].added = add;
-                    files[idx].removed = rem;
-                }
-            }
-            if (!eol) break;
-            q = eol + 1;
-        }
-        free(numstat_out);
+    /* Staged numstat (index vs HEAD; works on unborn HEAD too) */
+    const char *argv_staged[] = { "git", "diff", "--cached", "--numstat", NULL };
+    char *staged_out = NULL;
+    if (mcode_proc_run_capture(argv_staged, workdir, false, &rc, &staged_out, NULL) && rc == 0) {
+        apply_numstat_output(staged_out, files, count, true);
     }
+    free(staged_out);
 
     int total_add = 0, total_rem = 0;
     for (int i = 0; i < count; ++i) {
@@ -584,6 +617,29 @@ static char *read_file_capped(const char *path, size_t max_bytes) {
     return buf;
 }
 
+static char *git_show_capped(const char *workdir, const char *spec, size_t max_bytes, bool *ok_out) {
+    if (ok_out) *ok_out = false;
+    const char *argv[] = { "git", "show", spec, NULL };
+    int rc = -1;
+    char *text = NULL;
+    size_t len = 0;
+    if (!mcode_proc_run_capture(argv, workdir, false, &rc, &text, &len) || rc != 0 || !text) {
+        free(text);
+        return NULL;
+    }
+    if (len > max_bytes) {
+        text[max_bytes] = '\0';
+        len = max_bytes;
+    }
+    if (memchr(text, '\0', len)) {
+        free(text);
+        if (ok_out) *ok_out = true;
+        return strdup("[binary file]\n");
+    }
+    if (ok_out) *ok_out = true;
+    return text;
+}
+
 bool mcode_git_load_file_diff(const char *workdir, const mcode_diff_file *file,
                               char **out_old, char **out_new) {
     if (out_old) *out_old = NULL;
@@ -593,32 +649,45 @@ bool mcode_git_load_file_diff(const char *workdir, const mcode_diff_file *file,
     enum { MAX_DIFF_FILE_BYTES = 512 * 1024 };
 
     char *old_text = NULL;
-    if (file->untracked || strcmp(file->status, "A") == 0) {
-        old_text = strdup("");
-    } else {
-        char spec[600];
-        snprintf(spec, sizeof spec, "HEAD:%s", file->path);
-        const char *argv[] = { "git", "show", spec, NULL };
-        int rc = -1;
-        size_t len = 0;
-        if (!mcode_proc_run_capture(argv, workdir, false, &rc, &old_text, &len) || rc != 0 || !old_text) {
-            free(old_text);
-            old_text = strdup("");
-        } else if (len > MAX_DIFF_FILE_BYTES) {
-            old_text[MAX_DIFF_FILE_BYTES] = '\0';
-        } else if (memchr(old_text, '\0', len)) {
-            free(old_text);
-            old_text = strdup("[binary file]\n");
-        }
-    }
-
     char *new_text = NULL;
-    if (strcmp(file->status, "D") == 0) {
-        new_text = strdup("");
+    char spec[600];
+
+    if (file->staged) {
+        /* Staged diff: HEAD vs Index */
+        if (strcmp(file->status, "A") == 0) {
+            old_text = strdup("");
+        } else {
+            snprintf(spec, sizeof spec, "HEAD:%s", file->path);
+            old_text = git_show_capped(workdir, spec, MAX_DIFF_FILE_BYTES, NULL);
+            if (!old_text) old_text = strdup("");
+        }
+        if (strcmp(file->status, "D") == 0) {
+            new_text = strdup("");
+        } else {
+            snprintf(spec, sizeof spec, ":%s", file->path);
+            new_text = git_show_capped(workdir, spec, MAX_DIFF_FILE_BYTES, NULL);
+            if (!new_text) new_text = strdup("");
+        }
     } else {
-        char full[MCODE_PATH_MAX + 512];
-        snprintf(full, sizeof full, "%s/%s", workdir, file->path);
-        new_text = read_file_capped(full, MAX_DIFF_FILE_BYTES);
+        /* Unstaged / untracked diff: Index (fallback HEAD) vs Working Tree */
+        if (file->untracked) {
+            old_text = strdup("");
+        } else {
+            snprintf(spec, sizeof spec, ":%s", file->path);
+            old_text = git_show_capped(workdir, spec, MAX_DIFF_FILE_BYTES, NULL);
+            if (!old_text) {
+                snprintf(spec, sizeof spec, "HEAD:%s", file->path);
+                old_text = git_show_capped(workdir, spec, MAX_DIFF_FILE_BYTES, NULL);
+            }
+            if (!old_text) old_text = strdup("");
+        }
+        if (strcmp(file->status, "D") == 0) {
+            new_text = strdup("");
+        } else {
+            char full[MCODE_PATH_MAX + 512];
+            snprintf(full, sizeof full, "%s/%s", workdir, file->path);
+            new_text = read_file_capped(full, MAX_DIFF_FILE_BYTES);
+        }
     }
 
     if (out_old) *out_old = old_text;
@@ -659,6 +728,29 @@ const char *mcode_lang_from_path(const char *path) {
     return "text";
 }
 
+bool mcode_git_commit_staged(const char *workdir, const char *message,
+                             char *err, size_t err_cap) {
+    if (err && err_cap) err[0] = '\0';
+    if (!workdir || !workdir[0] || !message || !message[0]) {
+        if (err && err_cap) snprintf(err, err_cap, "Commit message cannot be empty.");
+        return false;
+    }
+
+    const char *argv_commit[] = { "git", "commit", "-m", message, NULL };
+    int rc = -1;
+    char *out = NULL;
+    if (!mcode_proc_run_capture(argv_commit, workdir, true, &rc, &out, NULL) || rc != 0) {
+        if (err && err_cap) {
+            if (out && out[0]) { trim_trailing(out); snprintf(err, err_cap, "%s", out); }
+            else snprintf(err, err_cap, "git commit failed.");
+        }
+        free(out);
+        return false;
+    }
+    free(out);
+    return true;
+}
+
 bool mcode_git_commit_all(const char *workdir, const char *message,
                           char *err, size_t err_cap) {
     if (err && err_cap) err[0] = '\0';
@@ -667,10 +759,63 @@ bool mcode_git_commit_all(const char *workdir, const char *message,
         return false;
     }
 
-    const char *argv_add[] = { "git", "add", "-A", NULL };
+    if (!mcode_git_stage_all(workdir, err, err_cap)) return false;
+    return mcode_git_commit_staged(workdir, message, err, err_cap);
+}
+
+bool mcode_git_stage_file(const char *workdir, const char *rel_path,
+                          char *err, size_t err_cap) {
+    if (err && err_cap) err[0] = '\0';
+    if (!workdir || !workdir[0] || !rel_path || !rel_path[0]) return false;
+    const char *argv[] = { "git", "add", "--", rel_path, NULL };
     int rc = -1;
     char *out = NULL;
-    if (!mcode_proc_run_capture(argv_add, workdir, true, &rc, &out, NULL) || rc != 0) {
+    if (!mcode_proc_run_capture(argv, workdir, true, &rc, &out, NULL) || rc != 0) {
+        if (err && err_cap) {
+            if (out && out[0]) { trim_trailing(out); snprintf(err, err_cap, "%s", out); }
+            else snprintf(err, err_cap, "git add failed.");
+        }
+        free(out);
+        return false;
+    }
+    free(out);
+    return true;
+}
+
+bool mcode_git_unstage_file(const char *workdir, const char *rel_path,
+                            char *err, size_t err_cap) {
+    if (err && err_cap) err[0] = '\0';
+    if (!workdir || !workdir[0] || !rel_path || !rel_path[0]) return false;
+    const char *argv[] = { "git", "restore", "--staged", "--", rel_path, NULL };
+    int rc = -1;
+    char *out = NULL;
+    if (mcode_proc_run_capture(argv, workdir, true, &rc, &out, NULL) && rc == 0) {
+        free(out);
+        return true;
+    }
+    free(out);
+    out = NULL;
+    /* Fallback for unborn HEAD or older git */
+    const char *argv_fb[] = { "git", "rm", "--cached", "--", rel_path, NULL };
+    if (mcode_proc_run_capture(argv_fb, workdir, true, &rc, &out, NULL) && rc == 0) {
+        free(out);
+        return true;
+    }
+    if (err && err_cap) {
+        if (out && out[0]) { trim_trailing(out); snprintf(err, err_cap, "%s", out); }
+        else snprintf(err, err_cap, "Could not unstage file.");
+    }
+    free(out);
+    return false;
+}
+
+bool mcode_git_stage_all(const char *workdir, char *err, size_t err_cap) {
+    if (err && err_cap) err[0] = '\0';
+    if (!workdir || !workdir[0]) return false;
+    const char *argv[] = { "git", "add", "-A", NULL };
+    int rc = -1;
+    char *out = NULL;
+    if (!mcode_proc_run_capture(argv, workdir, true, &rc, &out, NULL) || rc != 0) {
         if (err && err_cap) {
             if (out && out[0]) { trim_trailing(out); snprintf(err, err_cap, "%s", out); }
             else snprintf(err, err_cap, "git add -A failed.");
@@ -679,13 +824,19 @@ bool mcode_git_commit_all(const char *workdir, const char *message,
         return false;
     }
     free(out);
+    return true;
+}
 
-    const char *argv_commit[] = { "git", "commit", "-m", message, NULL };
-    out = NULL;
-    if (!mcode_proc_run_capture(argv_commit, workdir, true, &rc, &out, NULL) || rc != 0) {
+bool mcode_git_unstage_all(const char *workdir, char *err, size_t err_cap) {
+    if (err && err_cap) err[0] = '\0';
+    if (!workdir || !workdir[0]) return false;
+    const char *argv[] = { "git", "reset", NULL };
+    int rc = -1;
+    char *out = NULL;
+    if (!mcode_proc_run_capture(argv, workdir, true, &rc, &out, NULL) || rc != 0) {
         if (err && err_cap) {
             if (out && out[0]) { trim_trailing(out); snprintf(err, err_cap, "%s", out); }
-            else snprintf(err, err_cap, "git commit failed.");
+            else snprintf(err, err_cap, "git reset failed.");
         }
         free(out);
         return false;

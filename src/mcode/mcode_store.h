@@ -21,12 +21,15 @@ typedef struct {
     /* Persisted UI layout state */
     float sidebar_ratio;
     float diff_ratio;
+    float right_split_ratio;
     float terminal_ratio;
     bool show_sidebar;
     bool show_diff_panel;
     bool show_terminal_panel;
     bool diff_inline_mode;
     bool settled_expanded;
+    bool changes_expanded;
+    bool files_expanded;
 } mcode_store;
 
 void mcode_store_init(mcode_store *store);
