@@ -50,7 +50,7 @@ static bool draw_thread_card(mcode_app *app, cui_ctx *ui, int idx, bool show_pro
     }
     bool clicked = cui_card_begin(ui, &card_opts);
 
-    /* Top row: live status indicator + title + timer */
+    /* Top row: live status indicator + title + timer + provider icon */
     cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
         if (needs_review) {
             cui_icon(ui, CUI_ICON_SHIELD, 13, CUI_COLOR_WARNING);
@@ -81,28 +81,30 @@ static bool draw_thread_card(mcode_app *app, cui_ctx *ui, int idx, bool show_pro
             cui_text(ui, elapsed, .font = CUI_FONT_MONO, .size = 11,
                      .color = CUI_COLOR_ACCENT, .tabular = true);
         }
+
+        cui_color icon_tint = cui_alpha(
+            cui_color_of(ui, (t->state == MCODE_THREAD_SNOOZED)
+                                 ? CUI_COLOR_TEXT_MUTED
+                                 : CUI_COLOR_TEXT_SECONDARY),
+            0.5f);
+        mcode_ui_draw_provider_icon(app, ui, t->agent, 14.0f, icon_tint);
     }
 
-    /* Bottom row: agent badge + branch (and project name only in Settled bucket) */
-    cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
-        cui_tone ag_tone = (t->agent == APP_AGENT_CLAUDE) ? CUI_TONE_WARNING
-                         : (t->agent == APP_AGENT_CODEX)  ? CUI_TONE_SUCCESS
-                         : CUI_TONE_INFO;
-        cui_badge(ui, mcode_agent_short_label(t->agent), .tone = ag_tone, .size = CUI_SIZE_SM);
-
-        char meta[192] = "";
-        if (show_project_name && p && t->branch[0]) {
-            snprintf(meta, sizeof meta, "%s · %s", p->name, t->branch);
-        } else if (show_project_name && p) {
-            snprintf(meta, sizeof meta, "%s", p->name);
-        } else if (t->branch[0]) {
-            snprintf(meta, sizeof meta, "%s%s",
-                     t->branch,
-                     (t->state == MCODE_THREAD_SNOOZED) ? " · snoozed" : "");
-        } else if (t->state == MCODE_THREAD_SNOOZED) {
-            snprintf(meta, sizeof meta, "Snoozed");
-        }
-        if (meta[0]) {
+    /* Optional bottom row: branch / snoozed / project name (in Settled bucket) */
+    char meta[192] = "";
+    if (show_project_name && p && t->branch[0]) {
+        snprintf(meta, sizeof meta, "%s · %s", p->name, t->branch);
+    } else if (show_project_name && p) {
+        snprintf(meta, sizeof meta, "%s", p->name);
+    } else if (t->branch[0]) {
+        snprintf(meta, sizeof meta, "%s%s",
+                 t->branch,
+                 (t->state == MCODE_THREAD_SNOOZED) ? " · snoozed" : "");
+    } else if (t->state == MCODE_THREAD_SNOOZED) {
+        snprintf(meta, sizeof meta, "Snoozed");
+    }
+    if (meta[0]) {
+        cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
             cui_text(ui, meta, .size = 11.0f, .color = CUI_COLOR_TEXT_MUTED,
                      .width = CUI_FILL, .nowrap = true);
         }
