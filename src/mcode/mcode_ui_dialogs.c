@@ -212,7 +212,7 @@ static void draw_project_dialog(mcode_app *app, cui_ctx *ui) {
             }
 
             cui_switch(ui, "Initialize Git repository", &app->new_proj_init_git,
-                       .description = "Runs git init so diffs, commits, and worktrees work immediately");
+                       .description = "Runs git init so diffs and commits work immediately");
 
             if ((nf & CUI_SUBMITTED) && app->new_proj_name[0] && app->new_proj_parent[0]) {
                 try_create_project(app, ui);
@@ -453,13 +453,6 @@ static void draw_new_thread_dialog(mcode_app *app, cui_ctx *ui) {
                 }
             }
 
-            mcode_project *sel_proj = &app->store.projects[app->new_thread_project_idx];
-            cui_switch(ui, "Create isolated Git worktree", &app->new_thread_worktree,
-                       .description = sel_proj->is_git_repo
-                           ? "Creates a fresh mcode/* branch under ~/.mcode/worktrees/"
-                           : "Unavailable: selected folder is not a Git repository",
-                       .disabled = !sel_proj->is_git_repo);
-
             cui_switch(ui, "Auto-approve permissions", &app->new_thread_auto_approve,
                        .description = "Skip interactive permission prompts for unattended runs");
         } else {
@@ -478,7 +471,6 @@ static void draw_new_thread_dialog(mcode_app *app, cui_ctx *ui) {
                                        app->new_thread_title,
                                        (app_agent_kind)app->new_thread_agent,
                                        app->new_thread_model,
-                                       app->new_thread_worktree && p->is_git_repo,
                                        app->new_thread_auto_approve);
                 app->new_thread_open = false;
             }
@@ -591,7 +583,7 @@ static void draw_project_actions_dialog(mcode_app *app, cui_ctx *ui) {
     }
     if (!proj && app->store.project_count > 0) proj = &app->store.projects[0];
 
-    cui_dialog(ui, "Project Quick Actions & Setup", &app->actions_dialog_open,
+    cui_dialog(ui, "Project Quick Actions", &app->actions_dialog_open,
                .description = proj ? proj->name : NULL,
                .width = 520) {
         if (proj) {
@@ -612,12 +604,6 @@ static void draw_project_actions_dialog(mcode_app *app, cui_ctx *ui) {
                     }
                 }
             }
-
-            int f = cui_input(ui, "proj-setup-script", proj->setup_script, sizeof proj->setup_script,
-                              .label = "Worktree setup script (auto-runs on new worktrees)",
-                              .placeholder = "e.g. npm install  or  cmake -S . -B build",
-                              .width = CUI_FILL);
-            if (f & CUI_CHANGED) mcode_ui_mark_dirty(app);
 
             cui_separator(ui);
             cui_text(ui, "Quick Actions", .font = CUI_FONT_MEDIUM);

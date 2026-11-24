@@ -42,7 +42,7 @@ mcode_thread *mcode_store_find_thread(mcode_store *store, const char *id);
 mcode_thread *mcode_store_selected_thread(mcode_store *store);
 mcode_thread *mcode_store_add_thread(mcode_store *store, const mcode_project *proj,
                                      const char *title, app_agent_kind agent,
-                                     const char *model, bool use_worktree, bool auto_approve,
+                                     const char *model, bool auto_approve,
                                      const char *workdir, const char *branch);
 bool mcode_store_remove_thread(mcode_store *store, const char *id);
 

@@ -24,10 +24,9 @@ void mcode_ui_cancel_clone(mcode_app *app);
 /* Thread lifecycle */
 mcode_thread *mcode_ui_create_thread(mcode_app *app, cui_ctx *ui, mcode_project *proj,
                                      const char *title, app_agent_kind agent,
-                                     const char *model, bool use_worktree, bool auto_approve);
+                                     const char *model, bool auto_approve);
 mcode_thread *mcode_ui_quick_new_thread(mcode_app *app, cui_ctx *ui, mcode_project *proj);
 void mcode_ui_open_new_thread_dialog(mcode_app *app, const mcode_project *proj);
-void mcode_ui_toggle_thread_worktree(mcode_app *app, cui_ctx *ui, mcode_thread *thread);
 
 void mcode_ui_send_prompt(mcode_app *app, cui_ctx *ui, mcode_thread *thread, const char *prompt);
 void mcode_ui_stop_thread(mcode_app *app, cui_ctx *ui, mcode_thread *thread);

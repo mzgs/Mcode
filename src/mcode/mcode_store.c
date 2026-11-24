@@ -185,7 +185,7 @@ mcode_thread *mcode_store_selected_thread(mcode_store *store) {
 
 mcode_thread *mcode_store_add_thread(mcode_store *store, const mcode_project *proj,
                                      const char *title, app_agent_kind agent,
-                                     const char *model, bool use_worktree, bool auto_approve,
+                                     const char *model, bool auto_approve,
                                      const char *workdir, const char *branch) {
     if (!store) return NULL;
     if (store->thread_count >= store->thread_cap) {
@@ -203,7 +203,6 @@ mcode_thread *mcode_store_add_thread(mcode_store *store, const mcode_project *pr
     snprintf(t->title, sizeof t->title, "%s", (title && title[0]) ? title : "New thread");
     t->agent = agent;
     if (model && model[0]) snprintf(t->model, sizeof t->model, "%s", model);
-    t->use_worktree = use_worktree;
     t->auto_approve = auto_approve;
     t->perm_mode = auto_approve ? MCODE_PERM_FULL_ACCESS : MCODE_PERM_ACCEPT_EDITS;
     if (workdir && workdir[0]) snprintf(t->workdir, sizeof t->workdir, "%s", workdir);
@@ -323,7 +322,6 @@ bool mcode_store_load(mcode_store *store, const char *path) {
             if (!p->id[0]) mcode_gen_id(p->id, sizeof p->id, "proj");
             snprintf(p->name, sizeof p->name, "%s", jstr_or(pv, "name", "Project"));
             snprintf(p->path, sizeof p->path, "%s", ppath);
-            snprintf(p->setup_script, sizeof p->setup_script, "%s", jstr_or(pv, "setup_script", ""));
             snprintf(p->default_branch, sizeof p->default_branch, "%s", jstr_or(pv, "default_branch", ""));
             snprintf(p->remote_url, sizeof p->remote_url, "%s", jstr_or(pv, "remote_url", ""));
             p->is_git_repo = jbool_or(pv, "is_git_repo", false);
@@ -372,7 +370,6 @@ bool mcode_store_load(mcode_store *store, const char *path) {
             if (strcmp(spd, "fast") == 0) t->speed_mode = MCODE_SPEED_FAST;
             else if (strcmp(spd, "standard") == 0) t->speed_mode = MCODE_SPEED_STANDARD;
             else t->speed_mode = MCODE_SPEED_DEFAULT;
-            t->use_worktree = jbool_or(tv, "use_worktree", false);
             t->auto_approve = jbool_or(tv, "auto_approve", false);
             const char *pm = jstr_or(tv, "permission_mode", "");
             if (strcmp(pm, "supervised") == 0) {
@@ -499,7 +496,6 @@ bool mcode_store_save(const mcode_store *store, const char *path) {
         yyjson_mut_obj_add_str(doc, po, "id", p->id);
         yyjson_mut_obj_add_str(doc, po, "name", p->name);
         yyjson_mut_obj_add_str(doc, po, "path", p->path);
-        yyjson_mut_obj_add_str(doc, po, "setup_script", p->setup_script);
         yyjson_mut_obj_add_str(doc, po, "default_branch", p->default_branch);
         yyjson_mut_obj_add_str(doc, po, "remote_url", p->remote_url);
         yyjson_mut_obj_add_bool(doc, po, "is_git_repo", p->is_git_repo);
@@ -535,7 +531,6 @@ bool mcode_store_save(const mcode_store *store, const char *path) {
         } else if (t->speed_mode == MCODE_SPEED_STANDARD) {
             yyjson_mut_obj_add_str(doc, to, "speed_mode", "standard");
         }
-        yyjson_mut_obj_add_bool(doc, to, "use_worktree", t->use_worktree);
         yyjson_mut_obj_add_bool(doc, to, "auto_approve", t->perm_mode == MCODE_PERM_FULL_ACCESS);
         const char *pm_str = (t->perm_mode == MCODE_PERM_SUPERVISED) ? "supervised"
                            : (t->perm_mode == MCODE_PERM_FULL_ACCESS) ? "full_access"

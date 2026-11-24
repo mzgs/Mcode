@@ -47,7 +47,7 @@ int main(int argc, char **argv) {
         },
         {
             .id = "project_actions",
-            .title = "Project Quick Actions & Setup...",
+            .title = "Project Quick Actions...",
             .icon = CUI_ICON_SLIDERS_HORIZONTAL,
             .group = "Projects",
             .menu = APP_MENU_FILE,

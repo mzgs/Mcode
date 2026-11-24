@@ -29,14 +29,9 @@ static bool draw_general_section(app_chrome *chrome, cui_ctx *ui, bool compact) 
     }
     cui_box_end(ui);
 
-    if (cui_switch(ui, "Isolate new threads in Git worktrees",
-                   &chrome->settings.mcode.use_worktrees_by_default,
-                   .description = "Create a dedicated branch and worktree under ~/.mcode/worktrees/ for each thread")) {
-        changed = true;
-    }
     if (cui_switch(ui, "Auto-approve agent permissions",
                    &chrome->settings.mcode.auto_approve_permissions,
-                   .description = "Pass unattended execution flags (best used with isolated worktrees)")) {
+                   .description = "Skip interactive permission prompts for unattended execution")) {
         changed = true;
     }
 

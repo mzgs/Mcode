@@ -176,9 +176,6 @@ static bool draw_thread_row(mcode_app *app, cui_ctx *ui, int idx, bool show_proj
             cui_color_of(ui, CUI_COLOR_TEXT_MUTED),
             is_selected ? 0.92f : 0.78f);
         cui_row(ui, .width = CUI_FILL, .pad_left = 21, .gap = 4, .align = CUI_ALIGN_CENTER) {
-            if (t->use_worktree && t->branch[0] && !show_project_name) {
-                cui_icon(ui, CUI_ICON_GIT_BRANCH, 10.0f, cui_alpha(meta_color, 0.85f));
-            }
             cui_text(ui, meta, .size = 11.0f, .color = meta_color,
                      .width = CUI_FILL, .nowrap = true);
         }
@@ -220,7 +217,7 @@ static bool draw_thread_row(mcode_app *app, cui_ctx *ui, int idx, bool show_proj
         if (cui_menu_item(ui, "Refresh Diff", .icon = CUI_ICON_REFRESH_CW)) {
             mcode_ui_refresh_thread_diff(t);
         }
-        if (cui_menu_item(ui, t->use_worktree ? "Delete Thread & Worktree" : "Delete Thread",
+        if (cui_menu_item(ui, "Delete Thread",
                           .icon = CUI_ICON_TRASH_2, .danger = true)) {
             char del_id[MCODE_ID_MAX];
             snprintf(del_id, sizeof del_id, "%s", t->id);
@@ -363,7 +360,7 @@ static bool draw_project_section(mcode_app *app, cui_ctx *ui, int proj_idx, bool
                         app_chrome_notify(app->chrome, ui, "Could not open folder.", CUI_TONE_DANGER);
                     }
                 }
-                if (cui_menu_item(ui, "Setup & Quick Actions...", .icon = CUI_ICON_SQUARE_TERMINAL)) {
+                if (cui_menu_item(ui, "Quick Actions...", .icon = CUI_ICON_SQUARE_TERMINAL)) {
                     mcode_ui_open_project_actions_for(app, ui, proj_id);
                 }
                 if (!p->is_git_repo) {

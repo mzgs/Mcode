@@ -55,7 +55,6 @@ typedef struct {
     /* Mcode agent & workflow preferences. */
     struct {
         app_agent_kind default_agent;
-        bool use_worktrees_by_default;
         bool auto_approve_permissions;
         char claude_bin[APP_CLI_PATH_MAX];
         char codex_bin[APP_CLI_PATH_MAX];

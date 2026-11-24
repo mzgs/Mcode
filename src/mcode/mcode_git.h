@@ -13,9 +13,6 @@ bool mcode_git_inspect_repo(const char *dir, bool *is_repo,
 /* Initialize a new Git repository in `dir` (`git init`). */
 bool mcode_git_init_repo(const char *dir, char *err, size_t err_cap);
 
-/* True if `dir` is a Git repository with at least one commit (valid HEAD). */
-bool mcode_git_has_commits(const char *dir);
-
 /* Resolve a sensible default parent folder for new/cloned projects (e.g. ~/Developer). */
 void mcode_git_default_projects_dir(char *out, size_t cap);
 
@@ -38,18 +35,6 @@ typedef struct {
 
 /* Discover local Git repositories (1 level deep) in common workspace folders + optional `extra_dir`. */
 int mcode_git_discover_repos(const char *extra_dir, mcode_discovered_repo *out, int max_count);
-
-/* Create an isolated worktree under ~/.mcode/worktrees/<project>-<slug> on branch mcode/<slug>.
- * Writes worktree path and branch name to outputs; on failure writes error message to err. */
-bool mcode_git_create_worktree(const char *repo_path, const char *project_name,
-                               const char *title_or_slug,
-                               char *worktree_out, size_t worktree_cap,
-                               char *branch_out, size_t branch_cap,
-                               char *err, size_t err_cap);
-
-/* Remove a managed Git worktree (force-removes worktree directory). */
-bool mcode_git_remove_worktree(const char *repo_path, const char *worktree_path,
-                               char *err, size_t err_cap);
 
 /* Refresh changed files (`git status --porcelain` + `git diff --numstat`) for a working directory.
  * Caller owns *out_files (freed with free()). */

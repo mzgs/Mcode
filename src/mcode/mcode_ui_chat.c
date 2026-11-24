@@ -518,7 +518,7 @@ static void draw_empty_workspace(mcode_app *app, cui_ctx *ui) {
             }
             cui_secondary(ui,
                 "Orchestrate parallel Claude Code, Codex, and Antigravity CLI threads "
-                "with isolated Git worktrees, inline diff reviews, and an integrated shell.");
+                "with inline diff reviews and an integrated shell.");
 
             /* Detected CLI pills */
             cui_row(ui, .gap = 8, .wrap = true, .align = CUI_ALIGN_CENTER) {
@@ -1624,12 +1624,10 @@ static const char *thread_project_display_name(mcode_app *app, const mcode_threa
     return NULL;
 }
 
-static void draw_composer_options_strip(mcode_app *app, cui_ctx *ui, mcode_thread *thread, bool busy) {
-    const mcode_project *comp_proj = mcode_store_find_project(&app->store, thread->project_id);
+static void draw_composer_options_strip(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
     bool show_missing = !app->cli_status.available[thread->agent];
     bool show_session = (thread->session_id[0] != '\0');
-    bool show_worktree = (thread->turn_count == 0 && !busy && comp_proj && comp_proj->is_git_repo);
-    if (!show_missing && !show_session && !show_worktree) return;
+    if (!show_missing && !show_session) return;
 
     cui_row(ui, .width = CUI_FILL, .gap = 10, .align = CUI_ALIGN_CENTER, .wrap = true) {
         if (show_missing) {
@@ -1641,13 +1639,6 @@ static void draw_composer_options_strip(mcode_app *app, cui_ctx *ui, mcode_threa
             snprintf(sshort, sizeof sshort, "Session %.8s", thread->session_id);
             cui_muted(ui, sshort);
         }
-        cui_spacer(ui);
-        if (show_worktree) {
-            bool wt = thread->use_worktree;
-            if (cui_chip(ui, "Worktree", &wt)) {
-                mcode_ui_toggle_thread_worktree(app, ui, thread);
-            }
-        }
     }
 }
 
@@ -1655,7 +1646,7 @@ static void draw_thread_composer(mcode_app *app, cui_ctx *ui, mcode_thread *thre
     bool busy = (thread->active_run != NULL);
 
     if (!centered) {
-        draw_composer_options_strip(app, ui, thread, busy);
+        draw_composer_options_strip(app, ui, thread);
     }
 
     static const char *const k_first_placeholders[APP_AGENT_COUNT] = {
@@ -1693,7 +1684,7 @@ static void draw_thread_composer(mcode_app *app, cui_ctx *ui, mcode_thread *thre
     }
 
     if (centered) {
-        draw_composer_options_strip(app, ui, thread, busy);
+        draw_composer_options_strip(app, ui, thread);
     }
 
     if (ev & CUI_COMPOSER_ATTACH) {

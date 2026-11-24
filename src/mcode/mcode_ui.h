@@ -87,7 +87,6 @@ typedef struct {
     char new_thread_title[MCODE_NAME_MAX];
     char new_thread_model[APP_MODEL_NAME_MAX];
     bool new_thread_custom_model;
-    bool new_thread_worktree;
     bool new_thread_auto_approve;
 
     /* Commit / PR dialog state */
@@ -97,7 +96,7 @@ typedef struct {
     char pr_title[160];
     char pr_body[2048];
 
-    /* Project Quick Actions & Worktree Setup dialog */
+    /* Project Quick Actions dialog */
     bool actions_dialog_open;
     char actions_project_id[MCODE_ID_MAX];
     char qa_new_name[64];

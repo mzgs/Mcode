@@ -41,7 +41,6 @@ typedef struct {
     char id[MCODE_ID_MAX];
     char name[MCODE_NAME_MAX];
     char path[MCODE_PATH_MAX];
-    char setup_script[MCODE_CMD_MAX];
     char default_branch[MCODE_BRANCH_MAX];
     char remote_url[512];
     bool is_git_repo;
@@ -148,7 +147,6 @@ typedef struct {
     char reasoning_effort[32];
     mcode_speed_mode speed_mode;
     mcode_permission_mode perm_mode;
-    bool use_worktree;
     bool auto_approve;
     char workdir[MCODE_PATH_MAX];
     char branch[MCODE_BRANCH_MAX];
@@ -191,8 +189,6 @@ double mcode_now_mono(void);
 int64_t mcode_now_epoch(void);
 /* Generate a short unique hex ID. */
 void mcode_gen_id(char *out, size_t cap, const char *prefix);
-/* Slugify a title for git branch/worktree names. */
-void mcode_slugify(const char *input, char *out, size_t cap);
 
 /* Helper constructors / destructors for turns and blocks. */
 mcode_turn *mcode_thread_add_turn(mcode_thread *thread, const char *prompt);

@@ -26,7 +26,6 @@ const char *const chrome_section_icons[SETTINGS_SECTION_COUNT] = {
 static const app_settings k_default_settings = {
     .mcode = {
         .default_agent = APP_AGENT_CLAUDE,
-        .use_worktrees_by_default = true,
         .auto_approve_permissions = false,
         .claude_bin = "claude",
         .codex_bin = "codex",

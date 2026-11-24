@@ -453,11 +453,6 @@ bool app_settings_load(app_settings *settings, const char *override) {
     if (yyjson_is_obj(mcode)) {
         if (parse_agent_kind(yyjson_obj_get(mcode, "default_agent"), &loaded.mcode.default_agent))
             applied = true;
-        yyjson_val *wt = yyjson_obj_get(mcode, "use_worktrees_by_default");
-        if (yyjson_is_bool(wt)) {
-            loaded.mcode.use_worktrees_by_default = yyjson_get_bool(wt);
-            applied = true;
-        }
         yyjson_val *aa = yyjson_obj_get(mcode, "auto_approve_permissions");
         if (yyjson_is_bool(aa)) {
             loaded.mcode.auto_approve_permissions = yyjson_get_bool(aa);
@@ -616,7 +611,6 @@ bool app_settings_save(const app_settings *settings, const char *override) {
     yyjson_mut_val *mcode = root ? yyjson_mut_obj(doc) : NULL;
     bool ok = root && mcode &&
         yyjson_mut_obj_add_str(doc, mcode, "default_agent", agent_name) &&
-        yyjson_mut_obj_add_bool(doc, mcode, "use_worktrees_by_default", settings->mcode.use_worktrees_by_default) &&
         yyjson_mut_obj_add_bool(doc, mcode, "auto_approve_permissions", settings->mcode.auto_approve_permissions) &&
         yyjson_mut_obj_add_str(doc, mcode, "claude_bin", settings->mcode.claude_bin) &&
         yyjson_mut_obj_add_str(doc, mcode, "codex_bin", settings->mcode.codex_bin) &&

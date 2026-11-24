@@ -100,29 +100,6 @@ void mcode_gen_id(char *out, size_t cap, const char *prefix) {
     }
 }
 
-void mcode_slugify(const char *input, char *out, size_t cap) {
-    if (!out || cap == 0) return;
-    out[0] = '\0';
-    if (!input) {
-        snprintf(out, cap, "task");
-        return;
-    }
-    size_t w = 0;
-    bool prev_dash = true;
-    for (const unsigned char *p = (const unsigned char *)input; *p && w + 1 < cap && w < 32; ++p) {
-        if (isalnum(*p)) {
-            out[w++] = (char)tolower(*p);
-            prev_dash = false;
-        } else if (!prev_dash) {
-            out[w++] = '-';
-            prev_dash = true;
-        }
-    }
-    while (w > 0 && out[w - 1] == '-') --w;
-    out[w] = '\0';
-    if (w == 0) snprintf(out, cap, "task");
-}
-
 mcode_turn *mcode_thread_add_turn(mcode_thread *thread, const char *prompt) {
     if (!thread) return NULL;
     if (thread->turn_count >= thread->turn_cap) {

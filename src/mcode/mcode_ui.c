@@ -162,15 +162,6 @@ static void discard_draft_threads(mcode_app *app, const char *keep_id) {
             t->is_draft = false;
             continue;
         }
-        if (t->use_worktree && t->workdir[0]) {
-            mcode_project *p = mcode_store_find_project(&app->store, t->project_id);
-            if (p && p->is_git_repo && strcmp(p->path, t->workdir) != 0) {
-                char err[256] = "";
-                if (!mcode_git_remove_worktree(p->path, t->workdir, err, sizeof err)) {
-                    app_log_warn("Could not remove unused draft worktree %s: %s", t->workdir, err);
-                }
-            }
-        }
         char tid[MCODE_ID_MAX];
         snprintf(tid, sizeof tid, "%s", t->id);
         mcode_store_remove_thread(&app->store, tid);
@@ -586,7 +577,7 @@ void mcode_ui_cancel_clone(mcode_app *app) {
 
 mcode_thread *mcode_ui_create_thread(mcode_app *app, cui_ctx *ui, mcode_project *proj,
                                      const char *title, app_agent_kind agent,
-                                     const char *model, bool use_worktree, bool auto_approve) {
+                                     const char *model, bool auto_approve) {
     (void)ui;
     if (!app || !proj) return NULL;
     const char *final_title = (title && title[0]) ? title : "New thread";
@@ -594,19 +585,11 @@ mcode_thread *mcode_ui_create_thread(mcode_app *app, cui_ctx *ui, mcode_project 
     /* Discard any prior unsent draft before opening a fresh one. */
     discard_draft_threads(app, NULL);
 
-    char workdir[MCODE_PATH_MAX];
-    char branch[MCODE_BRANCH_MAX];
-    snprintf(workdir, sizeof workdir, "%s", proj->path);
-    snprintf(branch, sizeof branch, "%s", proj->default_branch);
-
-    /* Keep new threads as unsent drafts until the first message is sent.
-     * Worktree creation is deferred to mcode_ui_send_prompt() so opening a
-     * new thread never leaves orphan worktrees or saves empty threads. */
-    bool want_worktree = (use_worktree && proj->is_git_repo && mcode_git_has_commits(proj->path));
-
+    /* Keep new threads as unsent drafts until the first message is sent so
+     * opening a new thread never saves empty threads. */
     mcode_thread *t = mcode_store_add_thread(&app->store, proj, final_title,
-                                             agent, model, want_worktree, auto_approve,
-                                             workdir, branch);
+                                             agent, model, auto_approve,
+                                             proj->path, proj->default_branch);
     if (t) {
         t->is_draft = true;
         proj->collapsed = false;
@@ -627,10 +610,9 @@ mcode_thread *mcode_ui_quick_new_thread(mcode_app *app, cui_ctx *ui, mcode_proje
         return sel;
     }
     const app_settings *s = app_chrome_settings(app->chrome);
-    bool use_wt = s && s->mcode.use_worktrees_by_default && proj->is_git_repo;
     bool auto_app = s ? s->mcode.auto_approve_permissions : false;
     app_agent_kind ag = s ? s->mcode.default_agent : APP_AGENT_CLAUDE;
-    return mcode_ui_create_thread(app, ui, proj, "", ag, "", use_wt, auto_app);
+    return mcode_ui_create_thread(app, ui, proj, "", ag, "", auto_app);
 }
 
 void mcode_ui_open_new_thread_dialog(mcode_app *app, const mcode_project *proj) {
@@ -650,62 +632,8 @@ void mcode_ui_open_new_thread_dialog(mcode_app *app, const mcode_project *proj) 
     app->new_thread_title[0] = '\0';
     app->new_thread_model[0] = '\0';
     app->new_thread_custom_model = false;
-    app->new_thread_worktree = s->mcode.use_worktrees_by_default;
     app->new_thread_auto_approve = s->mcode.auto_approve_permissions;
     app->new_thread_open = true;
-}
-
-void mcode_ui_toggle_thread_worktree(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
-    if (!app || !thread || thread->turn_count > 0 || thread->active_run) return;
-    mcode_project *proj = mcode_store_find_project(&app->store, thread->project_id);
-    if (!proj || !proj->is_git_repo) return;
-
-    if (!thread->use_worktree) {
-        if (!mcode_git_has_commits(proj->path)) {
-            if (ui) {
-                app_chrome_notify(app->chrome, ui,
-                                  "Make an initial commit first to use isolated Git worktrees.",
-                                  CUI_TONE_INFO);
-            }
-            return;
-        }
-        if (thread->is_draft) {
-            thread->use_worktree = true;
-            return;
-        }
-        char wt_dir[MCODE_PATH_MAX] = "";
-        char wt_branch[MCODE_BRANCH_MAX] = "";
-        char err[256] = "";
-        if (!mcode_git_create_worktree(proj->path, proj->name, thread->title,
-                                       wt_dir, sizeof wt_dir,
-                                       wt_branch, sizeof wt_branch,
-                                       err, sizeof err)) {
-            if (ui) app_chrome_notify(app->chrome, ui, err[0] ? err : "Could not create worktree.", CUI_TONE_WARNING);
-            return;
-        }
-        snprintf(thread->workdir, sizeof thread->workdir, "%s", wt_dir);
-        snprintf(thread->branch, sizeof thread->branch, "%s", wt_branch);
-        thread->use_worktree = true;
-        if (proj->setup_script[0]) {
-            mcode_ui_run_terminal_cmd(app, ui, proj->setup_script, wt_dir);
-        }
-        mcode_ui_refresh_thread_diff(thread);
-        mcode_ui_mark_dirty(app);
-    } else {
-        if (strcmp(proj->path, thread->workdir) != 0) {
-            char err[256] = "";
-            if (!mcode_git_remove_worktree(proj->path, thread->workdir, err, sizeof err)) {
-                app_log_warn("Could not remove unused worktree %s: %s", thread->workdir, err);
-            }
-        }
-        snprintf(thread->workdir, sizeof thread->workdir, "%s", proj->path);
-        snprintf(thread->branch, sizeof thread->branch, "%s", proj->default_branch);
-        thread->use_worktree = false;
-        if (!thread->is_draft) {
-            mcode_ui_refresh_thread_diff(thread);
-            mcode_ui_mark_dirty(app);
-        }
-    }
 }
 
 void mcode_ui_send_prompt(mcode_app *app, cui_ctx *ui, mcode_thread *thread, const char *prompt) {
@@ -715,55 +643,17 @@ void mcode_ui_send_prompt(mcode_app *app, cui_ctx *ui, mcode_thread *thread, con
     bool should_auto_title = (thread->turn_count == 0 &&
         (strcmp(thread->title, "New thread") == 0 || thread->title[0] == '\0'));
     bool was_draft = thread->is_draft;
-    bool created_worktree_now = false;
-    mcode_project *proj = mcode_store_find_project(&app->store, thread->project_id);
-
-    if (was_draft && thread->use_worktree && proj && proj->is_git_repo &&
-        strcmp(thread->workdir, proj->path) == 0) {
-        if (mcode_git_has_commits(proj->path)) {
-            char wt_dir[MCODE_PATH_MAX] = "";
-            char wt_branch[MCODE_BRANCH_MAX] = "";
-            char wt_err[256] = "";
-            const char *slug_src = (!should_auto_title && thread->title[0]) ? thread->title : prompt;
-            if (mcode_git_create_worktree(proj->path, proj->name, slug_src,
-                                          wt_dir, sizeof wt_dir,
-                                          wt_branch, sizeof wt_branch,
-                                          wt_err, sizeof wt_err)) {
-                snprintf(thread->workdir, sizeof thread->workdir, "%s", wt_dir);
-                snprintf(thread->branch, sizeof thread->branch, "%s", wt_branch);
-                created_worktree_now = true;
-            } else {
-                thread->use_worktree = false;
-                char msg[320];
-                snprintf(msg, sizeof msg, "Worktree failed (using repo root): %s", wt_err);
-                if (ui) app_chrome_notify(app->chrome, ui, msg, CUI_TONE_WARNING);
-            }
-        } else {
-            thread->use_worktree = false;
-        }
-    }
 
     thread->state = MCODE_THREAD_ACTIVE;
     char err[256] = "";
     const app_settings *settings = app_chrome_settings(app->chrome);
     if (!mcode_agent_start(thread, settings, prompt, err, sizeof err)) {
-        if (created_worktree_now && proj && strcmp(proj->path, thread->workdir) != 0) {
-            char rm_err[256] = "";
-            if (!mcode_git_remove_worktree(proj->path, thread->workdir, rm_err, sizeof rm_err)) {
-                app_log_warn("Could not remove unused worktree %s: %s", thread->workdir, rm_err);
-            }
-            snprintf(thread->workdir, sizeof thread->workdir, "%s", proj->path);
-            snprintf(thread->branch, sizeof thread->branch, "%s", proj->default_branch);
-        }
         if (ui) app_chrome_notify(app->chrome, ui, err[0] ? err : "Could not start agent.", CUI_TONE_DANGER);
     } else {
         if (was_draft) {
             thread->is_draft = false;
             thread->created_at = mcode_now_epoch();
             thread->updated_at = thread->created_at;
-            if (created_worktree_now && proj && proj->setup_script[0]) {
-                mcode_ui_run_terminal_cmd(app, ui, proj->setup_script, thread->workdir);
-            }
             nav_history_push(app, thread->id);
             mcode_ui_refresh_thread_diff(thread);
         }
@@ -815,15 +705,6 @@ void mcode_ui_delete_thread(mcode_app *app, cui_ctx *ui, const char *thread_id) 
     if (t->title_run) {
         mcode_agent_title_destroy(t->title_run);
         t->title_run = NULL;
-    }
-    if (t->use_worktree && t->workdir[0]) {
-        mcode_project *p = mcode_store_find_project(&app->store, t->project_id);
-        if (p && p->is_git_repo && strcmp(p->path, t->workdir) != 0) {
-            char err[256] = "";
-            if (!mcode_git_remove_worktree(p->path, t->workdir, err, sizeof err)) {
-                app_log_warn("Could not remove worktree %s: %s", t->workdir, err);
-            }
-        }
     }
     mcode_store_remove_thread(&app->store, thread_id);
     mcode_thread *next = mcode_store_selected_thread(&app->store);
@@ -1065,7 +946,7 @@ static void draw_status_bar(mcode_app *app, cui_ctx *ui, mcode_thread *thread, i
                 char br[160];
                 snprintf(br, sizeof br, "%s###sb-branch", thread->branch);
                 if (cui_status_bar_item(ui, br, .icon = CUI_ICON_GIT_BRANCH,
-                                        .tooltip = thread->use_worktree ? "Isolated Git worktree branch" : "Repository branch")) {
+                                        .tooltip = "Repository branch")) {
                     mcode_ui_refresh_thread_diff(thread);
                 }
             }
@@ -1442,7 +1323,7 @@ static void draw_topbar_main_segment(mcode_app *app, cui_ctx *ui, mcode_thread *
                                     .align = CUI_ALIGN_CENTER, .wrap = true) {
                                 if (thread->branch[0]) {
                                     cui_badge(ui, thread->branch, .icon = CUI_ICON_GIT_BRANCH,
-                                              .tone = thread->use_worktree ? CUI_TONE_INFO : CUI_TONE_NEUTRAL,
+                                              .tone = CUI_TONE_NEUTRAL,
                                               .size = CUI_SIZE_SM);
                                 }
                                 if (thread->diff_file_count > 0) {
@@ -1504,7 +1385,7 @@ static void draw_topbar_main_segment(mcode_app *app, cui_ctx *ui, mcode_thread *
                         }
                         if (proj) {
                             if (draw_actions_pop_item(ui, "act-qa", CUI_ICON_SLIDERS_HORIZONTAL,
-                                                      "Quick Actions & Setup...", NULL, false)) {
+                                                      "Quick Actions...", NULL, false)) {
                                 mcode_ui_open_project_actions_for(app, ui, proj->id);
                                 close_actions = true;
                             }

@@ -34,7 +34,7 @@ void mcode_ui_draw_terminal(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
             cui_spacer(ui);
 
             if (proj) {
-                if (cui_icon_button(ui, CUI_ICON_PLUS, .tooltip = "Edit Quick Actions & Setup Script")) {
+                if (cui_icon_button(ui, CUI_ICON_PLUS, .tooltip = "Edit Quick Actions")) {
                     mcode_app_action_project_actions(ui, app);
                 }
             }

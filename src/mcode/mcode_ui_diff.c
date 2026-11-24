@@ -50,7 +50,7 @@ void mcode_ui_draw_diff(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
                 if (proj && !proj->is_git_repo) {
                     cui_icon(ui, CUI_ICON_GIT_BRANCH, 24, CUI_COLOR_TEXT_MUTED);
                     cui_text(ui, "Not a Git repository", .font = CUI_FONT_MEDIUM);
-                    cui_muted(ui, "Initialize Git to track agent edits, inspect diffs, and use worktrees.");
+                    cui_muted(ui, "Initialize Git to track agent edits and inspect diffs.");
                     if (cui_button(ui, "Initialize Git Repo", .variant = CUI_BUTTON_PRIMARY,
                                    .size = CUI_SIZE_SM, .icon = CUI_ICON_GIT_BRANCH)) {
                         mcode_ui_init_project_git(app, ui, proj);

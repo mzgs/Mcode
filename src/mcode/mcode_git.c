@@ -111,16 +111,6 @@ bool mcode_git_init_repo(const char *dir, char *err, size_t err_cap) {
     return true;
 }
 
-bool mcode_git_has_commits(const char *dir) {
-    if (!dir || !dir[0]) return false;
-    const char *argv[] = { "git", "rev-parse", "--verify", "HEAD", NULL };
-    int rc = -1;
-    char *out = NULL;
-    bool ran = mcode_proc_run_capture(argv, dir, true, &rc, &out, NULL);
-    free(out);
-    return ran && rc == 0;
-}
-
 static bool path_is_dir(const char *path) {
     if (!path || !path[0]) return false;
     struct stat st;
@@ -402,87 +392,6 @@ int mcode_git_discover_repos(const char *extra_dir, mcode_discovered_repo *out, 
     free(all);
     return ret;
 #endif
-}
-
-bool mcode_git_create_worktree(const char *repo_path, const char *project_name,
-                               const char *title_or_slug,
-                               char *worktree_out, size_t worktree_cap,
-                               char *branch_out, size_t branch_cap,
-                               char *err, size_t err_cap) {
-    if (worktree_out && worktree_cap) worktree_out[0] = '\0';
-    if (branch_out && branch_cap) branch_out[0] = '\0';
-    if (err && err_cap) err[0] = '\0';
-
-    const char *home = getenv("HOME");
-    if (!home || !home[0]) home = "/tmp";
-
-    char base_dir[MCODE_PATH_MAX];
-    snprintf(base_dir, sizeof base_dir, "%s/.mcode/worktrees", home);
-    if (!mkdir_p(base_dir)) {
-        if (err && err_cap) snprintf(err, err_cap, "Could not create ~/.mcode/worktrees directory.");
-        return false;
-    }
-
-    char proj_slug[64];
-    char task_slug[64];
-    char suffix[24];
-    mcode_slugify(project_name && project_name[0] ? project_name : "repo", proj_slug, sizeof proj_slug);
-    mcode_slugify(title_or_slug && title_or_slug[0] ? title_or_slug : "thread", task_slug, sizeof task_slug);
-    mcode_gen_id(suffix, sizeof suffix, "");
-    if (strlen(suffix) > 6) suffix[6] = '\0';
-
-    char wt_path[MCODE_PATH_MAX];
-    char br_name[MCODE_BRANCH_MAX];
-    snprintf(wt_path, sizeof wt_path, "%s/%s-%s-%s", base_dir, proj_slug, task_slug, suffix);
-    snprintf(br_name, sizeof br_name, "mcode/%s-%s", task_slug, suffix);
-
-    const char *argv[] = { "git", "worktree", "add", "-b", br_name, wt_path, NULL };
-    int rc = -1;
-    char *out = NULL;
-    bool ran = mcode_proc_run_capture(argv, repo_path, true, &rc, &out, NULL);
-    if (!ran || rc != 0) {
-        if (err && err_cap) {
-            if (out && out[0]) {
-                trim_trailing(out);
-                snprintf(err, err_cap, "%s", out);
-            } else {
-                snprintf(err, err_cap, "git worktree add failed (exit %d).", rc);
-            }
-        }
-        free(out);
-        return false;
-    }
-    free(out);
-
-    if (worktree_out && worktree_cap) snprintf(worktree_out, worktree_cap, "%s", wt_path);
-    if (branch_out && branch_cap) snprintf(branch_out, branch_cap, "%s", br_name);
-    app_log_info("Created git worktree %s (branch %s)", wt_path, br_name);
-    return true;
-}
-
-bool mcode_git_remove_worktree(const char *repo_path, const char *worktree_path,
-                               char *err, size_t err_cap) {
-    if (err && err_cap) err[0] = '\0';
-    if (!repo_path || !worktree_path || !worktree_path[0]) return false;
-
-    const char *argv[] = { "git", "worktree", "remove", "--force", worktree_path, NULL };
-    int rc = -1;
-    char *out = NULL;
-    bool ran = mcode_proc_run_capture(argv, repo_path, true, &rc, &out, NULL);
-    if (!ran || rc != 0) {
-        if (err && err_cap) {
-            if (out && out[0]) {
-                trim_trailing(out);
-                snprintf(err, err_cap, "%s", out);
-            } else {
-                snprintf(err, err_cap, "git worktree remove failed (exit %d).", rc);
-            }
-        }
-        free(out);
-        return false;
-    }
-    free(out);
-    return true;
 }
 
 static int find_diff_file(mcode_diff_file *files, int count, const char *path) {
