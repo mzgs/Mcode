@@ -50,7 +50,7 @@ static bool draw_thread_card(mcode_app *app, cui_ctx *ui, int idx, bool show_pro
     }
     bool clicked = cui_card_begin(ui, &card_opts);
 
-    /* Top row: live status indicator + title + timer/diff */
+    /* Top row: live status indicator + title + timer */
     cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
         if (needs_review) {
             cui_icon(ui, CUI_ICON_SHIELD, 13, CUI_COLOR_WARNING);
@@ -80,11 +80,6 @@ static bool draw_thread_card(mcode_app *app, cui_ctx *ui, int idx, bool show_pro
             mcode_ui_format_elapsed(secs, elapsed, sizeof elapsed);
             cui_text(ui, elapsed, .font = CUI_FONT_MONO, .size = 11,
                      .color = CUI_COLOR_ACCENT, .tabular = true);
-        } else if (t->total_added > 0 || t->total_removed > 0) {
-            char stat[32];
-            snprintf(stat, sizeof stat, "+%d -%d", t->total_added, t->total_removed);
-            cui_text(ui, stat, .font = CUI_FONT_MONO, .size = 10.5f,
-                     .color = CUI_COLOR_TEXT_MUTED, .tabular = true);
         }
     }
 
@@ -175,7 +170,6 @@ static bool draw_project_section(mcode_app *app, cui_ctx *ui, int proj_idx) {
     bool searching = (app->thread_search[0] != '\0');
     bool proj_name_matches = !searching || contains_icase(p->name, app->thread_search);
 
-    int open_count = 0;
     int matching_open_count = 0;
     int running_count = 0;
     int review_count = 0;
@@ -184,7 +178,6 @@ static bool draw_project_section(mcode_app *app, cui_ctx *ui, int proj_idx) {
         const mcode_thread *t = &app->store.threads[i];
         if (strcmp(t->project_id, proj_id) != 0) continue;
         if (t->state == MCODE_THREAD_SETTLED) continue;
-        ++open_count;
         if (t->active_run) {
             ++running_count;
             if (t->pending_approval.active) ++review_count;
@@ -242,10 +235,6 @@ static bool draw_project_section(mcode_app *app, cui_ctx *ui, int proj_idx) {
                 cui_badge(ui, rlbl, .tone = CUI_TONE_WARNING, .dot = true, .size = CUI_SIZE_SM);
             } else if (running_count > 0) {
                 cui_spinner(ui, 12);
-            } else if (!expanded && open_count > 0) {
-                char cnt[16];
-                snprintf(cnt, sizeof cnt, "%d", open_count);
-                cui_badge(ui, cnt, .size = CUI_SIZE_SM);
             }
             cui_card_end(ui);
 
