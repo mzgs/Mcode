@@ -1,6 +1,7 @@
 #include "mcode_ui_internal.h"
 #include "mcode_files.h"
 #include "mcode_git.h"
+#include "platform.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -245,6 +246,79 @@ static bool draw_commit_menu_item(cui_ctx *ui, const char *id, const char *icon,
     cui_text(ui, label, .size = 12.5f, .color = txt, .width = CUI_FILL, .nowrap = true);
     cui_card_end(ui);
     return clicked && !disabled;
+}
+
+static float context_menu_width(void) {
+#if defined(__APPLE__) || defined(_WIN32)
+    return 168.0f;
+#else
+    return 184.0f;
+#endif
+}
+
+static bool draw_context_menu_item(cui_ctx *ui, const char *id, const char *icon,
+                                   const char *label, bool disabled) {
+    cui_id cid = cui_make_id(ui, id);
+    bool hov = !disabled && rect_contains(cui_get_rect(ui, cid), cui_mouse_pos(ui));
+    cui_color fg = cui_color_of(ui, CUI_COLOR_FOREGROUND);
+    cui_color bg = hov ? cui_alpha(fg, 0.08f) : CUI_RGBA(0x00000001u);
+    cui_color txt = disabled ? CUI_COLOR_TEXT_MUTED : CUI_COLOR_FOREGROUND;
+    cui_color ic = disabled ? CUI_COLOR_TEXT_MUTED : CUI_COLOR_TEXT_SECONDARY;
+
+    bool clicked = cui_card_begin(ui, &(cui_card_opts){
+        .id = id,
+        .dir = CUI_ROW,
+        .align = CUI_ALIGN_CENTER,
+        .width = CUI_FILL,
+        .pad_x = 8,
+        .pad_y = 5,
+        .gap = 7,
+        .hoverable = !disabled,
+        .border = -1.0f,
+        .radius = 5.0f,
+        .bg = bg,
+    });
+    if (icon && icon[0]) {
+        cui_icon(ui, icon, 13.0f, ic);
+    }
+    cui_text(ui, label, .size = 12.0f, .color = txt, .width = CUI_FILL, .nowrap = true);
+    cui_card_end(ui);
+    return clicked && !disabled;
+}
+
+static void draw_context_menu_sep(cui_ctx *ui) {
+    cui_box(ui, .width = CUI_FILL, .pad_x = 4, .pad_y = 2) {
+        cui_separator(ui);
+    }
+}
+
+static void reveal_in_file_manager(mcode_app *app, cui_ctx *ui, const char *full_path) {
+    if (!full_path || !full_path[0]) return;
+    if (!app_reveal_in_file_manager(full_path) && ui) {
+        app_chrome_notify(app->chrome, ui, "Could not show item in file manager.", CUI_TONE_DANGER);
+    }
+}
+
+static void open_file_context_menu(mcode_app *app, cui_ctx *ui, mcode_file_ctx_kind kind,
+                                   int index, bool is_dir, bool is_expanded,
+                                   bool is_staged, bool is_deleted,
+                                   const char *workdir, const char *rel_path) {
+    if (!app || !ui) return;
+    cui_vec2 mp = cui_mouse_pos(ui);
+    app->file_ctx_open = true;
+    app->file_ctx_opened_this_frame = true;
+    app->file_ctx_kind = kind;
+    app->file_ctx_x = mp.x;
+    app->file_ctx_y = mp.y;
+    app->file_ctx_index = index;
+    app->file_ctx_is_dir = is_dir;
+    app->file_ctx_is_expanded = is_expanded;
+    app->file_ctx_is_staged = is_staged;
+    app->file_ctx_is_deleted = is_deleted;
+    snprintf(app->file_ctx_workdir, sizeof app->file_ctx_workdir, "%s",
+             workdir ? workdir : "");
+    snprintf(app->file_ctx_rel_path, sizeof app->file_ctx_rel_path, "%s",
+             rel_path ? rel_path : "");
 }
 
 static void promote_project_for_workdir(mcode_app *app, const char *workdir) {
@@ -646,51 +720,27 @@ static bool draw_change_file_rows(mcode_app *app, cui_ctx *ui, const char *workd
 
             cui_card_end(ui);
 
-            char tip[640];
-            const char *kind_lbl = want_staged ? "Staged" : (f->untracked ? "Untracked" : "Unstaged");
-            if (f->added > 0 || f->removed > 0) {
-                snprintf(tip, sizeof tip, "%s  (%s · +%d -%d)", f->path, kind_lbl, f->added, f->removed);
-            } else {
-                snprintf(tip, sizeof tip, "%s  (%s)", f->path, kind_lbl);
+            bool rclick = cui_last_hovered(ui) && cui_mouse_clicked(ui, CUI_MOUSE_RIGHT);
+            if (!app->file_ctx_open) {
+                char tip[640];
+                const char *kind_lbl = want_staged ? "Staged" : (f->untracked ? "Untracked" : "Unstaged");
+                if (f->added > 0 || f->removed > 0) {
+                    snprintf(tip, sizeof tip, "%s  (%s · +%d -%d)", f->path, kind_lbl, f->added, f->removed);
+                } else {
+                    snprintf(tip, sizeof tip, "%s  (%s)", f->path, kind_lbl);
+                }
+                cui_tooltip(ui, tip);
             }
-            cui_tooltip(ui, tip);
 
             /* Context menu */
             char path_copy[512];
             snprintf(path_copy, sizeof path_copy, "%s", f->path);
             bool is_deleted = (strcmp(f->status, "D") == 0);
 
-            cui_context_menu(ui, "chg-menu") {
-                if (cui_menu_item(ui, "View Diff", .icon = CUI_ICON_LAYERS)) {
-                    mcode_ui_open_diff_file(app, i);
-                }
-                if (!is_deleted && workdir && workdir[0]) {
-                    if (cui_menu_item(ui, "Open File", .icon = CUI_ICON_FILE_TEXT)) {
-                        mcode_ui_open_file_preview(app, ui, workdir, path_copy);
-                    }
-                }
-                cui_menu_separator(ui);
-                if (workdir && workdir[0] &&
-                    cui_menu_item(ui, want_staged ? "Unstage Changes" : "Stage Changes",
-                                  .icon = want_staged ? CUI_ICON_MINUS : CUI_ICON_PLUS)) {
-                    char err[256] = "";
-                    bool ok = want_staged
-                        ? mcode_git_unstage_file(workdir, path_copy, err, sizeof err)
-                        : mcode_git_stage_file(workdir, path_copy, err, sizeof err);
-                    if (ok) {
-                        promote_project_for_workdir(app, workdir);
-                        mcode_ui_refresh_workspace_git(app);
-                        mutated = true;
-                    } else if (err[0]) {
-                        app_chrome_notify(app->chrome, ui, err, CUI_TONE_DANGER);
-                    }
-                }
-                if (workdir && workdir[0] &&
-                    cui_menu_item(ui, "Open Externally", .icon = CUI_ICON_EXTERNAL_LINK)) {
-                    char full[MCODE_PATH_MAX + 512];
-                    snprintf(full, sizeof full, "%s/%s", workdir, path_copy);
-                    cui_app_open_url(full);
-                }
+            if (rclick) {
+                open_file_context_menu(app, ui, MCODE_FILE_CTX_CHANGE,
+                                       i, false, false, want_staged, is_deleted,
+                                       workdir, path_copy);
             }
 
             if (any_hov && workdir && workdir[0]) {
@@ -796,7 +846,8 @@ static void draw_source_control_lists(mcode_app *app, cui_ctx *ui,
     }
 }
 
-static void draw_files_header(mcode_app *app, cui_ctx *ui, const char *project_name) {
+static void draw_files_header(mcode_app *app, cui_ctx *ui, const char *project_name,
+                              const char *workdir) {
     bool dark = (cui_get_theme_mode(ui) == CUI_THEME_DARK);
     cui_color fg = cui_color_of(ui, CUI_COLOR_FOREGROUND);
 
@@ -831,6 +882,12 @@ static void draw_files_header(mcode_app *app, cui_ctx *ui, const char *project_n
                  .font = CUI_FONT_MEDIUM, .size = 12.5f,
                  .color = CUI_COLOR_FOREGROUND, .width = CUI_FILL, .nowrap = true);
         cui_card_end(ui);
+
+        if (cui_last_hovered(ui) && cui_mouse_clicked(ui, CUI_MOUSE_RIGHT)) {
+            open_file_context_menu(app, ui, MCODE_FILE_CTX_FILES_HDR,
+                                   -1, true, app->store.files_expanded, false, false,
+                                   workdir, "");
+        }
 
         if (clicked) {
             app->store.files_expanded = !app->store.files_expanded;
@@ -994,31 +1051,14 @@ static void draw_file_tree_nodes(mcode_app *app, cui_ctx *ui,
 
         cui_card_end(ui);
 
-        cui_tooltip(ui, node.rel_path);
-
-        cui_context_menu(ui, "fs-menu") {
-            if (node.is_dir) {
-                if (cui_menu_item(ui, node.expanded ? "Collapse Folder" : "Expand Folder",
-                                  .icon = node.expanded ? CUI_ICON_CHEVRON_RIGHT
-                                                        : CUI_ICON_CHEVRON_DOWN)) {
-                    mcode_file_tree_toggle(&app->file_tree, idx);
-                }
-            } else {
-                if (cui_menu_item(ui, "Open Preview", .icon = CUI_ICON_FILE_TEXT)) {
-                    mcode_ui_open_file_preview(app, ui, workdir, node.rel_path);
-                }
-                int diff_idx = find_diff_index_for_path(app, node.rel_path);
-                if (diff_idx >= 0 && cui_menu_item(ui, "View Diff", .icon = CUI_ICON_LAYERS)) {
-                    mcode_ui_open_diff_file(app, diff_idx);
-                }
-            }
-            cui_menu_separator(ui);
-            if (workdir && workdir[0] &&
-                cui_menu_item(ui, "Open Externally", .icon = CUI_ICON_EXTERNAL_LINK)) {
-                char full[MCODE_PATH_MAX + 512];
-                snprintf(full, sizeof full, "%s/%s", workdir, node.rel_path);
-                cui_app_open_url(full);
-            }
+        bool rclick = cui_last_hovered(ui) && cui_mouse_clicked(ui, CUI_MOUSE_RIGHT);
+        if (!app->file_ctx_open) {
+            cui_tooltip(ui, node.rel_path);
+        }
+        if (rclick) {
+            open_file_context_menu(app, ui, MCODE_FILE_CTX_TREE,
+                                   idx, node.is_dir, node.expanded, false, false,
+                                   workdir, node.rel_path);
         }
 
         if (clicked) {
@@ -1130,7 +1170,7 @@ void mcode_ui_draw_diff(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
                     /* Lower pane: Project Files Tree */
                     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .bg = bg, .gap = 0) {
                         cui_separator(ui);
-                        draw_files_header(app, ui, proj_name);
+                        draw_files_header(app, ui, proj_name, workdir);
                         draw_files_tree_body(app, ui, workdir);
                     }
                 }
@@ -1148,7 +1188,7 @@ void mcode_ui_draw_diff(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
                     draw_source_control_lists(app, ui, proj, workdir);
                 }
                 cui_separator(ui);
-                draw_files_header(app, ui, proj_name);
+                draw_files_header(app, ui, proj_name, workdir);
             } else if (!any_changes_expanded && files_open) {
                 if (!proj || proj->is_git_repo) {
                     draw_source_control_commit_box(app, ui, thread, proj, workdir);
@@ -1163,7 +1203,7 @@ void mcode_ui_draw_diff(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
                                          &app->store.changes_expanded, false, true);
                 cui_separator(ui);
                 cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .bg = bg, .gap = 0) {
-                    draw_files_header(app, ui, proj_name);
+                    draw_files_header(app, ui, proj_name, workdir);
                     draw_files_tree_body(app, ui, workdir);
                 }
             } else {
@@ -1179,9 +1219,217 @@ void mcode_ui_draw_diff(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
                                          "Changes", unstaged_count,
                                          &app->store.changes_expanded, false, true);
                 cui_separator(ui);
-                draw_files_header(app, ui, proj_name);
+                draw_files_header(app, ui, proj_name, workdir);
             }
         }
+    }
+}
+
+void mcode_ui_draw_file_context_menu(mcode_app *app, cui_ctx *ui) {
+    if (!app || !ui || !app->file_ctx_open) return;
+
+    bool just_opened = app->file_ctx_opened_this_frame;
+    app->file_ctx_opened_this_frame = false;
+
+    cui_id menu_id = cui_make_id(ui, "mcode-file-ctx-menu");
+    cui_rect menu_rect = cui_get_rect(ui, menu_id);
+    cui_vec2 mp = cui_mouse_pos(ui);
+
+    if (!just_opened) {
+        if (cui_key_pressed(ui, CUI_KEY_ESCAPE)) {
+            app->file_ctx_open = false;
+            return;
+        }
+        if ((cui_mouse_clicked(ui, CUI_MOUSE_LEFT) || cui_mouse_clicked(ui, CUI_MOUSE_RIGHT)) &&
+            !rect_contains(menu_rect, mp)) {
+            app->file_ctx_open = false;
+            return;
+        }
+    }
+
+    const char *workdir = app->file_ctx_workdir;
+    const char *rel_path = app->file_ctx_rel_path;
+    bool has_workdir = (workdir[0] != '\0');
+    int tree_diff_idx = -1;
+    if (app->file_ctx_kind == MCODE_FILE_CTX_TREE && !app->file_ctx_is_dir) {
+        tree_diff_idx = find_diff_index_for_path(app, rel_path);
+    }
+
+    int item_count = 0;
+    int sep_count = 0;
+    if (app->file_ctx_kind == MCODE_FILE_CTX_TREE) {
+        item_count = app->file_ctx_is_dir ? 1 : (tree_diff_idx >= 0 ? 2 : 1);
+        if (has_workdir) {
+            item_count += 2;
+            sep_count = 1;
+        }
+    } else if (app->file_ctx_kind == MCODE_FILE_CTX_CHANGE) {
+        item_count = 1 + (!app->file_ctx_is_deleted && has_workdir ? 1 : 0);
+        if (has_workdir) {
+            sep_count = 1;
+            item_count += 1 + (!app->file_ctx_is_deleted ? 2 : 0);
+        }
+    } else if (app->file_ctx_kind == MCODE_FILE_CTX_FILES_HDR) {
+        item_count = 2 + (has_workdir ? 1 : 0);
+        sep_count = has_workdir ? 1 : 0;
+    }
+
+    float w = context_menu_width();
+    float est_h = (!just_opened && menu_rect.h > 0.0f)
+        ? menu_rect.h
+        : ((float)item_count * 26.0f + (float)sep_count * 5.0f + 10.0f);
+
+    cui_rect root_r = cui_get_rect(ui, cui_make_id(ui, "mcode-root-stack"));
+    cui_vec2 vp = cui_app_size(NULL);
+    float origin_x = root_r.w > 0.0f ? root_r.x : 0.0f;
+    float origin_y = root_r.h > 0.0f ? root_r.y : 0.0f;
+    float avail_w = root_r.w > 0.0f ? root_r.w : vp.x;
+    float avail_h = root_r.h > 0.0f ? root_r.h : vp.y;
+
+    float x = app->file_ctx_x - origin_x;
+    float y = app->file_ctx_y - origin_y + 2.0f;
+    if (avail_w > 0.0f && x + w > avail_w - 8.0f) x = avail_w - 8.0f - w;
+    if (x < 8.0f) x = 8.0f;
+    if (avail_h > 0.0f && y + est_h > avail_h - 8.0f) {
+        y = (app->file_ctx_y - origin_y) - est_h - 2.0f;
+    }
+    if (y < 8.0f) y = 8.0f;
+
+    bool dark = (cui_get_theme_mode(ui) == CUI_THEME_DARK);
+    cui_color bdr = dark ? cui_color_of(ui, CUI_COLOR_BORDER)
+                         : cui_alpha(CUI_RGBA(0x000000ffu), 0.10f);
+    bool close_now = false;
+
+    cui_box(ui, .pad_left = x, .pad_top = y) {
+        cui_box(ui, .id = "mcode-file-ctx-menu", .dir = CUI_STACK,
+                .width = CUI_PX(w),
+                .bg = CUI_COLOR_SURFACE_RAISED,
+                .border = 1.0f,
+                .border_color = bdr,
+                .radius = 10.0f,
+                .elevation = CUI_ELEVATION_FLOATING) {
+            (void)cui_canvas(ui, "file-ctx-bg", CUI_FILL, CUI_FILL, NULL, NULL, 0);
+
+            cui_column(ui, .width = CUI_FILL, .pad = 4, .gap = 1) {
+                if (app->file_ctx_kind == MCODE_FILE_CTX_TREE) {
+                    if (app->file_ctx_is_dir) {
+                        if (draw_context_menu_item(ui, "fs-toggle",
+                                                   app->file_ctx_is_expanded ? CUI_ICON_CHEVRON_RIGHT
+                                                                             : CUI_ICON_CHEVRON_DOWN,
+                                                   app->file_ctx_is_expanded ? "Collapse Folder"
+                                                                             : "Expand Folder",
+                                                   false)) {
+                            int idx = app->file_ctx_index;
+                            if (idx >= 0 && idx < app->file_tree.count &&
+                                strcmp(app->file_tree.nodes[idx].rel_path, rel_path) == 0) {
+                                mcode_file_tree_toggle(&app->file_tree, idx);
+                            }
+                            close_now = true;
+                        }
+                    } else {
+                        if (draw_context_menu_item(ui, "fs-preview", CUI_ICON_FILE_TEXT,
+                                                   "Open Preview", false)) {
+                            mcode_ui_open_file_preview(app, ui, workdir, rel_path);
+                            close_now = true;
+                        }
+                        if (tree_diff_idx >= 0 &&
+                            draw_context_menu_item(ui, "fs-diff", CUI_ICON_LAYERS,
+                                                   "View Diff", false)) {
+                            mcode_ui_open_diff_file(app, tree_diff_idx);
+                            close_now = true;
+                        }
+                    }
+                    if (has_workdir) {
+                        draw_context_menu_sep(ui);
+                        if (draw_context_menu_item(ui, "fs-reveal", CUI_ICON_FOLDER_OPEN,
+                                                   app_reveal_in_file_manager_label(), false)) {
+                            char full[MCODE_PATH_MAX + 512];
+                            snprintf(full, sizeof full, "%s/%s", workdir, rel_path);
+                            reveal_in_file_manager(app, ui, full);
+                            close_now = true;
+                        }
+                        if (draw_context_menu_item(ui, "fs-ext", CUI_ICON_EXTERNAL_LINK,
+                                                   "Open Externally", false)) {
+                            char full[MCODE_PATH_MAX + 512];
+                            snprintf(full, sizeof full, "%s/%s", workdir, rel_path);
+                            cui_app_open_url(full);
+                            close_now = true;
+                        }
+                    }
+                } else if (app->file_ctx_kind == MCODE_FILE_CTX_CHANGE) {
+                    if (draw_context_menu_item(ui, "chg-diff", CUI_ICON_LAYERS, "View Diff", false)) {
+                        if (app->file_ctx_index >= 0 && app->file_ctx_index < app->git_file_count) {
+                            mcode_ui_open_diff_file(app, app->file_ctx_index);
+                        }
+                        close_now = true;
+                    }
+                    if (!app->file_ctx_is_deleted && has_workdir) {
+                        if (draw_context_menu_item(ui, "chg-open", CUI_ICON_FILE_TEXT, "Open File", false)) {
+                            mcode_ui_open_file_preview(app, ui, workdir, rel_path);
+                            close_now = true;
+                        }
+                    }
+                    if (has_workdir) {
+                        draw_context_menu_sep(ui);
+                        if (draw_context_menu_item(ui, "chg-stage",
+                                                   app->file_ctx_is_staged ? CUI_ICON_MINUS : CUI_ICON_PLUS,
+                                                   app->file_ctx_is_staged ? "Unstage Changes" : "Stage Changes",
+                                                   false)) {
+                            char err[256] = "";
+                            bool ok = app->file_ctx_is_staged
+                                ? mcode_git_unstage_file(workdir, rel_path, err, sizeof err)
+                                : mcode_git_stage_file(workdir, rel_path, err, sizeof err);
+                            if (ok) {
+                                promote_project_for_workdir(app, workdir);
+                                mcode_ui_refresh_workspace_git(app);
+                            } else if (err[0]) {
+                                app_chrome_notify(app->chrome, ui, err, CUI_TONE_DANGER);
+                            }
+                            close_now = true;
+                        }
+                        if (!app->file_ctx_is_deleted) {
+                            if (draw_context_menu_item(ui, "chg-reveal", CUI_ICON_FOLDER_OPEN,
+                                                       app_reveal_in_file_manager_label(), false)) {
+                                char full[MCODE_PATH_MAX + 512];
+                                snprintf(full, sizeof full, "%s/%s", workdir, rel_path);
+                                reveal_in_file_manager(app, ui, full);
+                                close_now = true;
+                            }
+                            if (draw_context_menu_item(ui, "chg-ext", CUI_ICON_EXTERNAL_LINK,
+                                                       "Open Externally", false)) {
+                                char full[MCODE_PATH_MAX + 512];
+                                snprintf(full, sizeof full, "%s/%s", workdir, rel_path);
+                                cui_app_open_url(full);
+                                close_now = true;
+                            }
+                        }
+                    }
+                } else if (app->file_ctx_kind == MCODE_FILE_CTX_FILES_HDR) {
+                    if (has_workdir) {
+                        if (draw_context_menu_item(ui, "exp-hdr-reveal", CUI_ICON_FOLDER_OPEN,
+                                                   app_reveal_in_file_manager_label(), false)) {
+                            reveal_in_file_manager(app, ui, workdir);
+                            close_now = true;
+                        }
+                        draw_context_menu_sep(ui);
+                    }
+                    if (draw_context_menu_item(ui, "exp-hdr-col", CUI_ICON_MINIMIZE_2,
+                                               "Collapse All", false)) {
+                        mcode_file_tree_collapse_all(&app->file_tree);
+                        close_now = true;
+                    }
+                    if (draw_context_menu_item(ui, "exp-hdr-ref", CUI_ICON_REFRESH_CW,
+                                               "Refresh", false)) {
+                        mcode_ui_refresh_workspace_git(app);
+                        close_now = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if (close_now) {
+        app->file_ctx_open = false;
     }
 }
 

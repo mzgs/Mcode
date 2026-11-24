@@ -52,6 +52,7 @@ void mcode_ui_draw_sidebar(mcode_app *app, cui_ctx *ui);
 void mcode_ui_draw_chat(mcode_app *app, cui_ctx *ui, mcode_thread *thread);
 void mcode_ui_draw_workspace_main(mcode_app *app, cui_ctx *ui, mcode_thread *thread);
 void mcode_ui_draw_diff(mcode_app *app, cui_ctx *ui, mcode_thread *thread);
+void mcode_ui_draw_file_context_menu(mcode_app *app, cui_ctx *ui);
 void mcode_ui_draw_terminal(mcode_app *app, cui_ctx *ui, mcode_thread *thread);
 void mcode_ui_draw_dialogs(mcode_app *app, cui_ctx *ui);
 

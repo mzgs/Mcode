@@ -8,6 +8,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <windows.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <wchar.h>
 #include <winhttp.h>
 
 int app_system_dark(void) {
@@ -36,6 +39,44 @@ bool app_os_info(char *out, size_t capacity) {
 #endif
     int n = snprintf(out, capacity, "Windows (%s)", arch);
     return n > 0 && (size_t)n < capacity;
+}
+
+const char *app_reveal_in_file_manager_label(void) {
+    return "Show in Explorer";
+}
+
+bool app_reveal_in_file_manager(const char *path) {
+    if (!path || !path[0]) return false;
+    wchar_t wide[4096];
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wide,
+                            (int)(sizeof wide / sizeof wide[0])) <= 0) {
+        return false;
+    }
+    for (wchar_t *p = wide; *p; ++p) {
+        if (*p == L'/') *p = L'\\';
+    }
+    if (GetFileAttributesW(wide) == INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+
+    HRESULT com_hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    bool com_inited = (com_hr == S_OK || com_hr == S_FALSE);
+    bool ok = false;
+    PIDLIST_ABSOLUTE pidl = ILCreateFromPathW(wide);
+    if (pidl) {
+        ok = SUCCEEDED(SHOpenFolderAndSelectItems(pidl, 0, NULL, 0));
+        ILFree(pidl);
+    }
+    if (com_inited) {
+        CoUninitialize();
+    }
+    if (!ok) {
+        wchar_t params[4128];
+        if (swprintf(params, sizeof params / sizeof params[0], L"/select,\"%ls\"", wide) > 0) {
+            ok = (INT_PTR)ShellExecuteW(NULL, L"open", L"explorer.exe", params, NULL, SW_SHOWNORMAL) > 32;
+        }
+    }
+    return ok;
 }
 
 typedef HRESULT (WINAPI *PFN_DwmSetWindowAttribute)(HWND, DWORD, LPCVOID, DWORD);

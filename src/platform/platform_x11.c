@@ -668,3 +668,71 @@ bool app_updater_install_release(const char *repo, const char *tag,
     linux_remove_tree(tmp_dir);
     return ok;
 }
+
+const char *app_reveal_in_file_manager_label(void) {
+    return "Show in File Manager";
+}
+
+static bool linux_file_uri_encode(const char *path, char *out, size_t cap) {
+    static const char hex[] = "0123456789ABCDEF";
+    if (!path || !path[0] || !out || cap < 10) return false;
+    size_t o = (size_t)snprintf(out, cap, "file://");
+    if (o >= cap) return false;
+    for (const unsigned char *p = (const unsigned char *)path; *p; ++p) {
+        unsigned char c = *p;
+        bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                    (c >= '0' && c <= '9') || c == '/' || c == '-' ||
+                    c == '_' || c == '.' || c == '~';
+        if (safe) {
+            if (o + 1 >= cap) return false;
+            out[o++] = (char)c;
+        } else {
+            if (o + 3 >= cap) return false;
+            out[o++] = '%';
+            out[o++] = hex[c >> 4];
+            out[o++] = hex[c & 0x0F];
+        }
+    }
+    out[o] = '\0';
+    return true;
+}
+
+bool app_reveal_in_file_manager(const char *path) {
+    if (!path || !path[0]) return false;
+    struct stat st;
+    if (lstat(path, &st) != 0) return false;
+
+    char resolved[PATH_MAX];
+    const char *abs_path = realpath(path, resolved) ? resolved : path;
+
+    char uri[PATH_MAX * 3 + 16];
+    char arg_uri[PATH_MAX * 3 + 32];
+    if (linux_file_uri_encode(abs_path, uri, sizeof uri) &&
+        snprintf(arg_uri, sizeof arg_uri, "array:string:%s", uri) < (int)sizeof arg_uri) {
+        char *argv[] = {
+            "dbus-send", "--session", "--print-reply", "--reply-timeout=800",
+            "--dest=org.freedesktop.FileManager1",
+            "/org/freedesktop/FileManager1",
+            "org.freedesktop.FileManager1.ShowItems",
+            arg_uri, "string:", NULL
+        };
+        if (linux_run_process(argv, NULL, 0, NULL, NULL, NULL, NULL, NULL, 0)) {
+            return true;
+        }
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+        return cui_app_open_url(abs_path);
+    }
+    const char *slash = strrchr(abs_path, '/');
+    if (slash && slash > abs_path) {
+        char parent[PATH_MAX];
+        size_t plen = (size_t)(slash - abs_path);
+        if (plen < sizeof parent) {
+            memcpy(parent, abs_path, plen);
+            parent[plen] = '\0';
+            return cui_app_open_url(parent);
+        }
+    }
+    return cui_app_open_url("/");
+}

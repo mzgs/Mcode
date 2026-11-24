@@ -1723,38 +1723,42 @@ void mcode_app_frame(mcode_app *app, cui_ctx *ui) {
     app_chrome_set_action_enabled(app->chrome, "create_pr", thread != NULL);
     app_chrome_set_action_enabled(app->chrome, "refresh_diff", thread != NULL);
 
-    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0) {
-        cui_box(ui, .width = CUI_FILL, .height = CUI_FILL) {
-            if (app->store.show_sidebar) {
-                cui_color sidebar_bg = (cui_get_theme_mode(ui) == CUI_THEME_DARK)
-                    ? CUI_RGBA(0x000000ffu)
-                    : CUI_COLOR_SURFACE_MUTED;
-                cui_split(ui, "mcode-main-split", &app->store.sidebar_ratio,
-                          .min_first = 248, .min_second = 420,
-                          .width = CUI_FILL, .height = CUI_FILL) {
-                    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
-                               .bg = sidebar_bg, .gap = 0) {
-                        draw_topbar_left_controls(app, ui, true);
-                        cui_separator(ui);
-                        mcode_ui_draw_sidebar(app, ui);
-                    }
-                    cui_split_next(ui);
+    cui_box(ui, .id = "mcode-root-stack", .dir = CUI_STACK, .width = CUI_FILL, .height = CUI_FILL) {
+        cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0) {
+            cui_box(ui, .width = CUI_FILL, .height = CUI_FILL) {
+                if (app->store.show_sidebar) {
+                    cui_color sidebar_bg = (cui_get_theme_mode(ui) == CUI_THEME_DARK)
+                        ? CUI_RGBA(0x000000ffu)
+                        : CUI_COLOR_SURFACE_MUTED;
+                    cui_split(ui, "mcode-main-split", &app->store.sidebar_ratio,
+                              .min_first = 248, .min_second = 420,
+                              .width = CUI_FILL, .height = CUI_FILL) {
+                        cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
+                                   .bg = sidebar_bg, .gap = 0) {
+                            draw_topbar_left_controls(app, ui, true);
+                            cui_separator(ui);
+                            mcode_ui_draw_sidebar(app, ui);
+                        }
+                        cui_split_next(ui);
 
+                        cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0) {
+                            draw_topbar_main_segment(app, ui, thread, false);
+                            cui_separator(ui);
+                            draw_main_workspace_body(app, ui, thread);
+                        }
+                    }
+                } else {
                     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0) {
-                        draw_topbar_main_segment(app, ui, thread, false);
+                        draw_topbar_main_segment(app, ui, thread, true);
                         cui_separator(ui);
                         draw_main_workspace_body(app, ui, thread);
                     }
                 }
-            } else {
-                cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0) {
-                    draw_topbar_main_segment(app, ui, thread, true);
-                    cui_separator(ui);
-                    draw_main_workspace_body(app, ui, thread);
-                }
             }
+            draw_status_bar(app, ui, thread, running_count);
         }
-        draw_status_bar(app, ui, thread, running_count);
+
+        mcode_ui_draw_file_context_menu(app, ui);
     }
 
     mcode_ui_draw_dialogs(app, ui);

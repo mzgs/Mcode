@@ -27,6 +27,13 @@ typedef enum {
     MCODE_INSPECTOR_FILE,
 } mcode_inspector_mode;
 
+typedef enum {
+    MCODE_FILE_CTX_NONE = 0,
+    MCODE_FILE_CTX_TREE,
+    MCODE_FILE_CTX_CHANGE,
+    MCODE_FILE_CTX_FILES_HDR,
+} mcode_file_ctx_kind;
+
 typedef struct {
     app_chrome *chrome;
     mcode_store store;
@@ -131,6 +138,20 @@ typedef struct {
     bool preview_is_binary;
     bool preview_truncated;
     int64_t preview_file_size;
+
+    /* Compact mouse-positioned context menu for file browser & changes list */
+    bool file_ctx_open;
+    bool file_ctx_opened_this_frame;
+    mcode_file_ctx_kind file_ctx_kind;
+    float file_ctx_x;
+    float file_ctx_y;
+    int file_ctx_index;
+    bool file_ctx_is_dir;
+    bool file_ctx_is_expanded;
+    bool file_ctx_is_staged;
+    bool file_ctx_is_deleted;
+    char file_ctx_workdir[MCODE_PATH_MAX];
+    char file_ctx_rel_path[512];
 
     /* Project Quick Actions dialog */
     bool actions_dialog_open;

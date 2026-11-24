@@ -453,6 +453,26 @@ bool app_os_info(char *out, size_t capacity) {
     }
 }
 
+const char *app_reveal_in_file_manager_label(void) {
+    return "Show in Finder";
+}
+
+bool app_reveal_in_file_manager(const char *path) {
+    if (!path || !path[0]) return false;
+    @autoreleasepool {
+        NSString *nsPath = [NSString stringWithUTF8String:path];
+        if (!nsPath.length) return false;
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:nsPath] && ![fm attributesOfItemAtPath:nsPath error:nil]) {
+            return false;
+        }
+        NSURL *url = [NSURL fileURLWithPath:nsPath];
+        if (!url) return false;
+        [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[ url ]];
+        return true;
+    }
+}
+
 static bool macos_url_fetch(NSURL *url, NSString *destPath,
                             NSTimeInterval reqTimeout, NSTimeInterval resTimeout,
                             app_updater_abort_fn should_abort, void *abort_user,

@@ -15,6 +15,13 @@ int app_system_dark(void);
 /* Human-readable OS and architecture summary (e.g. "macOS 15.3.1 (arm64)"). */
 bool app_os_info(char *out, size_t capacity);
 
+/* Platform-appropriate label for revealing a file/folder in the OS file manager
+ * (e.g. "Show in Finder", "Show in Explorer", "Show in File Manager"). */
+const char *app_reveal_in_file_manager_label(void);
+
+/* Reveal and select `path` in the OS file manager. */
+bool app_reveal_in_file_manager(const char *path);
+
 /* Native window helpers (backend is cui_app_backend(NULL)). */
 bool app_window_is_normal(void *native_window, const char *backend);
 bool app_window_get_pos(void *native_window, const char *backend, int *x, int *y);
