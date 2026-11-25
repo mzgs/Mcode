@@ -1770,7 +1770,6 @@ void mcode_ui_draw_chat(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
             }
 
             /* Composer dock */
-            cui_separator(ui);
             cui_row(ui, .width = CUI_FILL, .justify = CUI_JUSTIFY_CENTER, .pad_x = 16, .pad_y = 12) {
                 cui_column(ui, .width = CUI_FILL, .max_width = 860, .gap = 8) {
                     draw_thread_composer(app, ui, thread, false);

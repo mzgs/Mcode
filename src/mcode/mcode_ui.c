@@ -1448,8 +1448,153 @@ static bool draw_actions_pop_item(cui_ctx *ui, const char *id, const char *icon,
     return clicked;
 }
 
+static void draw_topbar_right_controls(mcode_app *app, cui_ctx *ui, mcode_thread *thread,
+                                       bool fill_width) {
+    mcode_project *proj = thread ? mcode_store_find_project(&app->store, thread->project_id) : NULL;
+    if (!proj && app->store.selected_project_id[0]) {
+        proj = mcode_store_find_project(&app->store, app->store.selected_project_id);
+    }
+
+    cui_row(ui, .width = fill_width ? CUI_FILL : CUI_FIT, .height = CUI_PX(40),
+            .pad_left = fill_width ? 8 : 0,
+            .pad_right = fill_width ? 10 : 0,
+            .gap = 4, .align = CUI_ALIGN_CENTER) {
+        if (fill_width) {
+            handle_topbar_drag_zone(app, ui, "tb-drag-right", CUI_FILL);
+        }
+
+        bool actions_open = cui_popover_is_open(ui, "topbar-actions-pop");
+        if (draw_topbar_icon_btn(ui, "tb-actions", TOPBAR_ICON_ACTIONS, actions_open,
+                                 thread ? "Thread & Git Actions" : "Workspace Actions", NULL)) {
+            cui_popover_toggle(ui, "topbar-actions-pop");
+        }
+
+        bool close_actions = false;
+        cui_popover(ui, "topbar-actions-pop", .placement = CUI_PLACE_BOTTOM_END,
+                    .width = 252, .pad = 6, .gap = 2) {
+            cui_column(ui, .width = CUI_FILL, .gap = 2) {
+                if (thread) {
+                    if (thread->branch[0] || thread->diff_file_count > 0) {
+                        cui_row(ui, .width = CUI_FILL, .pad_x = 9, .pad_y = 6, .gap = 6,
+                                .align = CUI_ALIGN_CENTER, .wrap = true) {
+                            if (thread->branch[0]) {
+                                cui_badge(ui, thread->branch, .icon = CUI_ICON_GIT_BRANCH,
+                                          .tone = CUI_TONE_NEUTRAL,
+                                          .size = CUI_SIZE_SM);
+                            }
+                            if (thread->diff_file_count > 0) {
+                                char dstat[48];
+                                snprintf(dstat, sizeof dstat, "+%d -%d",
+                                         thread->total_added, thread->total_removed);
+                                cui_text(ui, dstat, .font = CUI_FONT_MONO, .size = 11.0f,
+                                         .color = CUI_COLOR_TEXT_MUTED, .tabular = true);
+                            }
+                        }
+                        cui_separator(ui);
+                    }
+
+                    if (proj && proj->is_git_repo) {
+                        if (draw_actions_pop_item(ui, "act-commit", CUI_ICON_CHECK,
+                                                  "Commit Changes...", "Cmd Shift C", false)) {
+                            mcode_app_action_commit(ui, app);
+                            close_actions = true;
+                        }
+                        if (draw_actions_pop_item(ui, "act-pr", CUI_ICON_ARROW_UP_RIGHT,
+                                                  "Push & Create PR...", "Cmd Shift P", false)) {
+                            mcode_app_action_create_pr(ui, app);
+                            close_actions = true;
+                        }
+                        if (draw_actions_pop_item(ui, "act-rdiff", CUI_ICON_REFRESH_CW,
+                                                  "Refresh Diff", "Cmd R", false)) {
+                            mcode_app_action_refresh_diff(ui, app);
+                            close_actions = true;
+                        }
+                    } else if (proj && !proj->is_git_repo) {
+                        if (draw_actions_pop_item(ui, "act-init-git", CUI_ICON_GIT_BRANCH,
+                                                  "Initialize Git Repository", NULL, false)) {
+                            char pid[MCODE_ID_MAX];
+                            snprintf(pid, sizeof pid, "%s", proj->id);
+                            mcode_ui_init_project_git(app, ui, proj);
+                            proj = mcode_store_find_project(&app->store, pid);
+                            close_actions = true;
+                        }
+                    }
+
+                    if (draw_actions_pop_item(ui, "act-finder", CUI_ICON_FOLDER_OPEN,
+                                              "Open Folder in Finder", "Cmd Shift F", false)) {
+                        mcode_app_action_open_folder(ui, app);
+                        close_actions = true;
+                    }
+                    if (!thread->is_draft) {
+                        if (thread->state != MCODE_THREAD_SETTLED) {
+                            if (draw_actions_pop_item(ui, "act-settle", CUI_ICON_CIRCLE_CHECK,
+                                                      "Mark Thread Settled", NULL, false)) {
+                                thread->state = MCODE_THREAD_SETTLED;
+                                mcode_ui_mark_dirty(app);
+                                close_actions = true;
+                            }
+                        } else {
+                            if (draw_actions_pop_item(ui, "act-reopen", CUI_ICON_INBOX,
+                                                      "Reopen Thread", NULL, false)) {
+                                thread->state = MCODE_THREAD_ACTIVE;
+                                mcode_ui_mark_dirty(app);
+                                close_actions = true;
+                            }
+                        }
+                    }
+                    if (proj) {
+                        if (draw_actions_pop_item(ui, "act-qa", CUI_ICON_SLIDERS_HORIZONTAL,
+                                                  "Quick Actions...", NULL, false)) {
+                            mcode_ui_open_project_actions_for(app, ui, proj->id);
+                            close_actions = true;
+                        }
+                    }
+                    cui_separator(ui);
+                }
+
+                if (draw_actions_pop_item(ui, "act-palette", CUI_ICON_COMMAND,
+                                          "Command Palette...", "Cmd K", false)) {
+                    app->chrome->palette_open = true;
+                    close_actions = true;
+                }
+                if (draw_actions_pop_item(ui, "act-settings", CUI_ICON_SETTINGS,
+                                          "Settings...", "Cmd ,", false)) {
+                    app->chrome->settings_open = true;
+                    app->chrome->settings_section = SETTINGS_SECTION_GENERAL;
+                    close_actions = true;
+                }
+            }
+        }
+        if (close_actions) {
+            cui_popover_close(ui, "topbar-actions-pop");
+        }
+
+        if (draw_topbar_icon_btn(ui, "tb-terminal", TOPBAR_ICON_BOTTOM_PANEL,
+                                 app->store.show_terminal_panel,
+                                 "Toggle Terminal", "Cmd J")) {
+            mcode_app_action_toggle_terminal(ui, app);
+        }
+
+        char diff_tip[80];
+        if (thread && thread->diff_file_count > 0) {
+            snprintf(diff_tip, sizeof diff_tip, "Toggle Changes & Files (%d %s)",
+                     thread->diff_file_count,
+                     thread->diff_file_count == 1 ? "change" : "changes");
+        } else {
+            snprintf(diff_tip, sizeof diff_tip, "Toggle Changes & Files");
+        }
+        bool has_project = (thread != NULL || app->store.project_count > 0);
+        if (draw_topbar_icon_btn(ui, "tb-diff", TOPBAR_ICON_RIGHT_PANEL,
+                                 app->store.show_diff_panel && has_project,
+                                 diff_tip, "Cmd D")) {
+            mcode_app_action_toggle_diff(ui, app);
+        }
+    }
+}
+
 static void draw_topbar_main_segment(mcode_app *app, cui_ctx *ui, mcode_thread *thread,
-                                     bool include_left_controls) {
+                                     bool include_left_controls,
+                                     bool include_right_controls) {
     mcode_project *proj = thread ? mcode_store_find_project(&app->store, thread->project_id) : NULL;
     if (!proj && app->store.selected_project_id[0]) {
         proj = mcode_store_find_project(&app->store, app->store.selected_project_id);
@@ -1457,7 +1602,8 @@ static void draw_topbar_main_segment(mcode_app *app, cui_ctx *ui, mcode_thread *
 
     cui_row(ui, .width = CUI_FILL, .height = CUI_PX(40),
             .bg = CUI_COLOR_BACKGROUND,
-            .pad_left = include_left_controls ? 0 : 14, .pad_right = 10,
+            .pad_left = include_left_controls ? 0 : 14,
+            .pad_right = include_right_controls ? 10 : 8,
             .gap = 0, .align = CUI_ALIGN_CENTER) {
         if (include_left_controls) {
             draw_topbar_left_controls(app, ui, false);
@@ -1512,160 +1658,18 @@ static void draw_topbar_main_segment(mcode_app *app, cui_ctx *ui, mcode_thread *
         /* Draggable empty space */
         handle_topbar_drag_zone(app, ui, "tb-drag-main", CUI_FILL);
 
-        /* Right-side 3-icon cluster: Actions / Terminal / Diff */
-        cui_row(ui, .gap = 4, .align = CUI_ALIGN_CENTER) {
-            bool actions_open = cui_popover_is_open(ui, "topbar-actions-pop");
-            if (draw_topbar_icon_btn(ui, "tb-actions", TOPBAR_ICON_ACTIONS, actions_open,
-                                     thread ? "Thread & Git Actions" : "Workspace Actions", NULL)) {
-                cui_popover_toggle(ui, "topbar-actions-pop");
-            }
-
-            bool close_actions = false;
-            cui_popover(ui, "topbar-actions-pop", .placement = CUI_PLACE_BOTTOM_END,
-                        .width = 252, .pad = 6, .gap = 2) {
-                cui_column(ui, .width = CUI_FILL, .gap = 2) {
-                    if (thread) {
-                        if (thread->branch[0] || thread->diff_file_count > 0) {
-                            cui_row(ui, .width = CUI_FILL, .pad_x = 9, .pad_y = 6, .gap = 6,
-                                    .align = CUI_ALIGN_CENTER, .wrap = true) {
-                                if (thread->branch[0]) {
-                                    cui_badge(ui, thread->branch, .icon = CUI_ICON_GIT_BRANCH,
-                                              .tone = CUI_TONE_NEUTRAL,
-                                              .size = CUI_SIZE_SM);
-                                }
-                                if (thread->diff_file_count > 0) {
-                                    char dstat[48];
-                                    snprintf(dstat, sizeof dstat, "+%d -%d",
-                                             thread->total_added, thread->total_removed);
-                                    cui_text(ui, dstat, .font = CUI_FONT_MONO, .size = 11.0f,
-                                             .color = CUI_COLOR_TEXT_MUTED, .tabular = true);
-                                }
-                            }
-                            cui_separator(ui);
-                        }
-
-                        if (proj && proj->is_git_repo) {
-                            if (draw_actions_pop_item(ui, "act-commit", CUI_ICON_CHECK,
-                                                      "Commit Changes...", "Cmd Shift C", false)) {
-                                mcode_app_action_commit(ui, app);
-                                close_actions = true;
-                            }
-                            if (draw_actions_pop_item(ui, "act-pr", CUI_ICON_ARROW_UP_RIGHT,
-                                                      "Push & Create PR...", "Cmd Shift P", false)) {
-                                mcode_app_action_create_pr(ui, app);
-                                close_actions = true;
-                            }
-                            if (draw_actions_pop_item(ui, "act-rdiff", CUI_ICON_REFRESH_CW,
-                                                      "Refresh Diff", "Cmd R", false)) {
-                                mcode_app_action_refresh_diff(ui, app);
-                                close_actions = true;
-                            }
-                        } else if (proj && !proj->is_git_repo) {
-                            if (draw_actions_pop_item(ui, "act-init-git", CUI_ICON_GIT_BRANCH,
-                                                      "Initialize Git Repository", NULL, false)) {
-                                char pid[MCODE_ID_MAX];
-                                snprintf(pid, sizeof pid, "%s", proj->id);
-                                mcode_ui_init_project_git(app, ui, proj);
-                                proj = mcode_store_find_project(&app->store, pid);
-                                close_actions = true;
-                            }
-                        }
-
-                        if (draw_actions_pop_item(ui, "act-finder", CUI_ICON_FOLDER_OPEN,
-                                                  "Open Folder in Finder", "Cmd Shift F", false)) {
-                            mcode_app_action_open_folder(ui, app);
-                            close_actions = true;
-                        }
-                        if (!thread->is_draft) {
-                            if (thread->state != MCODE_THREAD_SETTLED) {
-                                if (draw_actions_pop_item(ui, "act-settle", CUI_ICON_CIRCLE_CHECK,
-                                                          "Mark Thread Settled", NULL, false)) {
-                                    thread->state = MCODE_THREAD_SETTLED;
-                                    mcode_ui_mark_dirty(app);
-                                    close_actions = true;
-                                }
-                            } else {
-                                if (draw_actions_pop_item(ui, "act-reopen", CUI_ICON_INBOX,
-                                                          "Reopen Thread", NULL, false)) {
-                                    thread->state = MCODE_THREAD_ACTIVE;
-                                    mcode_ui_mark_dirty(app);
-                                    close_actions = true;
-                                }
-                            }
-                        }
-                        if (proj) {
-                            if (draw_actions_pop_item(ui, "act-qa", CUI_ICON_SLIDERS_HORIZONTAL,
-                                                      "Quick Actions...", NULL, false)) {
-                                mcode_ui_open_project_actions_for(app, ui, proj->id);
-                                close_actions = true;
-                            }
-                        }
-                        cui_separator(ui);
-                    }
-
-                    if (draw_actions_pop_item(ui, "act-palette", CUI_ICON_COMMAND,
-                                              "Command Palette...", "Cmd K", false)) {
-                        app->chrome->palette_open = true;
-                        close_actions = true;
-                    }
-                    if (draw_actions_pop_item(ui, "act-settings", CUI_ICON_SETTINGS,
-                                              "Settings...", "Cmd ,", false)) {
-                        app->chrome->settings_open = true;
-                        app->chrome->settings_section = SETTINGS_SECTION_GENERAL;
-                        close_actions = true;
-                    }
-                }
-            }
-            if (close_actions) {
-                cui_popover_close(ui, "topbar-actions-pop");
-            }
-
-            if (draw_topbar_icon_btn(ui, "tb-terminal", TOPBAR_ICON_BOTTOM_PANEL,
-                                     app->store.show_terminal_panel,
-                                     "Toggle Terminal", "Cmd J")) {
-                mcode_app_action_toggle_terminal(ui, app);
-            }
-
-            char diff_tip[80];
-            if (thread && thread->diff_file_count > 0) {
-                snprintf(diff_tip, sizeof diff_tip, "Toggle Changes & Files (%d %s)",
-                         thread->diff_file_count,
-                         thread->diff_file_count == 1 ? "change" : "changes");
-            } else {
-                snprintf(diff_tip, sizeof diff_tip, "Toggle Changes & Files");
-            }
-            bool has_project = (thread != NULL || app->store.project_count > 0);
-            if (draw_topbar_icon_btn(ui, "tb-diff", TOPBAR_ICON_RIGHT_PANEL,
-                                     app->store.show_diff_panel && has_project,
-                                     diff_tip, "Cmd D")) {
-                mcode_app_action_toggle_diff(ui, app);
-            }
+        /* Right-side 3-icon cluster when right sidebar is hidden */
+        if (include_right_controls) {
+            draw_topbar_right_controls(app, ui, thread, false);
         }
     }
 }
 
-static void draw_main_workspace_body(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
-    bool has_project = (thread != NULL || app->store.project_count > 0);
-    if (app->store.show_diff_panel && has_project) {
-        cui_split(ui, "mcode-diff-split", &app->store.diff_ratio,
-                  .min_first = 360, .min_second = 248,
-                  .width = CUI_FILL, .height = CUI_FILL) {
-            if (app->store.show_terminal_panel) {
-                cui_split(ui, "mcode-term-split", &app->store.terminal_ratio,
-                          .vertical = true, .min_first = 220, .min_second = 150,
-                          .width = CUI_FILL, .height = CUI_FILL) {
-                    mcode_ui_draw_workspace_main(app, ui, thread);
-                    cui_split_next(ui);
-                    mcode_ui_draw_terminal(app, ui, thread);
-                }
-            } else {
-                mcode_ui_draw_workspace_main(app, ui, thread);
-            }
-            cui_split_next(ui);
-            mcode_ui_draw_diff(app, ui, thread);
-        }
-    } else if (app->store.show_terminal_panel) {
-        cui_split(ui, "mcode-term-split-wide", &app->store.terminal_ratio,
+static void draw_center_workspace_body(mcode_app *app, cui_ctx *ui, mcode_thread *thread,
+                                       bool diff_visible) {
+    if (app->store.show_terminal_panel) {
+        cui_split(ui, diff_visible ? "mcode-term-split" : "mcode-term-split-wide",
+                  &app->store.terminal_ratio,
                   .vertical = true, .min_first = 220, .min_second = 150,
                   .width = CUI_FILL, .height = CUI_FILL) {
             mcode_ui_draw_workspace_main(app, ui, thread);
@@ -1674,6 +1678,32 @@ static void draw_main_workspace_body(mcode_app *app, cui_ctx *ui, mcode_thread *
         }
     } else {
         mcode_ui_draw_workspace_main(app, ui, thread);
+    }
+}
+
+static void draw_workspace_area(mcode_app *app, cui_ctx *ui, mcode_thread *thread,
+                                bool include_left_controls, cui_color sidebar_bg) {
+    bool has_project = (thread != NULL || app->store.project_count > 0);
+    if (app->store.show_diff_panel && has_project) {
+        cui_split(ui, "mcode-diff-split", &app->store.diff_ratio,
+                  .min_first = 360, .min_second = 248,
+                  .width = CUI_FILL, .height = CUI_FILL) {
+            cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0) {
+                draw_topbar_main_segment(app, ui, thread, include_left_controls, false);
+                draw_center_workspace_body(app, ui, thread, true);
+            }
+            cui_split_next(ui);
+            cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
+                       .bg = sidebar_bg, .gap = 0) {
+                draw_topbar_right_controls(app, ui, thread, true);
+                mcode_ui_draw_diff(app, ui, thread);
+            }
+        }
+    } else {
+        cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0) {
+            draw_topbar_main_segment(app, ui, thread, include_left_controls, true);
+            draw_center_workspace_body(app, ui, thread, false);
+        }
     }
 }
 
@@ -1695,33 +1725,24 @@ void mcode_app_frame(mcode_app *app, cui_ctx *ui) {
     cui_box(ui, .id = "mcode-root-stack", .dir = CUI_STACK, .width = CUI_FILL, .height = CUI_FILL) {
         cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0) {
             cui_box(ui, .width = CUI_FILL, .height = CUI_FILL) {
+                cui_color sidebar_bg = (cui_get_theme_mode(ui) == CUI_THEME_DARK)
+                    ? CUI_RGBA(0x000000ffu)
+                    : CUI_COLOR_SURFACE_MUTED;
                 if (app->store.show_sidebar) {
-                    cui_color sidebar_bg = (cui_get_theme_mode(ui) == CUI_THEME_DARK)
-                        ? CUI_RGBA(0x000000ffu)
-                        : CUI_COLOR_SURFACE_MUTED;
                     cui_split(ui, "mcode-main-split", &app->store.sidebar_ratio,
                               .min_first = 248, .min_second = 420,
                               .width = CUI_FILL, .height = CUI_FILL) {
                         cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
                                    .bg = sidebar_bg, .gap = 0) {
                             draw_topbar_left_controls(app, ui, true);
-                            cui_separator(ui);
                             mcode_ui_draw_sidebar(app, ui);
                         }
                         cui_split_next(ui);
 
-                        cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0) {
-                            draw_topbar_main_segment(app, ui, thread, false);
-                            cui_separator(ui);
-                            draw_main_workspace_body(app, ui, thread);
-                        }
+                        draw_workspace_area(app, ui, thread, false, sidebar_bg);
                     }
                 } else {
-                    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0) {
-                        draw_topbar_main_segment(app, ui, thread, true);
-                        cui_separator(ui);
-                        draw_main_workspace_body(app, ui, thread);
-                    }
+                    draw_workspace_area(app, ui, thread, true, sidebar_bg);
                 }
             }
             draw_status_bar(app, ui, thread, running_count);
