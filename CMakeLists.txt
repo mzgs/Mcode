@@ -45,11 +45,31 @@ find_package(Threads REQUIRED)
 include(FetchContent)
 FetchContent_Declare(cui
     GIT_REPOSITORY https://github.com/mzgs/Better-C-UI.git
-    GIT_TAG 437c279afaeced0c501ed7fbb04b5d64060fffe9)
+    GIT_TAG d5f4bd6f4d4359ca3667e8a848324e0bb05a17d8)
 FetchContent_Declare(yyjson
     GIT_REPOSITORY https://github.com/ibireme/yyjson.git
     GIT_TAG 6447536015f3d600f3d65323b10976103b337ca7)
-FetchContent_MakeAvailable(yyjson)
+FetchContent_Declare(libvterm
+    GIT_REPOSITORY https://github.com/neovim/libvterm.git
+    GIT_TAG 934bc2fbf21800ac3458a499df8820ca5fb45fd3)
+FetchContent_MakeAvailable(yyjson libvterm)
+add_library(vterm STATIC
+    "${libvterm_SOURCE_DIR}/src/encoding.c"
+    "${libvterm_SOURCE_DIR}/src/keyboard.c"
+    "${libvterm_SOURCE_DIR}/src/mouse.c"
+    "${libvterm_SOURCE_DIR}/src/parser.c"
+    "${libvterm_SOURCE_DIR}/src/pen.c"
+    "${libvterm_SOURCE_DIR}/src/screen.c"
+    "${libvterm_SOURCE_DIR}/src/state.c"
+    "${libvterm_SOURCE_DIR}/src/unicode.c"
+    "${libvterm_SOURCE_DIR}/src/vterm.c")
+include(GNUInstallDirs)
+target_include_directories(vterm
+    PUBLIC "$<BUILD_INTERFACE:${libvterm_SOURCE_DIR}/include>"
+    PRIVATE "${libvterm_SOURCE_DIR}/src")
+install(TARGETS vterm EXPORT cuiVTermTargets ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}" EXCLUDE_FROM_ALL)
+add_library(VTerm::VTerm ALIAS vterm)
+set(CUI_VTERM ON CACHE BOOL "" FORCE)
 if(WIN32 AND NOT IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
     # Work around Better-C-UI passing "/" to file(RELATIVE_PATH) on Windows.
     if(CMAKE_INSTALL_LIBDIR)
@@ -132,7 +152,7 @@ add_library(app_mcode STATIC
     src/mcode/mcode_ui_terminal.c
     src/mcode/mcode_ui_dialogs.c)
 target_include_directories(app_mcode PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src/mcode")
-target_link_libraries(app_mcode PUBLIC app_chrome PRIVATE app_common yyjson Threads::Threads)
+target_link_libraries(app_mcode PUBLIC app_chrome cui::vterm PRIVATE app_common yyjson Threads::Threads)
 
 add_executable(empty_gui MACOSX_BUNDLE main.c)
 target_link_libraries(empty_gui PRIVATE app_mcode app_chrome app_common)

@@ -40,6 +40,7 @@ void mcode_ui_send_prompt(mcode_app *app, cui_ctx *ui, mcode_thread *thread, con
 void mcode_ui_stop_thread(mcode_app *app, cui_ctx *ui, mcode_thread *thread);
 void mcode_ui_delete_thread(mcode_app *app, cui_ctx *ui, const char *thread_id);
 
+bool mcode_ui_ensure_terminal(mcode_app *app, const char *cwd);
 void mcode_ui_run_terminal_cmd(mcode_app *app, cui_ctx *ui, const char *cmd, const char *cwd);
 void mcode_ui_stop_terminal(mcode_app *app);
 

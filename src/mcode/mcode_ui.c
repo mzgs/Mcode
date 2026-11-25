@@ -20,11 +20,6 @@
 #include <sys/stat.h>
 #endif
 
-enum {
-    MCODE_TERM_TEXT_CAP = 256 * 1024,
-    MCODE_TERM_LINE_CAP = 4096,
-};
-
 void mcode_ui_format_elapsed(float seconds, char *out, size_t cap) {
     if (!out || cap == 0) return;
     if (seconds < 0.0f) seconds = 0.0f;
@@ -423,53 +418,60 @@ void mcode_ui_select_thread(mcode_app *app, const char *thread_id) {
     if (!t->is_draft) mcode_ui_mark_dirty(app);
 }
 
-static void on_term_bytes(const char *data, size_t len, bool is_stderr, void *user) {
-    (void)is_stderr;
-    mcode_app *app = (mcode_app *)user;
-    pthread_mutex_lock(&app->term_mu);
-    mcode_str_append(&app->term_pending, data, len);
-    pthread_mutex_unlock(&app->term_mu);
-}
-
-static void on_term_exit(int exit_code, bool killed, void *user) {
-    (void)killed;
-    mcode_app *app = (mcode_app *)user;
-    pthread_mutex_lock(&app->term_mu);
-    app->term_exited = true;
-    app->term_exit_code = exit_code;
-    pthread_mutex_unlock(&app->term_mu);
+static void append_shell_quoted(mcode_str *out, const char *s) {
+    if (!out || !s) return;
+#ifdef _WIN32
+    mcode_str_append(out, "\"", 1);
+    for (const char *p = s; *p; ++p) {
+        if (*p == '"') mcode_str_append(out, "\"\"", 2);
+        else mcode_str_append(out, p, 1);
+    }
+    mcode_str_append(out, "\"", 1);
+#else
+    mcode_str_append(out, "'", 1);
+    for (const char *p = s; *p; ++p) {
+        if (*p == '\'') mcode_str_append(out, "'\\''", 4);
+        else mcode_str_append(out, p, 1);
+    }
+    mcode_str_append(out, "'", 1);
+#endif
 }
 
 void mcode_ui_run_terminal_cmd(mcode_app *app, cui_ctx *ui, const char *cmd, const char *cwd) {
     if (!app || !cmd || !cmd[0]) return;
-    if (app->term_proc) {
-        mcode_proc_destroy(app->term_proc);
-        app->term_proc = NULL;
-    }
     app->store.show_terminal_panel = true;
+    app->term_want_focus = true;
     mcode_ui_mark_dirty(app);
 
-    if (cwd && cwd[0]) {
-        cui_terminal_printf(&app->term_buf, "\x1b[2m[%s]\x1b[0m \x1b[36m$ %s\x1b[0m\n", cwd, cmd);
-    } else {
-        cui_terminal_printf(&app->term_buf, "\x1b[36m$ %s\x1b[0m\n", cmd);
+    if (!mcode_ui_ensure_terminal(app, cwd)) {
+        if (ui) app_chrome_notify(app->chrome, ui, "Failed to start integrated terminal.", CUI_TONE_DANGER);
+        return;
     }
 
-    pthread_mutex_lock(&app->term_mu);
-    app->term_exited = false;
-    app->term_exit_code = 0;
-    pthread_mutex_unlock(&app->term_mu);
-
-    app->term_proc = mcode_proc_spawn_shell(cmd, cwd, on_term_bytes, on_term_exit, app);
-    if (!app->term_proc) {
-        cui_terminal_printf(&app->term_buf, "\x1b[31mFailed to spawn command.\x1b[0m\n");
-        if (ui) app_chrome_notify(app->chrome, ui, "Failed to run shell command.", CUI_TONE_DANGER);
+    mcode_str line;
+    mcode_str_init(&line);
+    if (cwd && cwd[0] && strcmp(app->term_cwd, cwd) != 0) {
+#ifdef _WIN32
+        mcode_str_append_cstr(&line, "cd /d ");
+#else
+        mcode_str_append_cstr(&line, "cd ");
+#endif
+        append_shell_quoted(&line, cwd);
+        mcode_str_append_cstr(&line, " && ");
+        snprintf(app->term_cwd, sizeof app->term_cwd, "%s", cwd);
     }
+    mcode_str_append_cstr(&line, cmd);
+    mcode_str_append(&line, "\r", 1);
+
+    cui_vterm_scroll_to_bottom(app->term);
+    cui_vterm_write(app->term, line.data, line.len);
+    mcode_str_free(&line);
+    if (ui) cui_request_redraw(ui);
 }
 
 void mcode_ui_stop_terminal(mcode_app *app) {
-    if (!app || !app->term_proc) return;
-    mcode_proc_stop(app->term_proc);
+    if (!app || !app->term || !cui_vterm_is_running(app->term)) return;
+    cui_vterm_write(app->term, "\x03", 1);
 }
 
 void mcode_ui_refresh_discovered_repos(mcode_app *app) {
@@ -922,17 +924,7 @@ void mcode_app_init(mcode_app *app, app_chrome *chrome) {
     app->staged_expanded = true;
     if (chrome) app->last_focus_generation = chrome->focus_generation;
     app->last_focus_refresh_at = mcode_now_mono();
-    pthread_mutex_init(&app->term_mu, NULL);
     pthread_mutex_init(&app->clone_mu, NULL);
-    mcode_str_init(&app->term_pending);
-
-    app->term_text = calloc(1, MCODE_TERM_TEXT_CAP);
-    app->term_lines = calloc(MCODE_TERM_LINE_CAP, sizeof *app->term_lines);
-    if (app->term_text && app->term_lines) {
-        cui_terminal_init(&app->term_buf, app->term_text, MCODE_TERM_TEXT_CAP,
-                          app->term_lines, MCODE_TERM_LINE_CAP);
-        cui_terminal_printf(&app->term_buf, "\x1b[2mMcode shell ready. Run a command or click a quick action above.\x1b[0m\n");
-    }
 
     char dir[MCODE_PATH_MAX] = "";
     if (chrome && app_settings_dir(dir, sizeof dir, chrome->cli.settings_path, true)) {
@@ -962,9 +954,9 @@ void mcode_app_shutdown(mcode_app *app) {
         mcode_proc_destroy(app->clone_proc);
         app->clone_proc = NULL;
     }
-    if (app->term_proc) {
-        mcode_proc_destroy(app->term_proc);
-        app->term_proc = NULL;
+    if (app->term) {
+        cui_vterm_destroy(app->term);
+        app->term = NULL;
     }
     for (int i = 0; i < app->store.thread_count; ++i) {
         if (app->store.threads[i].active_run) {
@@ -991,13 +983,7 @@ void mcode_app_shutdown(mcode_app *app) {
     free(app->preview_text);
     app->preview_text = NULL;
     app->preview_buf_cap = 0;
-    mcode_str_free(&app->term_pending);
     pthread_mutex_destroy(&app->clone_mu);
-    pthread_mutex_destroy(&app->term_mu);
-    free(app->term_text);
-    free(app->term_lines);
-    app->term_text = NULL;
-    app->term_lines = NULL;
 }
 
 static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_count) {
@@ -1074,29 +1060,10 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
         }
     }
 
-    /* Drain integrated terminal stream */
-    bool term_active = (app->term_proc != NULL);
-    pthread_mutex_lock(&app->term_mu);
-    if (app->term_pending.len > 0) {
-        cui_terminal_write(&app->term_buf, app->term_pending.data, (int)app->term_pending.len);
-        mcode_str_clear(&app->term_pending);
-    }
-    bool texited = app->term_exited;
-    int tcode = app->term_exit_code;
-    app->term_exited = false;
-    pthread_mutex_unlock(&app->term_mu);
-
-    if (texited && app->term_proc) {
-        mcode_proc_destroy(app->term_proc);
-        app->term_proc = NULL;
-        term_active = false;
-        if (tcode == 0) {
-            cui_terminal_printf(&app->term_buf, "\x1b[32m[exit 0]\x1b[0m\n");
-        } else {
-            cui_terminal_printf(&app->term_buf, "\x1b[31m[exit %d]\x1b[0m\n", tcode);
-        }
-        mcode_ui_refresh_workspace_git(app);
-    }
+    /* Drain integrated terminal PTY stream */
+    bool term_dirty = app->term ? cui_vterm_poll(app->term) : false;
+    bool term_visible_running = app->store.show_terminal_panel &&
+                                app->term && cui_vterm_is_running(app->term);
 
     /* Poll async git clone */
     bool clone_active = (app->clone_proc != NULL);
@@ -1129,8 +1096,10 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
     }
 
     bool catalog_updated = mcode_model_catalog_poll(&app->models);
-    if (running > 0 || term_active || clone_active) {
-        cui_request_wakeup(ui, 0.05f);
+    if (term_dirty) {
+        cui_request_redraw(ui);
+    } else if (running > 0 || clone_active || term_visible_running) {
+        cui_request_wakeup(ui, 0.033f);
     } else if (title_running > 0 || app->models.loading_agy) {
         cui_request_wakeup(ui, 0.1f);
     } else if (any_finished || catalog_updated) {
@@ -1809,11 +1778,12 @@ void mcode_app_action_toggle_diff(cui_ctx *ui, void *user) {
 }
 
 void mcode_app_action_toggle_terminal(cui_ctx *ui, void *user) {
-    (void)ui;
     mcode_app *app = (mcode_app *)user;
     if (!app) return;
     app->store.show_terminal_panel = !app->store.show_terminal_panel;
+    app->term_want_focus = app->store.show_terminal_panel;
     mcode_ui_mark_dirty(app);
+    if (ui) cui_request_redraw(ui);
 }
 
 void mcode_app_action_commit(cui_ctx *ui, void *user) {

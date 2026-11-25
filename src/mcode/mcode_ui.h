@@ -7,6 +7,7 @@
 #include "mcode_git.h"
 #include "mcode_proc.h"
 #include "mcode_store.h"
+#include <cui/cui_vterm.h>
 #include <pthread.h>
 #include <stdbool.h>
 
@@ -159,15 +160,14 @@ typedef struct {
     char qa_new_name[64];
     char qa_new_cmd[MCODE_CMD_MAX];
 
-    /* Integrated terminal */
-    char *term_text;
-    cui_terminal_line *term_lines;
-    cui_terminal_buffer term_buf;
-    mcode_proc *term_proc;
-    pthread_mutex_t term_mu;
-    mcode_str term_pending;
-    bool term_exited;
-    int term_exit_code;
+    /* Integrated terminal (Better-C-UI cui::vterm) */
+    cui_vterm_session *term;
+    char term_cwd[MCODE_PATH_MAX];
+    bool term_want_focus;
+    bool term_search_open;
+    bool term_search_want_focus;
+    char term_search_buf[128];
+    char term_search_applied[128];
 } mcode_app;
 
 void mcode_app_init(mcode_app *app, app_chrome *chrome);
