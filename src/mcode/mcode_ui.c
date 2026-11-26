@@ -39,6 +39,14 @@ void mcode_ui_mark_dirty(mcode_app *app) {
     app->state_dirty_since = mcode_now_mono();
 }
 
+void mcode_ui_focus_composer(mcode_app *app, cui_ctx *ui) {
+    if (!app) return;
+    app->composer_want_focus = true;
+    app->term_want_focus = false;
+    app->term_search_want_focus = false;
+    if (ui) cui_request_redraw(ui);
+}
+
 void mcode_ui_promote_project(mcode_app *app, const char *project_id) {
     if (!app || !project_id || !project_id[0]) return;
     bool already_top = (app->store.project_count > 0 &&
@@ -382,7 +390,7 @@ static int nav_history_find_next(mcode_app *app) {
     return -1;
 }
 
-static void nav_history_jump(mcode_app *app, int target_idx) {
+static void nav_history_jump(mcode_app *app, cui_ctx *ui, int target_idx) {
     if (!app || target_idx < 0 || target_idx >= app->nav_count) return;
     char target_id[MCODE_ID_MAX];
     snprintf(target_id, sizeof target_id, "%s", app->nav_history[target_idx]);
@@ -391,11 +399,14 @@ static void nav_history_jump(mcode_app *app, int target_idx) {
     mcode_thread *t = mcode_store_find_thread(&app->store, target_id);
     if (!t) return;
     app->nav_index = target_idx;
+    mcode_ui_focus_composer(app, ui);
     if (!was_selected || strcmp(app->store.selected_thread_id, t->id) != 0) {
         snprintf(app->store.selected_thread_id, sizeof app->store.selected_thread_id, "%s", t->id);
         mcode_ui_close_inspector(app);
         mcode_ui_refresh_workspace_git(app);
         if (!t->is_draft) mcode_ui_mark_dirty(app);
+    } else {
+        app->inspector_showing_chat = true;
     }
 }
 
@@ -407,6 +418,7 @@ void mcode_ui_select_thread(mcode_app *app, const char *thread_id) {
     discard_draft_threads(app, target_id);
     mcode_thread *t = mcode_store_find_thread(&app->store, target_id);
     if (!t) return;
+    mcode_ui_focus_composer(app, NULL);
     if (!t->is_draft) nav_history_push(app, t->id);
     if (was_selected && strcmp(app->store.selected_thread_id, t->id) == 0) {
         app->inspector_showing_chat = true;
@@ -440,6 +452,7 @@ static void append_shell_quoted(mcode_str *out, const char *s) {
 void mcode_ui_run_terminal_cmd(mcode_app *app, cui_ctx *ui, const char *cmd, const char *cwd) {
     if (!app || !cmd || !cmd[0]) return;
     app->store.show_terminal_panel = true;
+    app->composer_want_focus = false;
     app->term_want_focus = true;
     mcode_ui_mark_dirty(app);
 
@@ -777,7 +790,6 @@ void mcode_ui_cancel_clone(mcode_app *app) {
 mcode_thread *mcode_ui_create_thread(mcode_app *app, cui_ctx *ui, mcode_project *proj,
                                      const char *title, app_agent_kind agent,
                                      const char *model, bool auto_approve) {
-    (void)ui;
     if (!app || !proj) return NULL;
     const char *final_title = (title && title[0]) ? title : "New thread";
 
@@ -796,6 +808,7 @@ mcode_thread *mcode_ui_create_thread(mcode_app *app, cui_ctx *ui, mcode_project 
                  "%s", proj->id);
         mcode_ui_close_inspector(app);
         mcode_ui_refresh_workspace_git(app);
+        mcode_ui_focus_composer(app, ui);
     }
     return t;
 }
@@ -807,6 +820,8 @@ mcode_thread *mcode_ui_quick_new_thread(mcode_app *app, cui_ctx *ui, mcode_proje
         proj->collapsed = false;
         snprintf(app->store.selected_project_id, sizeof app->store.selected_project_id,
                  "%s", proj->id);
+        mcode_ui_close_inspector(app);
+        mcode_ui_focus_composer(app, ui);
         return sel;
     }
     const app_settings *s = app_chrome_settings(app->chrome);
@@ -1574,7 +1589,7 @@ static void draw_topbar_left_controls(mcode_app *app, cui_ctx *ui, bool fill_wid
                                 .color = (prev_idx >= 0) ? CUI_COLOR_TEXT_SECONDARY
                                                          : CUI_COLOR_TEXT_MUTED,
                                 .tooltip = "Previous Thread")) {
-                nav_history_jump(app, prev_idx);
+                nav_history_jump(app, ui, prev_idx);
             }
             if (cui_icon_button(ui, CUI_ICON_ARROW_RIGHT, .size = CUI_SIZE_SM,
                                 .variant = CUI_BUTTON_GHOST,
@@ -1583,7 +1598,7 @@ static void draw_topbar_left_controls(mcode_app *app, cui_ctx *ui, bool fill_wid
                                 .color = (next_idx >= 0) ? CUI_COLOR_TEXT_SECONDARY
                                                          : CUI_COLOR_TEXT_MUTED,
                                 .tooltip = "Next Thread")) {
-                nav_history_jump(app, next_idx);
+                nav_history_jump(app, ui, next_idx);
             }
         }
     }
@@ -1785,6 +1800,11 @@ static void draw_topbar_main_segment(mcode_app *app, cui_ctx *ui, mcode_thread *
             .gap = 0, .align = CUI_ALIGN_CENTER) {
         if (include_left_controls) {
             draw_topbar_left_controls(app, ui, false);
+            thread = mcode_store_selected_thread(&app->store);
+            proj = thread ? mcode_store_find_project(&app->store, thread->project_id) : NULL;
+            if (!proj && app->store.selected_project_id[0]) {
+                proj = mcode_store_find_project(&app->store, app->store.selected_project_id);
+            }
             cui_box(ui, .width = CUI_PX(1), .height = CUI_PX(20),
                     .bg = CUI_COLOR_BORDER) {}
             cui_gap(ui, 12);
@@ -1868,11 +1888,13 @@ static void draw_workspace_area(mcode_app *app, cui_ctx *ui, mcode_thread *threa
                   .width = CUI_FILL, .height = CUI_FILL) {
             cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0) {
                 draw_topbar_main_segment(app, ui, thread, include_left_controls, false);
+                thread = mcode_store_selected_thread(&app->store);
                 draw_center_workspace_body(app, ui, thread, true);
             }
             cui_split_next(ui);
             cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
                        .bg = sidebar_bg, .gap = 0) {
+                thread = mcode_store_selected_thread(&app->store);
                 draw_topbar_right_controls(app, ui, thread, true);
                 mcode_ui_draw_diff(app, ui, thread);
             }
@@ -1880,6 +1902,7 @@ static void draw_workspace_area(mcode_app *app, cui_ctx *ui, mcode_thread *threa
     } else {
         cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0) {
             draw_topbar_main_segment(app, ui, thread, include_left_controls, true);
+            thread = mcode_store_selected_thread(&app->store);
             draw_center_workspace_body(app, ui, thread, false);
         }
     }
@@ -1917,12 +1940,14 @@ void mcode_app_frame(mcode_app *app, cui_ctx *ui) {
                         }
                         cui_split_next(ui);
 
+                        thread = mcode_store_selected_thread(&app->store);
                         draw_workspace_area(app, ui, thread, false, sidebar_bg);
                     }
                 } else {
                     draw_workspace_area(app, ui, thread, true, sidebar_bg);
                 }
             }
+            thread = mcode_store_selected_thread(&app->store);
             draw_status_bar(app, ui, thread, running_count);
         }
 
@@ -1980,6 +2005,9 @@ void mcode_app_action_toggle_terminal(cui_ctx *ui, void *user) {
     mcode_app *app = (mcode_app *)user;
     if (!app) return;
     app->store.show_terminal_panel = !app->store.show_terminal_panel;
+    if (app->store.show_terminal_panel) {
+        app->composer_want_focus = false;
+    }
     app->term_want_focus = app->store.show_terminal_panel;
     mcode_ui_mark_dirty(app);
     if (ui) cui_request_redraw(ui);
@@ -2079,10 +2107,10 @@ static void on_palette_clone_project(cui_ctx *ui, void *user) {
 }
 
 static void on_palette_select_thread(cui_ctx *ui, void *user) {
-    (void)ui;
     palette_target *pt = (palette_target *)user;
     if (!pt || !pt->app || pt->index < 0 || pt->index >= pt->app->store.thread_count) return;
     mcode_ui_select_thread(pt->app, pt->app->store.threads[pt->index].id);
+    if (ui) cui_request_redraw(ui);
 }
 
 static void on_palette_run_quick_action(cui_ctx *ui, void *user) {

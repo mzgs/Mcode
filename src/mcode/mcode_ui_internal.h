@@ -4,6 +4,7 @@
 #include "mcode_ui.h"
 
 void mcode_ui_mark_dirty(mcode_app *app);
+void mcode_ui_focus_composer(mcode_app *app, cui_ctx *ui);
 void mcode_ui_select_thread(mcode_app *app, const char *thread_id);
 void mcode_ui_refresh_thread_diff(mcode_thread *thread);
 void mcode_ui_load_selected_diff(mcode_thread *thread);

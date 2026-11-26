@@ -1497,7 +1497,10 @@ void mcode_ui_draw_workspace_main(mcode_app *app, cui_ctx *ui, mcode_thread *thr
                      .color = chat_active ? CUI_COLOR_FOREGROUND : CUI_COLOR_TEXT_SECONDARY,
                      .nowrap = true);
             cui_card_end(ui);
-            if (chat_clicked) app->inspector_showing_chat = true;
+            if (chat_clicked) {
+                app->inspector_showing_chat = true;
+                mcode_ui_focus_composer(app, ui);
+            }
 
             /* Active File / Diff tab */
             cui_id ftab_id = cui_make_id(ui, "ws-tab-file");

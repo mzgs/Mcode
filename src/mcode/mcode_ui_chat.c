@@ -1954,6 +1954,16 @@ static void draw_message_queue_dock(mcode_app *app, cui_ctx *ui, mcode_thread *t
     }
 }
 
+static bool composer_blocked_by_modal(const mcode_app *app) {
+    if (!app) return false;
+    return app->project_dialog_open ||
+           app->rename_project_open ||
+           app->new_thread_open ||
+           app->git_dialog_open ||
+           app->actions_dialog_open ||
+           (app->chrome && (app->chrome->settings_open || app->chrome->palette_open));
+}
+
 static void draw_thread_composer(mcode_app *app, cui_ctx *ui, mcode_thread *thread, bool centered) {
     bool busy = (thread->active_run != NULL);
     const app_settings *settings = app_chrome_settings(app->chrome);
@@ -2075,6 +2085,11 @@ static void draw_thread_composer(mcode_app *app, cui_ctx *ui, mcode_thread *thre
                 }
             }
         }
+    }
+
+    if (app->composer_want_focus && !composer_blocked_by_modal(app)) {
+        cui_set_focus(ui, composer_fid);
+        app->composer_want_focus = false;
     }
 
     if (centered) {

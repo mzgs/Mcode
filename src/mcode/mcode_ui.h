@@ -167,6 +167,7 @@ typedef struct {
     /* Integrated terminal (Better-C-UI cui::vterm) */
     cui_vterm_session *term;
     char term_cwd[MCODE_PATH_MAX];
+    bool composer_want_focus;
     bool term_want_focus;
     bool term_search_open;
     bool term_search_want_focus;
