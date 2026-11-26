@@ -154,7 +154,12 @@ typedef enum {
     MCODE_STEER_INTERRUPTING, /* Gracefully interrupting active turn so caller runs steer next */
 } mcode_steer_result;
 
-/* Steer an active agent run with a mid-turn redirection message. */
+/* Steer an active agent run with a mid-turn redirection message.
+ * - Codex RPC (`turn/steer`) & Antigravity ACP (live `session/prompt`): inject live
+ *   into the active turn without canceling (falling back to next turn if rejected
+ *   or if blocked on an approval prompt).
+ * - Claude CTL: gracefully interrupts via `control_request` (`interrupt`) and
+ *   redirects on the same session as soon as the turn winds down. */
 mcode_steer_result mcode_agent_steer(mcode_agent_run *run, mcode_thread *thread,
                                      const char *message);
 

@@ -106,13 +106,15 @@ struct mcode_agent_run {
     bool codex_emitted_live_usage;
     int64_t claude_last_ctx_tokens;
 
-    /* Codex live-steer tracking (protected by mu) */
+    /* Codex & Antigravity ACP live-steer tracking (protected by mu) */
     char **pending_live_steers;
     int pending_live_steer_count;
     int pending_live_steer_cap;
     int64_t inflight_steer_ids[16];
     char *inflight_steer_texts[16];
     int inflight_steer_count;
+    int64_t agy_open_prompts[16];
+    int agy_open_prompt_count;
 
     /* Pending approval RPC metadata (protected by mu) */
     bool approval_pending;
@@ -2476,6 +2478,112 @@ static bool agy_acp_send_cancel(mcode_agent_run *run) {
     return ok;
 }
 
+static bool agy_acp_send_steer_prompt(mcode_agent_run *run, const char *session_id,
+                                      const char *message) {
+    if (!run || !run->proc || !session_id || !session_id[0] || !message || !message[0]) {
+        return false;
+    }
+
+    int64_t rpc_id = 0;
+    bool tracked_open = false;
+    bool tracked_steer = false;
+    pthread_mutex_lock(&run->mu);
+    if (run->next_rpc_id < 100) run->next_rpc_id = 100;
+    rpc_id = run->next_rpc_id++;
+    if (run->agy_open_prompt_count < 16) {
+        run->agy_open_prompts[run->agy_open_prompt_count++] = rpc_id;
+        tracked_open = true;
+    }
+    if (run->inflight_steer_count < 16) {
+        char *copy = strdup(message);
+        if (copy) {
+            int idx = run->inflight_steer_count++;
+            run->inflight_steer_ids[idx] = rpc_id;
+            run->inflight_steer_texts[idx] = copy;
+            tracked_steer = true;
+        }
+    }
+    pthread_mutex_unlock(&run->mu);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        pthread_mutex_lock(&run->mu);
+        if (tracked_open) {
+            for (int i = 0; i < run->agy_open_prompt_count; ++i) {
+                if (run->agy_open_prompts[i] == rpc_id) {
+                    for (int j = i + 1; j < run->agy_open_prompt_count; ++j) {
+                        run->agy_open_prompts[j - 1] = run->agy_open_prompts[j];
+                    }
+                    run->agy_open_prompt_count--;
+                    break;
+                }
+            }
+        }
+        if (tracked_steer) {
+            for (int i = 0; i < run->inflight_steer_count; ++i) {
+                if (run->inflight_steer_ids[i] == rpc_id) {
+                    free(run->inflight_steer_texts[i]);
+                    for (int j = i + 1; j < run->inflight_steer_count; ++j) {
+                        run->inflight_steer_ids[j - 1] = run->inflight_steer_ids[j];
+                        run->inflight_steer_texts[j - 1] = run->inflight_steer_texts[j];
+                    }
+                    run->inflight_steer_count--;
+                    break;
+                }
+            }
+        }
+        pthread_mutex_unlock(&run->mu);
+        return false;
+    }
+
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
+    yyjson_mut_obj_add_sint(doc, root, "id", rpc_id);
+    yyjson_mut_obj_add_str(doc, root, "method", "session/prompt");
+    yyjson_mut_val *params = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_strcpy(doc, params, "sessionId", session_id);
+    yyjson_mut_val *prompt_arr = yyjson_mut_arr(doc);
+    yyjson_mut_val *part = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, part, "type", "text");
+    yyjson_mut_obj_add_strcpy(doc, part, "text", message);
+    yyjson_mut_arr_append(prompt_arr, part);
+    yyjson_mut_obj_add_val(doc, params, "prompt", prompt_arr);
+    yyjson_mut_obj_add_val(doc, root, "params", params);
+    bool ok = send_json_doc(run->proc, doc);
+    yyjson_mut_doc_free(doc);
+
+    if (!ok) {
+        pthread_mutex_lock(&run->mu);
+        if (tracked_open) {
+            for (int i = 0; i < run->agy_open_prompt_count; ++i) {
+                if (run->agy_open_prompts[i] == rpc_id) {
+                    for (int j = i + 1; j < run->agy_open_prompt_count; ++j) {
+                        run->agy_open_prompts[j - 1] = run->agy_open_prompts[j];
+                    }
+                    run->agy_open_prompt_count--;
+                    break;
+                }
+            }
+        }
+        if (tracked_steer) {
+            for (int i = 0; i < run->inflight_steer_count; ++i) {
+                if (run->inflight_steer_ids[i] == rpc_id) {
+                    free(run->inflight_steer_texts[i]);
+                    for (int j = i + 1; j < run->inflight_steer_count; ++j) {
+                        run->inflight_steer_ids[j - 1] = run->inflight_steer_ids[j];
+                        run->inflight_steer_texts[j - 1] = run->inflight_steer_texts[j];
+                    }
+                    run->inflight_steer_count--;
+                    break;
+                }
+            }
+        }
+        pthread_mutex_unlock(&run->mu);
+    }
+    return ok;
+}
+
 static void agy_acp_finish_turn(mcode_agent_run *run);
 
 static void agy_acp_send_configure_and_prompt(mcode_agent_run *run) {
@@ -2523,7 +2631,10 @@ static void agy_acp_send_configure_and_prompt(mcode_agent_run *run) {
             yyjson_mut_doc_free(doc);
         }
     }
-    /* 3. Send the prompt */
+    /* 3. Send the initial prompt and flush any early buffered live steers */
+    char sid[MCODE_SESSION_MAX] = "";
+    char **queued = NULL;
+    int queued_n = 0;
     {
         yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
         if (doc) {
@@ -2543,14 +2654,34 @@ static void agy_acp_send_configure_and_prompt(mcode_agent_run *run) {
             yyjson_mut_obj_add_val(doc, root, "params", params);
             pthread_mutex_lock(&run->mu);
             run->rpc_prompt_sent = true;
+            run->agy_open_prompts[0] = 5;
+            run->agy_open_prompt_count = 1;
+            snprintf(sid, sizeof sid, "%s", run->active_session_id);
+            if (run->pending_live_steer_count > 0) {
+                queued = run->pending_live_steers;
+                queued_n = run->pending_live_steer_count;
+                run->pending_live_steers = NULL;
+                run->pending_live_steer_count = 0;
+                run->pending_live_steer_cap = 0;
+            }
             pthread_mutex_unlock(&run->mu);
             send_json_doc(run->proc, doc);
             yyjson_mut_doc_free(doc);
         }
     }
+    for (int i = 0; i < queued_n; ++i) {
+        if (queued[i] && queued[i][0]) {
+            if (!agy_acp_send_steer_prompt(run, sid, queued[i])) {
+                emit_simple(run, EV_STEER_REJECTED, queued[i]);
+            }
+        }
+        free(queued[i]);
+    }
+    free(queued);
 }
 
 static void agy_acp_finish_turn(mcode_agent_run *run) {
+    flush_unsent_live_steers(run);
     pthread_mutex_lock(&run->mu);
     run->rpc_turn_done = true;
     run->approval_pending = false;
@@ -2639,13 +2770,52 @@ static void parse_agy_acp_json(mcode_agent_run *run, yyjson_val *root) {
             return;
         }
 
-        if (rid == 5) {
-            pthread_mutex_lock(&run->mu);
-            bool steer_int = run->steer_interrupting;
-            pthread_mutex_unlock(&run->mu);
+        /* Responses to the initial `session/prompt` (id 5) or any live-steer `session/prompt` (id >= 100).
+         * When a live steer joins a running turn, `agy acp` immediately resolves the earlier prompt ID
+         * and transfers turn ownership to the new prompt ID — so we only finish once all open prompts close. */
+        bool matched_prompt = false;
+        bool all_prompts_closed = false;
+        bool matched_steer = false;
+        bool steer_int = false;
+        char *steer_text = NULL;
+        pthread_mutex_lock(&run->mu);
+        steer_int = run->steer_interrupting;
+        for (int i = 0; i < run->agy_open_prompt_count; ++i) {
+            if (run->agy_open_prompts[i] == rid) {
+                matched_prompt = true;
+                for (int j = i + 1; j < run->agy_open_prompt_count; ++j) {
+                    run->agy_open_prompts[j - 1] = run->agy_open_prompts[j];
+                }
+                run->agy_open_prompt_count--;
+                break;
+            }
+        }
+        if (!matched_prompt && rid == 5) {
+            matched_prompt = true;
+        }
+        all_prompts_closed = (run->agy_open_prompt_count == 0);
+        for (int i = 0; i < run->inflight_steer_count; ++i) {
+            if (run->inflight_steer_ids[i] == rid) {
+                matched_steer = true;
+                steer_text = run->inflight_steer_texts[i];
+                for (int j = i + 1; j < run->inflight_steer_count; ++j) {
+                    run->inflight_steer_ids[j - 1] = run->inflight_steer_ids[j];
+                    run->inflight_steer_texts[j - 1] = run->inflight_steer_texts[j];
+                }
+                run->inflight_steer_count--;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&run->mu);
+
+        if (matched_prompt) {
             if (err_v) {
-                if (!steer_int) {
-                    const char *emsg = jstr(err_v, "message");
+                const char *emsg = jstr(err_v, "message");
+                if (matched_steer && !steer_int && steer_text && steer_text[0]) {
+                    app_log_warn("Antigravity ACP live steer rejected (%s); falling back to next turn",
+                                 emsg ? emsg : "unknown error");
+                    emit_simple(run, EV_STEER_REJECTED, steer_text);
+                } else if (!steer_int) {
                     emit_simple(run, EV_ERROR, emsg ? emsg : "Antigravity ACP prompt failed.");
                 }
             } else if (yyjson_is_obj(res_v)) {
@@ -2659,8 +2829,17 @@ static void parse_agy_acp_json(mcode_agent_run *run, yyjson_val *root) {
                         emit_usage_ev(run, in_tok, out_tok, cached, 0, ctx_win, 0.0, false);
                     }
                 }
+                if (!all_prompts_closed) {
+                    /* Earlier prompt resolved because a live steer prompt took over the active turn */
+                    emit_simple(run, EV_STATUS, "Steered — continuing...");
+                }
             }
-            agy_acp_finish_turn(run);
+            free(steer_text);
+            if (all_prompts_closed) {
+                agy_acp_finish_turn(run);
+            }
+        } else {
+            free(steer_text);
         }
         return;
     }
@@ -2788,6 +2967,12 @@ static void parse_agy_acp_json(mcode_agent_run *run, yyjson_val *root) {
             if (detail[0]) snprintf(st, sizeof st, "%s: %s", tname, detail);
             else snprintf(st, sizeof st, "Running %s...", tname);
             emit_simple(run, EV_STATUS, st);
+        }
+    } else if (strcmp(su, "usage_update") == 0) {
+        int64_t used = ji64(upd, "used");
+        int64_t size = ji64(upd, "size");
+        if (used > 0 || size > 0) {
+            emit_usage_ev(run, 0, 0, 0, used, size, 0.0, false);
         }
     }
 }
@@ -4921,7 +5106,8 @@ void mcode_agent_stop(mcode_agent_run *run) {
 }
 
 bool mcode_agent_supports_live_steer(const mcode_agent_run *run) {
-    return run != NULL && run->proto == AGENT_PROTO_CODEX_RPC;
+    return run != NULL &&
+           (run->proto == AGENT_PROTO_CODEX_RPC || run->proto == AGENT_PROTO_AGY_ACP);
 }
 
 mcode_steer_result mcode_agent_steer(mcode_agent_run *run, mcode_thread *thread,
@@ -5017,21 +5203,43 @@ mcode_steer_result mcode_agent_steer(mcode_agent_run *run, mcode_thread *thread,
     if (run->proto == AGENT_PROTO_AGY_ACP) {
         bool prompt_sent = false;
         char sid[MCODE_SESSION_MAX] = "";
+        bool buffered = false;
+        bool buf_oom = false;
+
         pthread_mutex_lock(&run->mu);
         if (run->rpc_turn_done || run->finished) {
             pthread_mutex_unlock(&run->mu);
             return MCODE_STEER_INTERRUPTING;
         }
-        run->steer_interrupting = true;
-        run->interrupt_requested_at = mcode_now_mono();
         prompt_sent = run->rpc_prompt_sent;
         snprintf(sid, sizeof sid, "%s", run->active_session_id);
-        if (!prompt_sent) {
-            run->deferred_interrupt = true;
+        if (!prompt_sent || !sid[0]) {
+            if (run->pending_live_steer_count >= run->pending_live_steer_cap) {
+                int nc = run->pending_live_steer_cap ? run->pending_live_steer_cap * 2 : 4;
+                char **grown = realloc(run->pending_live_steers, (size_t)nc * sizeof *grown);
+                if (grown) {
+                    run->pending_live_steers = grown;
+                    run->pending_live_steer_cap = nc;
+                } else {
+                    buf_oom = true;
+                }
+            }
+            if (!buf_oom) {
+                char *dup = strdup(message);
+                if (dup) {
+                    run->pending_live_steers[run->pending_live_steer_count++] = dup;
+                    buffered = true;
+                } else {
+                    buf_oom = true;
+                }
+            }
         }
         pthread_mutex_unlock(&run->mu);
-        if (prompt_sent && sid[0]) {
-            agy_acp_send_cancel(run);
+
+        if (buffered) return MCODE_STEER_INJECTED;
+        if (buf_oom) return MCODE_STEER_FAILED;
+        if (agy_acp_send_steer_prompt(run, sid, message)) {
+            return MCODE_STEER_INJECTED;
         }
         return MCODE_STEER_INTERRUPTING;
     }
