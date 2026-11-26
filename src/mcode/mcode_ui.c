@@ -836,60 +836,198 @@ void mcode_ui_open_new_thread_dialog(mcode_app *app, const mcode_project *proj) 
     app->new_thread_open = true;
 }
 
-void mcode_ui_send_prompt(mcode_app *app, cui_ctx *ui, mcode_thread *thread, const char *prompt) {
-    if (!app || !thread || !prompt || !prompt[0]) return;
-    if (thread->active_run) return;
+static bool prompt_is_blank(const char *s) {
+    if (!s) return true;
+    while (*s) {
+        if (!isspace((unsigned char)*s)) return false;
+        ++s;
+    }
+    return true;
+}
+
+static bool start_thread_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread,
+                              const char *prompt, bool is_steer) {
+    if (!app || !thread || prompt_is_blank(prompt)) return false;
+    if (thread->active_run) return false;
 
     bool should_auto_title = (thread->turn_count == 0 &&
         (strcmp(thread->title, "New thread") == 0 || thread->title[0] == '\0'));
     bool was_draft = thread->is_draft;
 
     thread->state = MCODE_THREAD_ACTIVE;
+    thread->stop_requested = false;
+    thread->queue_paused = false;
     char err[256] = "";
     const app_settings *settings = app_chrome_settings(app->chrome);
     if (!mcode_agent_start(thread, settings, prompt, err, sizeof err)) {
         if (ui) app_chrome_notify(app->chrome, ui, err[0] ? err : "Could not start agent.", CUI_TONE_DANGER);
-    } else {
-        if (was_draft) {
-            thread->is_draft = false;
-            thread->created_at = mcode_now_epoch();
-            thread->updated_at = thread->created_at;
-            nav_history_push(app, thread->id);
-            mcode_ui_refresh_thread_diff(thread);
+        return false;
+    }
+
+    if (is_steer && thread->turn_count > 0) {
+        thread->turns[thread->turn_count - 1].steered = true;
+    }
+    if (was_draft) {
+        thread->is_draft = false;
+        thread->created_at = mcode_now_epoch();
+        thread->updated_at = thread->created_at;
+        nav_history_push(app, thread->id);
+        mcode_ui_refresh_thread_diff(thread);
+    }
+    /* Set an immediate fallback title and ask the provider for a concise title in parallel. */
+    if (should_auto_title) {
+        const char *p = prompt;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
+        size_t n = 0;
+        while (p[n] && p[n] != '\n' && p[n] != '\r' && n < 56) ++n;
+        while (n > 0 && ((unsigned char)p[n] & 0xC0) == 0x80) --n;
+        if (n > 0) {
+            snprintf(thread->title, sizeof thread->title, "%.*s%s",
+                     (int)n, p, (p[n] != '\0') ? "..." : "");
         }
-        /* Set an immediate fallback title and ask the provider for a concise title in parallel. */
-        if (should_auto_title) {
-            const char *p = prompt;
-            while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
-            size_t n = 0;
-            while (p[n] && p[n] != '\n' && p[n] != '\r' && n < 56) ++n;
-            while (n > 0 && ((unsigned char)p[n] & 0xC0) == 0x80) --n;
-            if (n > 0) {
-                snprintf(thread->title, sizeof thread->title, "%.*s%s",
-                         (int)n, p, (p[n] != '\0') ? "..." : "");
-            }
-            snprintf(thread->title_auto_fallback, sizeof thread->title_auto_fallback,
-                     "%s", thread->title);
-            if (thread->title_run) {
-                mcode_agent_title_destroy(thread->title_run);
-                thread->title_run = NULL;
-            }
-            thread->title_pending = false;
-            if (thread->agent == APP_AGENT_AGY) {
-                /* Defer agy title generation until the turn completes so two concurrent
-                 * `agy -p` processes do not race on agy's local trajectory database. */
-                thread->title_pending = true;
-            } else {
-                thread->title_run = mcode_agent_start_title(thread, settings, prompt);
-            }
+        snprintf(thread->title_auto_fallback, sizeof thread->title_auto_fallback,
+                 "%s", thread->title);
+        if (thread->title_run) {
+            mcode_agent_title_destroy(thread->title_run);
+            thread->title_run = NULL;
         }
-        mcode_ui_promote_project(app, thread->project_id);
+        thread->title_pending = false;
+        if (thread->agent == APP_AGENT_AGY) {
+            /* Defer agy title generation until the turn completes so two concurrent
+             * `agy -p` processes do not race on agy's local trajectory database. */
+            thread->title_pending = true;
+        } else {
+            thread->title_run = mcode_agent_start_title(thread, settings, prompt);
+        }
+    }
+    mcode_ui_promote_project(app, thread->project_id);
+    mcode_ui_mark_dirty(app);
+    return true;
+}
+
+void mcode_ui_send_prompt(mcode_app *app, cui_ctx *ui, mcode_thread *thread, const char *prompt) {
+    (void)start_thread_turn(app, ui, thread, prompt, false);
+}
+
+void mcode_ui_queue_message(mcode_app *app, cui_ctx *ui, mcode_thread *thread, const char *prompt) {
+    if (!app || !thread || prompt_is_blank(prompt)) return;
+    if (!thread->active_run && !thread->queue_paused && thread->queued_count == 0) {
+        mcode_ui_send_prompt(app, ui, thread, prompt);
+        return;
+    }
+    if (mcode_thread_queue_push(thread, prompt)) {
+        if (thread->active_run) {
+            thread->queue_paused = false;
+        }
+        thread->updated_at = mcode_now_epoch();
         mcode_ui_mark_dirty(app);
     }
 }
 
+void mcode_ui_steer_message(mcode_app *app, cui_ctx *ui, mcode_thread *thread, const char *prompt) {
+    if (!app || !thread || prompt_is_blank(prompt)) return;
+    if (!thread->active_run) {
+        mcode_ui_send_prompt(app, ui, thread, prompt);
+        return;
+    }
+
+    mcode_steer_result res = mcode_agent_steer(thread->active_run, thread, prompt);
+    if (res == MCODE_STEER_INJECTED) {
+        if (thread->turn_count > 0) {
+            mcode_block *b = mcode_turn_add_block(&thread->turns[thread->turn_count - 1],
+                                                  MCODE_BLOCK_STEER);
+            if (b) mcode_str_set(&b->text, prompt);
+        }
+        snprintf(thread->status_text, sizeof thread->status_text, "Steering...");
+        thread->queue_paused = false;
+        thread->stop_requested = false;
+        thread->scroll_to_bottom_frames = 3;
+        thread->updated_at = mcode_now_epoch();
+        mcode_ui_mark_dirty(app);
+    } else if (res == MCODE_STEER_INTERRUPTING) {
+        if (thread->steer_pending && thread->pending_steer.len > 0) {
+            mcode_str_append_cstr(&thread->pending_steer, "\n\n");
+            mcode_str_append_cstr(&thread->pending_steer, prompt);
+        } else {
+            mcode_str_set(&thread->pending_steer, prompt);
+            thread->steer_pending = true;
+        }
+        snprintf(thread->status_text, sizeof thread->status_text, "Steering — redirecting...");
+        thread->queue_paused = false;
+        thread->stop_requested = false;
+        thread->scroll_to_bottom_frames = 2;
+        thread->updated_at = mcode_now_epoch();
+        mcode_ui_mark_dirty(app);
+    } else {
+        mcode_thread_queue_push_front(thread, prompt);
+        thread->queue_paused = false;
+        mcode_ui_mark_dirty(app);
+        if (ui) {
+            app_chrome_notify(app->chrome, ui,
+                              "Could not steer active run; queued message next.",
+                              CUI_TONE_WARNING);
+        }
+    }
+}
+
+void mcode_ui_steer_queued_item(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int index) {
+    if (!app || !thread || index < 0 || index >= thread->queued_count) return;
+    char *copy = strdup(mcode_str_cstr(&thread->queued_msgs[index].text));
+    if (!copy) return;
+    mcode_thread_queue_remove(thread, index);
+    mcode_ui_mark_dirty(app);
+    if (thread->active_run) {
+        mcode_ui_steer_message(app, ui, thread, copy);
+    } else {
+        mcode_ui_send_prompt(app, ui, thread, copy);
+    }
+    free(copy);
+}
+
+void mcode_ui_send_next_queued(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
+    if (!app || !thread || thread->active_run || thread->queued_count <= 0) return;
+    mcode_str next;
+    mcode_str_init(&next);
+    if (mcode_thread_queue_pop_front(thread, &next) && !prompt_is_blank(mcode_str_cstr(&next))) {
+        if (!start_thread_turn(app, ui, thread, mcode_str_cstr(&next), false)) {
+            /* Put it back at the front if the CLI failed to launch */
+            mcode_thread_queue_push_front(thread, mcode_str_cstr(&next));
+            thread->queue_paused = true;
+        }
+    }
+    mcode_str_free(&next);
+    mcode_ui_mark_dirty(app);
+}
+
+void mcode_ui_cancel_pending_steer(mcode_app *app, mcode_thread *thread) {
+    if (!app || !thread || !thread->steer_pending) return;
+    if (thread->pending_steer.len > 0) {
+        if (!thread->composer_draft[0]) {
+            snprintf(thread->composer_draft, sizeof thread->composer_draft, "%s",
+                     mcode_str_cstr(&thread->pending_steer));
+        } else {
+            mcode_thread_queue_push_front(thread, mcode_str_cstr(&thread->pending_steer));
+        }
+    }
+    thread->steer_pending = false;
+    mcode_str_clear(&thread->pending_steer);
+    mcode_ui_mark_dirty(app);
+}
+
 void mcode_ui_stop_thread(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
     if (!thread || !thread->active_run) return;
+    thread->stop_requested = true;
+    if (thread->steer_pending) {
+        if (thread->pending_steer.len > 0) {
+            mcode_thread_queue_push_front(thread, mcode_str_cstr(&thread->pending_steer));
+        }
+        thread->steer_pending = false;
+        mcode_str_clear(&thread->pending_steer);
+    }
+    if (thread->queued_count > 0) {
+        thread->queue_paused = true;
+        mcode_ui_mark_dirty(app);
+    }
     mcode_agent_stop(thread->active_run);
     snprintf(thread->status_text, sizeof thread->status_text, "Stopping...");
     if (ui) app_chrome_notify(app->chrome, ui, "Stopping agent turn...", CUI_TONE_INFO);
@@ -1025,6 +1163,10 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
         if (finished) {
             mcode_agent_destroy(t->active_run);
             t->active_run = NULL;
+            bool was_stopped = t->stop_requested;
+            t->stop_requested = false;
+            bool last_failed = (t->turn_count > 0 && t->turns[t->turn_count - 1].failed);
+
             if (strcmp(app->store.selected_thread_id, t->id) == 0) {
                 mcode_ui_refresh_workspace_git(app);
             } else {
@@ -1034,11 +1176,45 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
                 mcode_usage_tracker_refresh_agent(&app->usage, &app->cli_status, t->agent, false);
                 app->usage_checked_at = mcode_now_mono();
             }
+
+            /* Dispatch pending steer redirect immediately (ahead of queued messages). */
+            if (!was_stopped && t->steer_pending && !prompt_is_blank(mcode_str_cstr(&t->pending_steer))) {
+                char *steer_prompt = strdup(mcode_str_cstr(&t->pending_steer));
+                t->steer_pending = false;
+                mcode_str_clear(&t->pending_steer);
+                if (steer_prompt) {
+                    if (!start_thread_turn(app, ui, t, steer_prompt, true)) {
+                        mcode_thread_queue_push_front(t, steer_prompt);
+                        t->queue_paused = true;
+                    }
+                    free(steer_prompt);
+                }
+            } else if (!was_stopped && !last_failed && !t->queue_paused && t->queued_count > 0) {
+                /* Auto-drain the next queued follow-up message on clean completion. */
+                mcode_str next_msg;
+                mcode_str_init(&next_msg);
+                if (mcode_thread_queue_pop_front(t, &next_msg) &&
+                    !prompt_is_blank(mcode_str_cstr(&next_msg))) {
+                    if (!start_thread_turn(app, ui, t, mcode_str_cstr(&next_msg), false)) {
+                        mcode_thread_queue_push_front(t, mcode_str_cstr(&next_msg));
+                        t->queue_paused = true;
+                    }
+                }
+                mcode_str_free(&next_msg);
+            } else if ((was_stopped || last_failed) && t->queued_count > 0) {
+                /* Pause remaining queue on Stop or error so user can review before continuing. */
+                t->queue_paused = true;
+            }
+
             mcode_ui_mark_dirty(app);
             any_finished = true;
-            char msg[220];
-            snprintf(msg, sizeof msg, "Finished: %s", t->title);
-            app_chrome_notify(app->chrome, ui, msg, CUI_TONE_SUCCESS);
+            if (t->active_run) {
+                ++running;
+            } else {
+                char msg[220];
+                snprintf(msg, sizeof msg, "Finished: %s", t->title);
+                app_chrome_notify(app->chrome, ui, msg, CUI_TONE_SUCCESS);
+            }
         } else {
             ++running;
         }
@@ -1936,9 +2112,79 @@ static void on_palette_refresh_usage(cui_ctx *ui, void *user) {
     if (ui) app_chrome_notify(app->chrome, ui, "Refreshing usage limits...", CUI_TONE_INFO);
 }
 
+static void on_palette_send_next_queued(cui_ctx *ui, void *user) {
+    mcode_app *app = (mcode_app *)user;
+    if (!app) return;
+    mcode_thread *t = mcode_store_selected_thread(&app->store);
+    if (t && !t->active_run && t->queued_count > 0) {
+        mcode_ui_send_next_queued(app, ui, t);
+    }
+}
+
+static void on_palette_clear_queue(cui_ctx *ui, void *user) {
+    mcode_app *app = (mcode_app *)user;
+    if (!app) return;
+    mcode_thread *t = mcode_store_selected_thread(&app->store);
+    if (t && t->queued_count > 0) {
+        mcode_thread_queue_clear(t);
+        t->queue_paused = false;
+        mcode_ui_mark_dirty(app);
+        if (ui) app_chrome_notify(app->chrome, ui, "Cleared queued messages.", CUI_TONE_INFO);
+    }
+}
+
+static void on_palette_toggle_busy_submit(cui_ctx *ui, void *user) {
+    mcode_app *app = (mcode_app *)user;
+    if (!app || !app->chrome) return;
+    app->chrome->settings.mcode.busy_submit_mode =
+        (app->chrome->settings.mcode.busy_submit_mode == APP_BUSY_SUBMIT_QUEUE)
+            ? APP_BUSY_SUBMIT_STEER
+            : APP_BUSY_SUBMIT_QUEUE;
+    app_settings_save(&app->chrome->settings, app->chrome->cli.settings_path);
+    if (ui) {
+        const char *msg = (app->chrome->settings.mcode.busy_submit_mode == APP_BUSY_SUBMIT_STEER)
+            ? "Enter while busy now steers immediately."
+            : "Enter while busy now queues follow-ups.";
+        app_chrome_notify(app->chrome, ui, msg, CUI_TONE_INFO);
+    }
+}
+
 void mcode_app_palette_provider(app_palette_builder *builder, void *user) {
     mcode_app *app = (mcode_app *)user;
     if (!app) return;
+
+    mcode_thread *sel_thr = mcode_store_selected_thread(&app->store);
+    if (sel_thr && sel_thr->queued_count > 0) {
+        if (!sel_thr->active_run) {
+            app_palette_add(builder, &(app_palette_command){
+                .title = "Send Next Queued Message",
+                .icon = CUI_ICON_PLAY,
+                .group = "Queue",
+                .on_trigger = on_palette_send_next_queued,
+                .user = app,
+            });
+        }
+        app_palette_add(builder, &(app_palette_command){
+            .title = "Clear Queued Messages",
+            .icon = CUI_ICON_TRASH_2,
+            .group = "Queue",
+            .on_trigger = on_palette_clear_queue,
+            .user = app,
+        });
+    }
+    if (app->chrome) {
+        const char *toggle_lbl =
+            (app->chrome->settings.mcode.busy_submit_mode == APP_BUSY_SUBMIT_STEER)
+                ? "Enter While Busy: Switch to Queue"
+                : "Enter While Busy: Switch to Steer";
+        app_palette_add(builder, &(app_palette_command){
+            .title = toggle_lbl,
+            .icon = CUI_ICON_ARROW_RIGHT,
+            .group = "Composer",
+            .on_trigger = on_palette_toggle_busy_submit,
+            .user = app,
+        });
+    }
 
     if (app->cli_status.available[APP_AGENT_CLAUDE] ||
         app->cli_status.available[APP_AGENT_CODEX] ||

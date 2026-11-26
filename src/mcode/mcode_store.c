@@ -441,6 +441,7 @@ bool mcode_store_load(mcode_store *store, const char *path) {
                     turn->created_at = (int64_t)jnum_or(trv, "created_at", 0);
                     turn->duration_sec = (float)jnum_or(trv, "duration_sec", 0.0);
                     turn->failed = jbool_or(trv, "failed", false);
+                    turn->steered = jbool_or(trv, "steered", false);
                     turn->input_tokens = (int64_t)jnum_or(trv, "input_tokens", 0.0);
                     turn->output_tokens = (int64_t)jnum_or(trv, "output_tokens", 0.0);
                     turn->cached_tokens = (int64_t)jnum_or(trv, "cached_tokens", 0.0);
@@ -455,7 +456,7 @@ bool mcode_store_load(mcode_store *store, const char *path) {
                         yyjson_arr_foreach(blocks, bi, bmax, bv) {
                             if (!yyjson_is_obj(bv)) continue;
                             int bk = jint_or(bv, "kind", MCODE_BLOCK_TEXT);
-                            if (bk < MCODE_BLOCK_TEXT || bk > MCODE_BLOCK_ERROR) bk = MCODE_BLOCK_TEXT;
+                            if (bk < MCODE_BLOCK_TEXT || bk > MCODE_BLOCK_STEER) bk = MCODE_BLOCK_TEXT;
                             mcode_block *b = mcode_turn_add_block(turn, (mcode_block_kind)bk);
                             if (!b) break;
                             mcode_str_set(&b->text, jstr_or(bv, "text", ""));
@@ -477,6 +478,27 @@ bool mcode_store_load(mcode_store *store, const char *path) {
                             b->duration_sec = (float)jnum_or(bv, "duration_sec", 0.0);
                         }
                     }
+                }
+            }
+
+            yyjson_val *qmsgs = yyjson_obj_get(tv, "queued_messages");
+            if (yyjson_is_arr(qmsgs)) {
+                size_t qi, qmax;
+                yyjson_val *qv;
+                yyjson_arr_foreach(qmsgs, qi, qmax, qv) {
+                    if (!yyjson_is_obj(qv)) continue;
+                    const char *qtxt = jstr_or(qv, "text", "");
+                    if (!qtxt[0]) continue;
+                    mcode_queued_msg *qm = mcode_thread_queue_push(t, qtxt);
+                    if (!qm) break;
+                    const char *qid = jstr_or(qv, "id", "");
+                    if (qid[0]) snprintf(qm->id, sizeof qm->id, "%s", qid);
+                    int64_t qts = (int64_t)jnum_or(qv, "created_at", 0);
+                    if (qts > 0) qm->created_at = qts;
+                }
+                if (t->queued_count > 0) {
+                    /* Persisted queued messages stay paused until the user resumes or sends. */
+                    t->queue_paused = true;
                 }
             }
         }
@@ -593,6 +615,9 @@ bool mcode_store_save(const mcode_store *store, const char *path) {
             yyjson_mut_obj_add_sint(doc, tro, "created_at", tr->created_at);
             yyjson_mut_obj_add_real(doc, tro, "duration_sec", tr->duration_sec);
             yyjson_mut_obj_add_bool(doc, tro, "failed", tr->failed);
+            if (tr->steered) {
+                yyjson_mut_obj_add_bool(doc, tro, "steered", true);
+            }
             yyjson_mut_obj_add_sint(doc, tro, "input_tokens", tr->input_tokens);
             yyjson_mut_obj_add_sint(doc, tro, "output_tokens", tr->output_tokens);
             if (tr->cached_tokens > 0) {
@@ -627,6 +652,18 @@ bool mcode_store_save(const mcode_store *store, const char *path) {
             yyjson_mut_arr_append(turns, tro);
         }
         yyjson_mut_obj_add_val(doc, to, "turns", turns);
+        if (t->queued_count > 0) {
+            yyjson_mut_val *qarr = yyjson_mut_arr(doc);
+            for (int qi = 0; qi < t->queued_count; ++qi) {
+                const mcode_queued_msg *qm = &t->queued_msgs[qi];
+                yyjson_mut_val *qo = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_str(doc, qo, "id", qm->id);
+                yyjson_mut_obj_add_str(doc, qo, "text", mcode_str_cstr(&qm->text));
+                yyjson_mut_obj_add_sint(doc, qo, "created_at", qm->created_at);
+                yyjson_mut_arr_append(qarr, qo);
+            }
+            yyjson_mut_obj_add_val(doc, to, "queued_messages", qarr);
+        }
         yyjson_mut_arr_append(threads, to);
     }
     yyjson_mut_obj_add_val(doc, root, "threads", threads);

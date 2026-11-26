@@ -35,6 +35,27 @@ static bool draw_general_section(app_chrome *chrome, cui_ctx *ui, bool compact) 
         changed = true;
     }
 
+    static const char *const busy_submit_labels[APP_BUSY_SUBMIT_COUNT] = {
+        "Queue", "Steer"
+    };
+    setting_row_begin(ui, "Enter while busy", compact, true);
+    int bmode = (int)chrome->settings.mcode.busy_submit_mode;
+    bool bmode_changed = compact
+        ? cui_select(ui, "busy-submit-mode", busy_submit_labels, APP_BUSY_SUBMIT_COUNT,
+                     &bmode, .width = CUI_FILL)
+        : cui_segmented(ui, "busy-submit-mode", busy_submit_labels, APP_BUSY_SUBMIT_COUNT,
+                        &bmode);
+    if (bmode_changed) {
+        chrome->settings.mcode.busy_submit_mode = (app_busy_submit_mode)bmode;
+        changed = true;
+    }
+    cui_box_end(ui);
+#ifdef __APPLE__
+    cui_muted(ui, "Cmd+Enter or Alt+Enter triggers the alternate action while an agent is running.");
+#else
+    cui_muted(ui, "Ctrl+Enter or Alt+Enter triggers the alternate action while an agent is running.");
+#endif
+
     cui_separator(ui);
     cui_text(ui, "Agent CLI Binaries", .font = CUI_FONT_MEDIUM);
 

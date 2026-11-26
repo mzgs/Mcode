@@ -37,6 +37,11 @@ mcode_thread *mcode_ui_quick_new_thread(mcode_app *app, cui_ctx *ui, mcode_proje
 void mcode_ui_open_new_thread_dialog(mcode_app *app, const mcode_project *proj);
 
 void mcode_ui_send_prompt(mcode_app *app, cui_ctx *ui, mcode_thread *thread, const char *prompt);
+void mcode_ui_queue_message(mcode_app *app, cui_ctx *ui, mcode_thread *thread, const char *prompt);
+void mcode_ui_steer_message(mcode_app *app, cui_ctx *ui, mcode_thread *thread, const char *prompt);
+void mcode_ui_steer_queued_item(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int index);
+void mcode_ui_send_next_queued(mcode_app *app, cui_ctx *ui, mcode_thread *thread);
+void mcode_ui_cancel_pending_steer(mcode_app *app, mcode_thread *thread);
 void mcode_ui_stop_thread(mcode_app *app, cui_ctx *ui, mcode_thread *thread);
 void mcode_ui_delete_thread(mcode_app *app, cui_ctx *ui, const char *thread_id);
 

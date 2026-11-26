@@ -150,6 +150,16 @@ static bool draw_thread_row(mcode_app *app, cui_ctx *ui, int idx, bool show_proj
                      .color = CUI_COLOR_TEXT_SECONDARY, .tabular = true);
         }
 
+        if (t->queued_count > 0) {
+            char qbuf[16];
+            snprintf(qbuf, sizeof qbuf, "+%d", t->queued_count);
+            cui_badge(ui, qbuf, .tone = CUI_TONE_NEUTRAL, .size = CUI_SIZE_SM);
+            char qtip[64];
+            snprintf(qtip, sizeof qtip, "%d queued %s", t->queued_count,
+                     t->queued_count == 1 ? "message" : "messages");
+            cui_tooltip(ui, qtip);
+        }
+
         float icon_alpha = is_selected ? 0.65f
                          : muted_state ? 0.26f
                          : hov         ? 0.55f
@@ -206,6 +216,18 @@ static bool draw_thread_row(mcode_app *app, cui_ctx *ui, int idx, bool show_proj
         if (running) {
             if (cui_menu_item(ui, "Stop Turn", .icon = CUI_ICON_SQUARE)) {
                 mcode_ui_stop_thread(app, ui, t);
+            }
+        }
+        if (t->queued_count > 0) {
+            if (!running) {
+                if (cui_menu_item(ui, "Send Next Queued", .icon = CUI_ICON_PLAY)) {
+                    mcode_ui_send_next_queued(app, ui, t);
+                }
+            }
+            if (cui_menu_item(ui, "Clear Queued Messages", .icon = CUI_ICON_TRASH_2)) {
+                mcode_thread_queue_clear(t);
+                t->queue_paused = false;
+                mcode_ui_mark_dirty(app);
             }
         }
         cui_menu_separator(ui);

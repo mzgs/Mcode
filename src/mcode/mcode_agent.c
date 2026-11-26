@@ -33,6 +33,7 @@ typedef enum {
     EV_STATUS,
     EV_USAGE,
     EV_RATE_LIMIT,
+    EV_STEER_REJECTED,
     EV_ERROR,
     EV_DONE,
 } agent_ev_kind;
@@ -62,6 +63,7 @@ typedef struct agent_ev {
     char *extra_a; /* approval reason */
     char *extra_b; /* approval raw details */
     bool flag; /* failed / killed / can_allow_session / replace_usage */
+    bool flag_b; /* steer_interrupted */
     int int_a; /* exit_code */
     int64_t tok_in;
     int64_t tok_out;
@@ -87,8 +89,13 @@ struct mcode_agent_run {
     mcode_permission_mode init_perm_mode;
     char init_session_id[MCODE_SESSION_MAX];
     char active_session_id[MCODE_SESSION_MAX];
+    char active_turn_id[128];
+    int next_rpc_id;
     bool rpc_prompt_sent;
     bool rpc_turn_done;
+    bool steer_interrupting;
+    bool deferred_interrupt;
+    double interrupt_requested_at;
     bool has_emitted_text;
     bool need_text_sep;
     int64_t codex_turn_in_tokens;
@@ -98,6 +105,14 @@ struct mcode_agent_run {
     int64_t codex_ctx_window;
     bool codex_emitted_live_usage;
     int64_t claude_last_ctx_tokens;
+
+    /* Codex live-steer tracking (protected by mu) */
+    char **pending_live_steers;
+    int pending_live_steer_count;
+    int pending_live_steer_cap;
+    int64_t inflight_steer_ids[16];
+    char *inflight_steer_texts[16];
+    int inflight_steer_count;
 
     /* Pending approval RPC metadata (protected by mu) */
     bool approval_pending;
@@ -429,6 +444,20 @@ static void parse_claude_json(mcode_agent_run *run, yyjson_val *root) {
         return;
     }
 
+    if (strcmp(type, "control_cancel_request") == 0 && run->proto == AGENT_PROTO_CLAUDE_CTL) {
+        const char *rid = jstr(root, "request_id");
+        bool cleared = false;
+        pthread_mutex_lock(&run->mu);
+        if (run->approval_pending &&
+            (!rid || !rid[0] || strcmp(run->approval_rpc_id_str, rid) == 0)) {
+            run->approval_pending = false;
+            cleared = true;
+        }
+        pthread_mutex_unlock(&run->mu);
+        if (cleared) emit_simple(run, EV_APPROVAL_CLEAR, NULL);
+        return;
+    }
+
     if (strcmp(type, "control_request") == 0 && run->proto == AGENT_PROTO_CLAUDE_CTL) {
         const char *rid = jstr(root, "request_id");
         yyjson_val *req = yyjson_obj_get(root, "request");
@@ -646,12 +675,15 @@ static void parse_claude_json(mcode_agent_run *run, yyjson_val *root) {
     }
 
     if (strcmp(type, "result") == 0) {
+        pthread_mutex_lock(&run->mu);
+        bool steer_int = run->steer_interrupting;
+        pthread_mutex_unlock(&run->mu);
         yyjson_val *is_err_v = yyjson_obj_get(root, "is_error");
         bool is_err = yyjson_is_bool(is_err_v) && yyjson_get_bool(is_err_v);
         const char *res_text = jstr(root, "result");
-        if (is_err && res_text && res_text[0]) {
+        if (is_err && res_text && res_text[0] && !steer_int) {
             emit_simple(run, EV_ERROR, res_text);
-        } else if (res_text && res_text[0]) {
+        } else if (!is_err && res_text && res_text[0]) {
             emit_simple(run, EV_TEXT_FALLBACK, res_text);
         }
         yyjson_val *usage = yyjson_obj_get(root, "usage");
@@ -1681,6 +1713,12 @@ static void codex_rpc_send_initialize(mcode_agent_run *run) {
     yyjson_mut_doc_free(doc);
 }
 
+static const char *codex_approval_policy(mcode_permission_mode mode) {
+    if (mode == MCODE_PERM_FULL_ACCESS) return "never";
+    if (mode == MCODE_PERM_SUPERVISED) return "untrusted";
+    return "on-request";
+}
+
 static void codex_rpc_send_thread_open(mcode_agent_run *run, bool resume, int rpc_id) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) return;
@@ -1696,9 +1734,10 @@ static void codex_rpc_send_thread_open(mcode_agent_run *run, bool resume, int rp
     if (run->init_cwd[0]) {
         yyjson_mut_obj_add_strcpy(doc, params, "cwd", run->init_cwd);
     }
-    const char *policy = (run->init_perm_mode == MCODE_PERM_SUPERVISED) ? "untrusted" : "on-request";
-    yyjson_mut_obj_add_str(doc, params, "approvalPolicy", policy);
-    yyjson_mut_obj_add_str(doc, params, "sandbox", "workspace-write");
+    yyjson_mut_obj_add_str(doc, params, "approvalPolicy", codex_approval_policy(run->init_perm_mode));
+    yyjson_mut_obj_add_str(doc, params, "sandbox",
+                           run->init_perm_mode == MCODE_PERM_FULL_ACCESS
+                               ? "danger-full-access" : "workspace-write");
     if (run->init_model[0]) {
         yyjson_mut_obj_add_strcpy(doc, params, "model", run->init_model);
     }
@@ -1731,8 +1770,12 @@ static void codex_rpc_send_turn_start(mcode_agent_run *run) {
     if (run->init_cwd[0]) {
         yyjson_mut_obj_add_strcpy(doc, params, "cwd", run->init_cwd);
     }
-    const char *policy = (run->init_perm_mode == MCODE_PERM_SUPERVISED) ? "untrusted" : "on-request";
-    yyjson_mut_obj_add_str(doc, params, "approvalPolicy", policy);
+    yyjson_mut_obj_add_str(doc, params, "approvalPolicy", codex_approval_policy(run->init_perm_mode));
+    if (run->init_perm_mode == MCODE_PERM_FULL_ACCESS) {
+        yyjson_mut_val *sp = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, sp, "type", "dangerFullAccess");
+        yyjson_mut_obj_add_val(doc, params, "sandboxPolicy", sp);
+    }
     if (run->init_model[0]) {
         yyjson_mut_obj_add_strcpy(doc, params, "model", run->init_model);
     }
@@ -1745,12 +1788,195 @@ static void codex_rpc_send_turn_start(mcode_agent_run *run) {
         yyjson_mut_obj_add_str(doc, params, "serviceTier", "default");
     }
     yyjson_mut_obj_add_val(doc, root, "params", params);
+    pthread_mutex_lock(&run->mu);
     run->rpc_prompt_sent = true;
+    pthread_mutex_unlock(&run->mu);
     send_json_doc(run->proc, doc);
     yyjson_mut_doc_free(doc);
 }
 
+static bool codex_rpc_send_turn_steer(mcode_agent_run *run, const char *session_id,
+                                      const char *turn_id, const char *message) {
+    if (!run || !run->proc || !session_id || !session_id[0] ||
+        !turn_id || !turn_id[0] || !message || !message[0]) {
+        return false;
+    }
+
+    int64_t rpc_id = 0;
+    bool tracked = false;
+    pthread_mutex_lock(&run->mu);
+    if (run->next_rpc_id < 100) run->next_rpc_id = 100;
+    rpc_id = run->next_rpc_id++;
+    if (run->inflight_steer_count < 16) {
+        char *copy = strdup(message);
+        if (copy) {
+            int idx = run->inflight_steer_count++;
+            run->inflight_steer_ids[idx] = rpc_id;
+            run->inflight_steer_texts[idx] = copy;
+            tracked = true;
+        }
+    }
+    pthread_mutex_unlock(&run->mu);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        if (tracked) {
+            pthread_mutex_lock(&run->mu);
+            for (int i = 0; i < run->inflight_steer_count; ++i) {
+                if (run->inflight_steer_ids[i] == rpc_id) {
+                    free(run->inflight_steer_texts[i]);
+                    for (int j = i + 1; j < run->inflight_steer_count; ++j) {
+                        run->inflight_steer_ids[j - 1] = run->inflight_steer_ids[j];
+                        run->inflight_steer_texts[j - 1] = run->inflight_steer_texts[j];
+                    }
+                    run->inflight_steer_count--;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&run->mu);
+        }
+        return false;
+    }
+
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
+    yyjson_mut_obj_add_sint(doc, root, "id", rpc_id);
+    yyjson_mut_obj_add_str(doc, root, "method", "turn/steer");
+    yyjson_mut_val *params = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_strcpy(doc, params, "threadId", session_id);
+    yyjson_mut_obj_add_strcpy(doc, params, "expectedTurnId", turn_id);
+    yyjson_mut_val *inp = yyjson_mut_arr(doc);
+    yyjson_mut_val *part = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, part, "type", "text");
+    yyjson_mut_obj_add_strcpy(doc, part, "text", message);
+    yyjson_mut_arr_append(inp, part);
+    yyjson_mut_obj_add_val(doc, params, "input", inp);
+    yyjson_mut_obj_add_val(doc, root, "params", params);
+    bool ok = send_json_doc(run->proc, doc);
+    yyjson_mut_doc_free(doc);
+
+    if (!ok && tracked) {
+        pthread_mutex_lock(&run->mu);
+        for (int i = 0; i < run->inflight_steer_count; ++i) {
+            if (run->inflight_steer_ids[i] == rpc_id) {
+                free(run->inflight_steer_texts[i]);
+                for (int j = i + 1; j < run->inflight_steer_count; ++j) {
+                    run->inflight_steer_ids[j - 1] = run->inflight_steer_ids[j];
+                    run->inflight_steer_texts[j - 1] = run->inflight_steer_texts[j];
+                }
+                run->inflight_steer_count--;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&run->mu);
+    }
+    return ok;
+}
+
+static bool codex_rpc_send_turn_interrupt(mcode_agent_run *run) {
+    if (!run || !run->proc) return false;
+    char sid[MCODE_SESSION_MAX] = "";
+    char tid[128] = "";
+    int64_t rpc_id = 0;
+    pthread_mutex_lock(&run->mu);
+    snprintf(sid, sizeof sid, "%s", run->active_session_id);
+    snprintf(tid, sizeof tid, "%s", run->active_turn_id);
+    if (run->next_rpc_id < 100) run->next_rpc_id = 100;
+    rpc_id = run->next_rpc_id++;
+    pthread_mutex_unlock(&run->mu);
+    if (!sid[0] || !tid[0]) return false;
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return false;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
+    yyjson_mut_obj_add_sint(doc, root, "id", rpc_id);
+    yyjson_mut_obj_add_str(doc, root, "method", "turn/interrupt");
+    yyjson_mut_val *params = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_strcpy(doc, params, "threadId", sid);
+    yyjson_mut_obj_add_strcpy(doc, params, "turnId", tid);
+    yyjson_mut_obj_add_val(doc, root, "params", params);
+    bool ok = send_json_doc(run->proc, doc);
+    yyjson_mut_doc_free(doc);
+    return ok;
+}
+
+static void codex_rpc_set_active_turn(mcode_agent_run *run, const char *turn_id) {
+    if (!run || !turn_id || !turn_id[0]) return;
+    char sid[MCODE_SESSION_MAX] = "";
+    char **queued = NULL;
+    int queued_n = 0;
+    bool want_interrupt = false;
+
+    pthread_mutex_lock(&run->mu);
+    snprintf(run->active_turn_id, sizeof run->active_turn_id, "%s", turn_id);
+    snprintf(sid, sizeof sid, "%s", run->active_session_id);
+    want_interrupt = run->deferred_interrupt;
+    run->deferred_interrupt = false;
+    if (run->pending_live_steer_count > 0) {
+        queued = run->pending_live_steers;
+        queued_n = run->pending_live_steer_count;
+        run->pending_live_steers = NULL;
+        run->pending_live_steer_count = 0;
+        run->pending_live_steer_cap = 0;
+    }
+    pthread_mutex_unlock(&run->mu);
+
+    if (want_interrupt) {
+        codex_rpc_send_turn_interrupt(run);
+    }
+    for (int i = 0; i < queued_n; ++i) {
+        if (queued[i] && queued[i][0]) {
+            if (want_interrupt || !codex_rpc_send_turn_steer(run, sid, turn_id, queued[i])) {
+                emit_simple(run, EV_STEER_REJECTED, queued[i]);
+            }
+        }
+        free(queued[i]);
+    }
+    free(queued);
+}
+
+static void flush_unsent_live_steers(mcode_agent_run *run) {
+    if (!run) return;
+    char **queued = NULL;
+    int queued_n = 0;
+    char *unacked[16];
+    int unacked_n = 0;
+
+    pthread_mutex_lock(&run->mu);
+    if (run->pending_live_steer_count > 0) {
+        queued = run->pending_live_steers;
+        queued_n = run->pending_live_steer_count;
+        run->pending_live_steers = NULL;
+        run->pending_live_steer_count = 0;
+        run->pending_live_steer_cap = 0;
+    }
+    for (int i = 0; i < run->inflight_steer_count && unacked_n < 16; ++i) {
+        unacked[unacked_n++] = run->inflight_steer_texts[i];
+        run->inflight_steer_texts[i] = NULL;
+    }
+    run->inflight_steer_count = 0;
+    pthread_mutex_unlock(&run->mu);
+
+    for (int i = 0; i < unacked_n; ++i) {
+        if (unacked[i] && unacked[i][0]) {
+            emit_simple(run, EV_STEER_REJECTED, unacked[i]);
+        }
+        free(unacked[i]);
+    }
+    for (int i = 0; i < queued_n; ++i) {
+        if (queued[i] && queued[i][0]) {
+            emit_simple(run, EV_STEER_REJECTED, queued[i]);
+        }
+        free(queued[i]);
+    }
+    free(queued);
+}
+
 static void codex_rpc_finish_turn(mcode_agent_run *run) {
+    flush_unsent_live_steers(run);
     if (!run->codex_emitted_live_usage &&
         (run->codex_turn_in_tokens > 0 || run->codex_turn_out_tokens > 0)) {
         emit_usage_ev(run, run->codex_turn_in_tokens, run->codex_turn_out_tokens,
@@ -1811,7 +2037,9 @@ static void parse_codex_rpc_json(mcode_agent_run *run, yyjson_val *root) {
             yyjson_val *thr = yyjson_is_obj(res_v) ? yyjson_obj_get(res_v, "thread") : NULL;
             const char *tid = jstr(thr, "id");
             if (tid && tid[0]) {
+                pthread_mutex_lock(&run->mu);
                 snprintf(run->active_session_id, sizeof run->active_session_id, "%s", tid);
+                pthread_mutex_unlock(&run->mu);
                 emit_simple(run, EV_SESSION, tid);
                 codex_rpc_send_turn_start(run);
             } else {
@@ -1821,10 +2049,50 @@ static void parse_codex_rpc_json(mcode_agent_run *run, yyjson_val *root) {
             return;
         }
 
-        if (rid == 3 && err_v) {
-            const char *emsg = jstr(err_v, "message");
-            emit_simple(run, EV_ERROR, emsg ? emsg : "Codex turn/start failed.");
-            codex_rpc_finish_turn(run);
+        if (rid == 3) {
+            if (err_v) {
+                const char *emsg = jstr(err_v, "message");
+                emit_simple(run, EV_ERROR, emsg ? emsg : "Codex turn/start failed.");
+                codex_rpc_finish_turn(run);
+                return;
+            }
+            yyjson_val *turn = yyjson_is_obj(res_v) ? yyjson_obj_get(res_v, "turn") : NULL;
+            const char *turn_id = jstr(turn, "id");
+            if (turn_id && turn_id[0]) {
+                codex_rpc_set_active_turn(run, turn_id);
+            }
+            return;
+        }
+
+        /* Check if this response matches an in-flight `turn/steer` request */
+        char *steer_text = NULL;
+        bool matched_steer = false;
+        pthread_mutex_lock(&run->mu);
+        for (int i = 0; i < run->inflight_steer_count; ++i) {
+            if (run->inflight_steer_ids[i] == rid) {
+                matched_steer = true;
+                steer_text = run->inflight_steer_texts[i];
+                for (int j = i + 1; j < run->inflight_steer_count; ++j) {
+                    run->inflight_steer_ids[j - 1] = run->inflight_steer_ids[j];
+                    run->inflight_steer_texts[j - 1] = run->inflight_steer_texts[j];
+                }
+                run->inflight_steer_count--;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&run->mu);
+        if (matched_steer) {
+            if (err_v) {
+                const char *emsg = jstr(err_v, "message");
+                app_log_warn("Codex turn/steer rejected (%s); falling back to next turn",
+                             emsg ? emsg : "unknown error");
+                if (steer_text && steer_text[0]) {
+                    emit_simple(run, EV_STEER_REJECTED, steer_text);
+                }
+            } else {
+                emit_simple(run, EV_STATUS, "Steered — continuing...");
+            }
+            free(steer_text);
         }
         return;
     }
@@ -2125,10 +2393,22 @@ static void parse_codex_rpc_json(mcode_agent_run *run, yyjson_val *root) {
         return;
     }
 
+    if (strcmp(method, "turn/started") == 0) {
+        yyjson_val *turn = yyjson_is_obj(params) ? yyjson_obj_get(params, "turn") : NULL;
+        const char *turn_id = jstr(turn, "id");
+        if (turn_id && turn_id[0]) {
+            codex_rpc_set_active_turn(run, turn_id);
+        }
+        return;
+    }
+
     if (strcmp(method, "turn/completed") == 0) {
+        pthread_mutex_lock(&run->mu);
+        bool steer_int = run->steer_interrupting;
+        pthread_mutex_unlock(&run->mu);
         yyjson_val *turn = yyjson_is_obj(params) ? yyjson_obj_get(params, "turn") : NULL;
         yyjson_val *err_v = yyjson_is_obj(turn) ? yyjson_obj_get(turn, "error") : NULL;
-        if (err_v && !yyjson_is_null(err_v)) {
+        if (err_v && !yyjson_is_null(err_v) && !steer_int) {
             const char *emsg = yyjson_is_obj(err_v) ? jstr(err_v, "message") : NULL;
             char *s = emsg ? strdup(emsg) : stringify_json_val(err_v);
             if (s && s[0]) emit_simple(run, EV_ERROR, s);
@@ -2174,9 +2454,41 @@ static void agy_acp_send_session_open(mcode_agent_run *run, bool load, int rpc_i
     yyjson_mut_doc_free(doc);
 }
 
+static bool agy_acp_send_cancel(mcode_agent_run *run) {
+    if (!run || !run->proc) return false;
+    char sid[MCODE_SESSION_MAX] = "";
+    pthread_mutex_lock(&run->mu);
+    snprintf(sid, sizeof sid, "%s", run->active_session_id);
+    pthread_mutex_unlock(&run->mu);
+    if (!sid[0]) return false;
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return false;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
+    yyjson_mut_obj_add_str(doc, root, "method", "session/cancel");
+    yyjson_mut_val *params = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_strcpy(doc, params, "sessionId", sid);
+    yyjson_mut_obj_add_val(doc, root, "params", params);
+    bool ok = send_json_doc(run->proc, doc);
+    yyjson_mut_doc_free(doc);
+    return ok;
+}
+
+static void agy_acp_finish_turn(mcode_agent_run *run);
+
 static void agy_acp_send_configure_and_prompt(mcode_agent_run *run) {
-    /* 1. Accept workspace file edits automatically; prompt interactively for commands / unsandboxed actions */
-    {
+    pthread_mutex_lock(&run->mu);
+    bool already_interrupted = run->deferred_interrupt;
+    pthread_mutex_unlock(&run->mu);
+    if (already_interrupted) {
+        agy_acp_finish_turn(run);
+        return;
+    }
+
+    /* 1. Configure permission mode unless running with --dangerously-skip-permissions */
+    if (run->init_perm_mode != MCODE_PERM_FULL_ACCESS) {
         yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
         if (doc) {
             yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -2229,7 +2541,9 @@ static void agy_acp_send_configure_and_prompt(mcode_agent_run *run) {
             yyjson_mut_arr_append(prompt_arr, part);
             yyjson_mut_obj_add_val(doc, params, "prompt", prompt_arr);
             yyjson_mut_obj_add_val(doc, root, "params", params);
+            pthread_mutex_lock(&run->mu);
             run->rpc_prompt_sent = true;
+            pthread_mutex_unlock(&run->mu);
             send_json_doc(run->proc, doc);
             yyjson_mut_doc_free(doc);
         }
@@ -2313,7 +2627,9 @@ static void parse_agy_acp_json(mcode_agent_run *run, yyjson_val *root) {
             const char *sid = jstr(res_v, "sessionId");
             if (!sid || !sid[0]) sid = run->init_session_id;
             if (sid && sid[0]) {
+                pthread_mutex_lock(&run->mu);
                 snprintf(run->active_session_id, sizeof run->active_session_id, "%s", sid);
+                pthread_mutex_unlock(&run->mu);
                 emit_simple(run, EV_SESSION, sid);
                 agy_acp_send_configure_and_prompt(run);
             } else {
@@ -2324,9 +2640,14 @@ static void parse_agy_acp_json(mcode_agent_run *run, yyjson_val *root) {
         }
 
         if (rid == 5) {
+            pthread_mutex_lock(&run->mu);
+            bool steer_int = run->steer_interrupting;
+            pthread_mutex_unlock(&run->mu);
             if (err_v) {
-                const char *emsg = jstr(err_v, "message");
-                emit_simple(run, EV_ERROR, emsg ? emsg : "Antigravity ACP prompt failed.");
+                if (!steer_int) {
+                    const char *emsg = jstr(err_v, "message");
+                    emit_simple(run, EV_ERROR, emsg ? emsg : "Antigravity ACP prompt failed.");
+                }
             } else if (yyjson_is_obj(res_v)) {
                 yyjson_val *usage = yyjson_obj_get(res_v, "usage");
                 if (yyjson_is_obj(usage)) {
@@ -2567,10 +2888,12 @@ static void on_proc_exit(int exit_code, bool killed, void *user) {
         handle_line(run, mcode_str_cstr(&run->err_line), true);
         mcode_str_clear(&run->err_line);
     }
+    flush_unsent_live_steers(run);
     pthread_mutex_lock(&run->mu);
     bool clean_rpc_done = run->rpc_turn_done;
+    bool steer_int = run->steer_interrupting;
     pthread_mutex_unlock(&run->mu);
-    if (clean_rpc_done) {
+    if (clean_rpc_done || steer_int) {
         exit_code = 0;
         killed = false;
     }
@@ -2580,7 +2903,8 @@ static void on_proc_exit(int exit_code, bool killed, void *user) {
         ev->kind = EV_DONE;
         ev->int_a = exit_code;
         ev->flag = killed;
-        if (exit_code != 0 && !killed && run->stderr_tail.len > 0) {
+        ev->flag_b = steer_int;
+        if (exit_code != 0 && !killed && !steer_int && run->stderr_tail.len > 0) {
             ev->text = dup_or_null(mcode_str_cstr(&run->stderr_tail));
         }
         push_ev(run, ev);
@@ -2771,6 +3095,29 @@ static void apply_event(mcode_thread *thread, mcode_turn *turn,
             merge_provider_quota(&usage->quotas[thread->agent], ev->quota);
         }
         break;
+    case EV_STEER_REJECTED:
+        if (ev->text && ev->text[0]) {
+            /* Remove optimistic inline steer block if it is still the trailing block */
+            if (turn->block_count > 0) {
+                mcode_block *last = &turn->blocks[turn->block_count - 1];
+                if (last->kind == MCODE_BLOCK_STEER &&
+                    strcmp(mcode_str_cstr(&last->text), ev->text) == 0) {
+                    mcode_str_free(&last->text);
+                    mcode_str_free(&last->input);
+                    mcode_str_free(&last->output);
+                    turn->block_count--;
+                }
+            }
+            if (thread->steer_pending && thread->pending_steer.len > 0) {
+                mcode_str_append_cstr(&thread->pending_steer, "\n\n");
+                mcode_str_append_cstr(&thread->pending_steer, ev->text);
+            } else {
+                mcode_str_set(&thread->pending_steer, ev->text);
+                thread->steer_pending = true;
+            }
+            snprintf(thread->status_text, sizeof thread->status_text, "Steer queued next...");
+        }
+        break;
     case EV_ERROR: {
         if (ev->text && ev->text[0]) {
             const char *new_norm = ev->text;
@@ -2828,11 +3175,17 @@ static void apply_event(mcode_thread *thread, mcode_turn *turn,
                 b->thinking = false;
                 b->duration_sec = (float)(mcode_now_mono() - b->started_mono);
             } else if (b->kind == MCODE_BLOCK_TOOL && b->status == CUI_TASK_RUNNING) {
-                b->status = (ev->flag || ev->int_a != 0) ? CUI_TASK_FAILED : CUI_TASK_DONE;
+                if (ev->flag_b) {
+                    b->status = CUI_TASK_SKIPPED;
+                } else {
+                    b->status = (ev->flag || ev->int_a != 0) ? CUI_TASK_FAILED : CUI_TASK_DONE;
+                }
                 b->duration_sec = (float)(mcode_now_mono() - b->started_mono);
             }
         }
-        if (ev->flag) {
+        if (ev->flag_b) {
+            snprintf(thread->status_text, sizeof thread->status_text, "Steered");
+        } else if (ev->flag) {
             snprintf(thread->status_text, sizeof thread->status_text, "Stopped");
         } else if (ev->int_a != 0) {
             turn->failed = true;
@@ -4354,17 +4707,6 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
 
     const char *bin = status.resolved_path[thread->agent];
     const char *model = mcode_agent_effective_model(thread, settings);
-    char codex_effort_cfg[64] = "";
-    if (thread->reasoning_effort[0]) {
-        snprintf(codex_effort_cfg, sizeof codex_effort_cfg,
-                 "model_reasoning_effort=\"%s\"", thread->reasoning_effort);
-    }
-    const char *codex_speed_cfg = NULL;
-    if (thread->speed_mode == MCODE_SPEED_FAST) {
-        codex_speed_cfg = "service_tier=\"fast\"";
-    } else if (thread->speed_mode == MCODE_SPEED_STANDARD) {
-        codex_speed_cfg = "service_tier=\"default\"";
-    }
     const char *argv[32];
     int n = 0;
     agent_proto_kind proto = AGENT_PROTO_STREAM;
@@ -4373,15 +4715,11 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
     bool full_access = (perm_mode == MCODE_PERM_FULL_ACCESS);
 
     if (thread->agent == APP_AGENT_CLAUDE) {
+        proto = AGENT_PROTO_CLAUDE_CTL;
         argv[n++] = bin;
         argv[n++] = "-p";
-        if (full_access) {
-            argv[n++] = prompt;
-        } else {
-            proto = AGENT_PROTO_CLAUDE_CTL;
-            argv[n++] = "--input-format";
-            argv[n++] = "stream-json";
-        }
+        argv[n++] = "--input-format";
+        argv[n++] = "stream-json";
         argv[n++] = "--output-format";
         argv[n++] = "stream-json";
         argv[n++] = "--verbose";
@@ -4409,79 +4747,20 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
             }
         }
     } else if (thread->agent == APP_AGENT_CODEX) {
-        if (!full_access) {
-            proto = AGENT_PROTO_CODEX_RPC;
-            argv[n++] = bin;
-            argv[n++] = "app-server";
-            argv[n++] = "--listen";
-            argv[n++] = "stdio://";
-        } else {
-            argv[n++] = bin;
-            argv[n++] = "exec";
-            if (thread->session_id[0]) {
-                argv[n++] = "resume";
-                argv[n++] = "--json";
-                argv[n++] = "--skip-git-repo-check";
-                if (model[0]) {
-                    argv[n++] = "-m";
-                    argv[n++] = model;
-                }
-                if (codex_effort_cfg[0]) {
-                    argv[n++] = "-c";
-                    argv[n++] = codex_effort_cfg;
-                }
-                if (codex_speed_cfg) {
-                    argv[n++] = "-c";
-                    argv[n++] = codex_speed_cfg;
-                }
-                argv[n++] = "--dangerously-bypass-approvals-and-sandbox";
-                argv[n++] = thread->session_id;
-                argv[n++] = prompt;
-            } else {
-                argv[n++] = "--json";
-                argv[n++] = "--skip-git-repo-check";
-                if (thread->workdir[0]) {
-                    argv[n++] = "--cd";
-                    argv[n++] = thread->workdir;
-                }
-                if (model[0]) {
-                    argv[n++] = "-m";
-                    argv[n++] = model;
-                }
-                if (codex_effort_cfg[0]) {
-                    argv[n++] = "-c";
-                    argv[n++] = codex_effort_cfg;
-                }
-                if (codex_speed_cfg) {
-                    argv[n++] = "-c";
-                    argv[n++] = codex_speed_cfg;
-                }
-                argv[n++] = "--dangerously-bypass-approvals-and-sandbox";
-                argv[n++] = prompt;
-            }
-        }
+        proto = AGENT_PROTO_CODEX_RPC;
+        argv[n++] = bin;
+        argv[n++] = "app-server";
+        argv[n++] = "--listen";
+        argv[n++] = "stdio://";
     } else { /* APP_AGENT_AGY */
-        if (!full_access) {
-            proto = AGENT_PROTO_AGY_ACP;
-            argv[n++] = bin;
-            argv[n++] = "acp";
-            argv[n++] = "--stdio";
-            argv[n++] = "--sandbox";
-        } else {
-            argv[n++] = bin;
-            argv[n++] = "-p";
-            argv[n++] = prompt;
-            argv[n++] = "--output-format";
-            argv[n++] = "stream-json";
-            if (thread->session_id[0]) {
-                argv[n++] = "--conversation";
-                argv[n++] = thread->session_id;
-            }
-            if (model[0]) {
-                argv[n++] = "--model";
-                argv[n++] = model;
-            }
+        proto = AGENT_PROTO_AGY_ACP;
+        argv[n++] = bin;
+        argv[n++] = "acp";
+        argv[n++] = "--stdio";
+        if (full_access) {
             argv[n++] = "--dangerously-skip-permissions";
+        } else {
+            argv[n++] = "--sandbox";
         }
     }
     argv[n] = NULL;
@@ -4490,6 +4769,7 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
     if (!run) return NULL;
     run->agent = thread->agent;
     run->proto = proto;
+    run->next_rpc_id = 100;
     run->init_prompt = dup_or_null(prompt);
     if (thread->workdir[0]) snprintf(run->init_cwd, sizeof run->init_cwd, "%s", thread->workdir);
     if (model[0]) snprintf(run->init_model, sizeof run->init_model, "%s", model);
@@ -4565,17 +4845,52 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
     return run;
 }
 
+static bool claude_ctl_send_interrupt(mcode_agent_run *run) {
+    if (!run || !run->proc) return false;
+    int64_t rpc_id = 0;
+    pthread_mutex_lock(&run->mu);
+    if (run->next_rpc_id < 100) run->next_rpc_id = 100;
+    rpc_id = run->next_rpc_id++;
+    pthread_mutex_unlock(&run->mu);
+
+    char req_id[48];
+    snprintf(req_id, sizeof req_id, "int_%lld", (long long)rpc_id);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return false;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "type", "control_request");
+    yyjson_mut_obj_add_strcpy(doc, root, "request_id", req_id);
+    yyjson_mut_val *req = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, req, "subtype", "interrupt");
+    yyjson_mut_obj_add_val(doc, root, "request", req);
+    bool ok = send_json_doc(run->proc, doc);
+    yyjson_mut_doc_free(doc);
+    return ok;
+}
+
 bool mcode_agent_poll(mcode_agent_run *run, mcode_thread *thread,
                       mcode_usage_tracker *usage, bool *out_finished) {
     if (out_finished) *out_finished = false;
     if (!run || !thread || thread->turn_count == 0) return false;
 
+    bool escalate_stop = false;
     pthread_mutex_lock(&run->mu);
     agent_ev *list = run->head;
     run->head = NULL;
     run->tail = NULL;
     bool finished = run->finished;
+    if (!finished && run->interrupt_requested_at > 0.0 &&
+        (mcode_now_mono() - run->interrupt_requested_at) > 2.5) {
+        run->interrupt_requested_at = -1.0;
+        escalate_stop = true;
+    }
     pthread_mutex_unlock(&run->mu);
+
+    if (escalate_stop && run->proc) {
+        mcode_proc_stop(run->proc);
+    }
 
     bool changed = false;
     mcode_turn *turn = &thread->turns[thread->turn_count - 1];
@@ -4595,7 +4910,139 @@ bool mcode_agent_poll(mcode_agent_run *run, mcode_thread *thread,
 
 void mcode_agent_stop(mcode_agent_run *run) {
     if (!run || !run->proc) return;
+    if (run->proto == AGENT_PROTO_CODEX_RPC) {
+        codex_rpc_send_turn_interrupt(run);
+    } else if (run->proto == AGENT_PROTO_CLAUDE_CTL) {
+        claude_ctl_send_interrupt(run);
+    } else if (run->proto == AGENT_PROTO_AGY_ACP) {
+        agy_acp_send_cancel(run);
+    }
     mcode_proc_stop(run->proc);
+}
+
+bool mcode_agent_supports_live_steer(const mcode_agent_run *run) {
+    return run != NULL && run->proto == AGENT_PROTO_CODEX_RPC;
+}
+
+mcode_steer_result mcode_agent_steer(mcode_agent_run *run, mcode_thread *thread,
+                                     const char *message) {
+    if (!run || !run->proc || !message || !message[0]) return MCODE_STEER_FAILED;
+
+    bool has_approval = false;
+    bool already_done = false;
+    pthread_mutex_lock(&run->mu);
+    has_approval = run->approval_pending;
+    already_done = run->rpc_turn_done || run->finished;
+    pthread_mutex_unlock(&run->mu);
+
+    if (already_done) {
+        return MCODE_STEER_INTERRUPTING;
+    }
+
+    /* If an interactive permission prompt is blocking the agent, deny it first
+     * to unblock the RPC channel and redirect on the next turn. */
+    if (has_approval) {
+        mcode_agent_respond_approval(run, thread, MCODE_APPROVAL_DENY);
+        pthread_mutex_lock(&run->mu);
+        run->steer_interrupting = true;
+        run->interrupt_requested_at = mcode_now_mono();
+        pthread_mutex_unlock(&run->mu);
+        if (run->proto == AGENT_PROTO_CLAUDE_CTL) {
+            claude_ctl_send_interrupt(run);
+        } else if (run->proto == AGENT_PROTO_AGY_ACP) {
+            agy_acp_send_cancel(run);
+        } else if (run->proto == AGENT_PROTO_CODEX_RPC) {
+            codex_rpc_send_turn_interrupt(run);
+        }
+        return MCODE_STEER_INTERRUPTING;
+    }
+
+    if (run->proto == AGENT_PROTO_CODEX_RPC) {
+        char sid[MCODE_SESSION_MAX] = "";
+        char tid[128] = "";
+        bool buffered = false;
+        bool buf_oom = false;
+
+        pthread_mutex_lock(&run->mu);
+        if (run->rpc_turn_done || run->finished) {
+            pthread_mutex_unlock(&run->mu);
+            return MCODE_STEER_INTERRUPTING;
+        }
+        snprintf(sid, sizeof sid, "%s", run->active_session_id);
+        snprintf(tid, sizeof tid, "%s", run->active_turn_id);
+        if (!tid[0]) {
+            if (run->pending_live_steer_count >= run->pending_live_steer_cap) {
+                int nc = run->pending_live_steer_cap ? run->pending_live_steer_cap * 2 : 4;
+                char **grown = realloc(run->pending_live_steers, (size_t)nc * sizeof *grown);
+                if (grown) {
+                    run->pending_live_steers = grown;
+                    run->pending_live_steer_cap = nc;
+                } else {
+                    buf_oom = true;
+                }
+            }
+            if (!buf_oom) {
+                char *dup = strdup(message);
+                if (dup) {
+                    run->pending_live_steers[run->pending_live_steer_count++] = dup;
+                    buffered = true;
+                } else {
+                    buf_oom = true;
+                }
+            }
+        }
+        pthread_mutex_unlock(&run->mu);
+
+        if (buffered) return MCODE_STEER_INJECTED;
+        if (buf_oom) return MCODE_STEER_FAILED;
+        if (codex_rpc_send_turn_steer(run, sid, tid, message)) {
+            return MCODE_STEER_INJECTED;
+        }
+        return MCODE_STEER_INTERRUPTING;
+    }
+
+    if (run->proto == AGENT_PROTO_CLAUDE_CTL) {
+        pthread_mutex_lock(&run->mu);
+        if (run->rpc_turn_done || run->finished) {
+            pthread_mutex_unlock(&run->mu);
+            return MCODE_STEER_INTERRUPTING;
+        }
+        run->steer_interrupting = true;
+        run->interrupt_requested_at = mcode_now_mono();
+        pthread_mutex_unlock(&run->mu);
+        claude_ctl_send_interrupt(run);
+        return MCODE_STEER_INTERRUPTING;
+    }
+
+    if (run->proto == AGENT_PROTO_AGY_ACP) {
+        bool prompt_sent = false;
+        char sid[MCODE_SESSION_MAX] = "";
+        pthread_mutex_lock(&run->mu);
+        if (run->rpc_turn_done || run->finished) {
+            pthread_mutex_unlock(&run->mu);
+            return MCODE_STEER_INTERRUPTING;
+        }
+        run->steer_interrupting = true;
+        run->interrupt_requested_at = mcode_now_mono();
+        prompt_sent = run->rpc_prompt_sent;
+        snprintf(sid, sizeof sid, "%s", run->active_session_id);
+        if (!prompt_sent) {
+            run->deferred_interrupt = true;
+        }
+        pthread_mutex_unlock(&run->mu);
+        if (prompt_sent && sid[0]) {
+            agy_acp_send_cancel(run);
+        }
+        return MCODE_STEER_INTERRUPTING;
+    }
+
+    /* Stream-only fallback */
+    pthread_mutex_lock(&run->mu);
+    run->steer_interrupting = true;
+    run->interrupt_requested_at = -1.0;
+    pthread_mutex_unlock(&run->mu);
+    mcode_proc_stop(run->proc);
+    return MCODE_STEER_INTERRUPTING;
 }
 
 bool mcode_agent_respond_approval(mcode_agent_run *run, mcode_thread *thread,
@@ -4742,6 +5189,18 @@ void mcode_agent_destroy(mcode_agent_run *run) {
     run->head = run->tail = NULL;
     free(run->approval_payload_json);
     run->approval_payload_json = NULL;
+    for (int i = 0; i < run->pending_live_steer_count; ++i) {
+        free(run->pending_live_steers[i]);
+    }
+    free(run->pending_live_steers);
+    run->pending_live_steers = NULL;
+    run->pending_live_steer_count = 0;
+    run->pending_live_steer_cap = 0;
+    for (int i = 0; i < run->inflight_steer_count; ++i) {
+        free(run->inflight_steer_texts[i]);
+        run->inflight_steer_texts[i] = NULL;
+    }
+    run->inflight_steer_count = 0;
     pthread_mutex_unlock(&run->mu);
     while (cur) {
         agent_ev *next = cur->next;

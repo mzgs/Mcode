@@ -33,6 +33,12 @@ typedef enum {
 } app_agent_kind;
 
 typedef enum {
+    APP_BUSY_SUBMIT_QUEUE = 0,
+    APP_BUSY_SUBMIT_STEER,
+    APP_BUSY_SUBMIT_COUNT
+} app_busy_submit_mode;
+
+typedef enum {
     APP_THEME_SYSTEM = 0,
     APP_THEME_LIGHT,
     APP_THEME_DARK,
@@ -55,6 +61,7 @@ typedef struct {
     /* Mcode agent & workflow preferences. */
     struct {
         app_agent_kind default_agent;
+        app_busy_submit_mode busy_submit_mode;
         bool auto_approve_permissions;
         char claude_bin[APP_CLI_PATH_MAX];
         char codex_bin[APP_CLI_PATH_MAX];

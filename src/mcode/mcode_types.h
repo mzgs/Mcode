@@ -54,6 +54,7 @@ typedef enum {
     MCODE_BLOCK_REASONING,
     MCODE_BLOCK_TOOL,
     MCODE_BLOCK_ERROR,
+    MCODE_BLOCK_STEER,
 } mcode_block_kind;
 
 typedef struct {
@@ -82,6 +83,7 @@ typedef struct {
     float duration_sec;
     bool running;
     bool failed;
+    bool steered;
     int vote;
     int64_t input_tokens;
     int64_t output_tokens;
@@ -180,6 +182,12 @@ typedef struct {
     bool can_allow_session;
 } mcode_pending_approval;
 
+typedef struct {
+    char id[MCODE_ID_MAX];
+    mcode_str text;
+    int64_t created_at;
+} mcode_queued_msg;
+
 struct mcode_agent_run;
 struct mcode_title_run;
 
@@ -204,6 +212,11 @@ typedef struct {
     int turn_count;
     int turn_cap;
 
+    /* Queued follow-up messages (FIFO, persisted) */
+    mcode_queued_msg *queued_msgs;
+    int queued_count;
+    int queued_cap;
+
     /* Live runtime state (not persisted) */
     bool is_draft;
     struct mcode_agent_run *active_run;
@@ -213,6 +226,10 @@ typedef struct {
     char status_text[160];
     double run_started_mono;
     mcode_pending_approval pending_approval;
+    bool queue_paused;
+    bool stop_requested;
+    bool steer_pending;
+    mcode_str pending_steer;
 
     mcode_diff_file *diff_files;
     int diff_file_count;
@@ -242,5 +259,13 @@ mcode_block *mcode_turn_find_tool(mcode_turn *turn, const char *tool_id);
 void mcode_turn_free(mcode_turn *turn);
 void mcode_thread_free_runtime(mcode_thread *thread);
 void mcode_thread_free(mcode_thread *thread);
+
+/* Per-thread follow-up message queue helpers (FIFO). */
+mcode_queued_msg *mcode_thread_queue_push(mcode_thread *thread, const char *text);
+mcode_queued_msg *mcode_thread_queue_push_front(mcode_thread *thread, const char *text);
+bool mcode_thread_queue_pop_front(mcode_thread *thread, mcode_str *out_text);
+bool mcode_thread_queue_remove(mcode_thread *thread, int index);
+bool mcode_thread_queue_move(mcode_thread *thread, int from_idx, int to_idx);
+void mcode_thread_queue_clear(mcode_thread *thread);
 
 #endif

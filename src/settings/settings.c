@@ -306,6 +306,11 @@ static const char *const agent_names[APP_AGENT_COUNT] = {
     "agy",
 };
 
+static const char *const busy_submit_names[APP_BUSY_SUBMIT_COUNT] = {
+    "queue",
+    "steer",
+};
+
 static double json_number(yyjson_val *value) {
     return yyjson_is_num(value) ? yyjson_get_num(value) : NAN;
 }
@@ -341,6 +346,18 @@ static bool parse_agent_kind(yyjson_val *value, app_agent_kind *out) {
     for (int i = 0; i < APP_AGENT_COUNT; ++i) {
         if (str_eq_ignore_case(text, agent_names[i])) {
             *out = (app_agent_kind)i;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool parse_busy_submit_mode(yyjson_val *value, app_busy_submit_mode *out) {
+    const char *text = json_cstr(value, NULL);
+    if (!text) return false;
+    for (int i = 0; i < APP_BUSY_SUBMIT_COUNT; ++i) {
+        if (str_eq_ignore_case(text, busy_submit_names[i])) {
+            *out = (app_busy_submit_mode)i;
             return true;
         }
     }
@@ -452,6 +469,9 @@ bool app_settings_load(app_settings *settings, const char *override) {
     yyjson_val *mcode = yyjson_obj_get(root, "mcode");
     if (yyjson_is_obj(mcode)) {
         if (parse_agent_kind(yyjson_obj_get(mcode, "default_agent"), &loaded.mcode.default_agent))
+            applied = true;
+        if (parse_busy_submit_mode(yyjson_obj_get(mcode, "busy_submit_mode"),
+                                   &loaded.mcode.busy_submit_mode))
             applied = true;
         yyjson_val *aa = yyjson_obj_get(mcode, "auto_approve_permissions");
         if (yyjson_is_bool(aa)) {
@@ -608,9 +628,13 @@ bool app_settings_save(const app_settings *settings, const char *override) {
     const char *agent_name = (settings->mcode.default_agent >= 0 &&
                               settings->mcode.default_agent < APP_AGENT_COUNT)
         ? agent_names[settings->mcode.default_agent] : agent_names[APP_AGENT_CLAUDE];
+    const char *busy_mode_name = (settings->mcode.busy_submit_mode >= 0 &&
+                                  settings->mcode.busy_submit_mode < APP_BUSY_SUBMIT_COUNT)
+        ? busy_submit_names[settings->mcode.busy_submit_mode] : busy_submit_names[APP_BUSY_SUBMIT_QUEUE];
     yyjson_mut_val *mcode = root ? yyjson_mut_obj(doc) : NULL;
     bool ok = root && mcode &&
         yyjson_mut_obj_add_str(doc, mcode, "default_agent", agent_name) &&
+        yyjson_mut_obj_add_str(doc, mcode, "busy_submit_mode", busy_mode_name) &&
         yyjson_mut_obj_add_bool(doc, mcode, "auto_approve_permissions", settings->mcode.auto_approve_permissions) &&
         yyjson_mut_obj_add_str(doc, mcode, "claude_bin", settings->mcode.claude_bin) &&
         yyjson_mut_obj_add_str(doc, mcode, "codex_bin", settings->mcode.codex_bin) &&

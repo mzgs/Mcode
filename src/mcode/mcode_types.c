@@ -171,6 +171,9 @@ void mcode_thread_free_runtime(mcode_thread *thread) {
     free(thread->diff_new_text);
     thread->diff_new_text = NULL;
     thread->diff_loaded_path[0] = '\0';
+    mcode_str_free(&thread->pending_steer);
+    thread->steer_pending = false;
+    thread->stop_requested = false;
 }
 
 void mcode_thread_free(mcode_thread *thread) {
@@ -182,5 +185,110 @@ void mcode_thread_free(mcode_thread *thread) {
     thread->turns = NULL;
     thread->turn_count = 0;
     thread->turn_cap = 0;
+    mcode_thread_queue_clear(thread);
     mcode_thread_free_runtime(thread);
+}
+
+static bool queue_ensure_cap(mcode_thread *thread) {
+    if (!thread) return false;
+    if (thread->queued_count < thread->queued_cap) return true;
+    int new_cap = thread->queued_cap ? thread->queued_cap * 2 : 4;
+    mcode_queued_msg *grown = realloc(thread->queued_msgs, (size_t)new_cap * sizeof *grown);
+    if (!grown) return false;
+    thread->queued_msgs = grown;
+    thread->queued_cap = new_cap;
+    return true;
+}
+
+mcode_queued_msg *mcode_thread_queue_push(mcode_thread *thread, const char *text) {
+    if (!thread || !text || !text[0]) return NULL;
+    if (!queue_ensure_cap(thread)) return NULL;
+    mcode_queued_msg *m = &thread->queued_msgs[thread->queued_count++];
+    memset(m, 0, sizeof *m);
+    mcode_gen_id(m->id, sizeof m->id, "qmsg");
+    mcode_str_init(&m->text);
+    if (!mcode_str_set(&m->text, text)) {
+        thread->queued_count--;
+        return NULL;
+    }
+    m->created_at = mcode_now_epoch();
+    return m;
+}
+
+mcode_queued_msg *mcode_thread_queue_push_front(mcode_thread *thread, const char *text) {
+    if (!thread || !text || !text[0]) return NULL;
+    if (!queue_ensure_cap(thread)) return NULL;
+    if (thread->queued_count > 0) {
+        memmove(&thread->queued_msgs[1], &thread->queued_msgs[0],
+                (size_t)thread->queued_count * sizeof thread->queued_msgs[0]);
+    }
+    thread->queued_count++;
+    mcode_queued_msg *m = &thread->queued_msgs[0];
+    memset(m, 0, sizeof *m);
+    mcode_gen_id(m->id, sizeof m->id, "qmsg");
+    mcode_str_init(&m->text);
+    if (!mcode_str_set(&m->text, text)) {
+        if (thread->queued_count > 1) {
+            memmove(&thread->queued_msgs[0], &thread->queued_msgs[1],
+                    (size_t)(thread->queued_count - 1) * sizeof thread->queued_msgs[0]);
+        }
+        thread->queued_count--;
+        return NULL;
+    }
+    m->created_at = mcode_now_epoch();
+    return m;
+}
+
+bool mcode_thread_queue_pop_front(mcode_thread *thread, mcode_str *out_text) {
+    if (!thread || thread->queued_count <= 0) return false;
+    if (out_text) {
+        mcode_str_set(out_text, mcode_str_cstr(&thread->queued_msgs[0].text));
+    }
+    mcode_str_free(&thread->queued_msgs[0].text);
+    if (thread->queued_count > 1) {
+        memmove(&thread->queued_msgs[0], &thread->queued_msgs[1],
+                (size_t)(thread->queued_count - 1) * sizeof thread->queued_msgs[0]);
+    }
+    thread->queued_count--;
+    return true;
+}
+
+bool mcode_thread_queue_remove(mcode_thread *thread, int index) {
+    if (!thread || index < 0 || index >= thread->queued_count) return false;
+    mcode_str_free(&thread->queued_msgs[index].text);
+    if (index + 1 < thread->queued_count) {
+        memmove(&thread->queued_msgs[index], &thread->queued_msgs[index + 1],
+                (size_t)(thread->queued_count - index - 1) * sizeof thread->queued_msgs[0]);
+    }
+    thread->queued_count--;
+    return true;
+}
+
+bool mcode_thread_queue_move(mcode_thread *thread, int from_idx, int to_idx) {
+    if (!thread || from_idx < 0 || from_idx >= thread->queued_count ||
+        to_idx < 0 || to_idx >= thread->queued_count) {
+        return false;
+    }
+    if (from_idx == to_idx) return true;
+    mcode_queued_msg tmp = thread->queued_msgs[from_idx];
+    if (from_idx < to_idx) {
+        memmove(&thread->queued_msgs[from_idx], &thread->queued_msgs[from_idx + 1],
+                (size_t)(to_idx - from_idx) * sizeof thread->queued_msgs[0]);
+    } else {
+        memmove(&thread->queued_msgs[to_idx + 1], &thread->queued_msgs[to_idx],
+                (size_t)(from_idx - to_idx) * sizeof thread->queued_msgs[0]);
+    }
+    thread->queued_msgs[to_idx] = tmp;
+    return true;
+}
+
+void mcode_thread_queue_clear(mcode_thread *thread) {
+    if (!thread) return;
+    for (int i = 0; i < thread->queued_count; ++i) {
+        mcode_str_free(&thread->queued_msgs[i].text);
+    }
+    free(thread->queued_msgs);
+    thread->queued_msgs = NULL;
+    thread->queued_count = 0;
+    thread->queued_cap = 0;
 }

@@ -660,7 +660,7 @@ static void draw_empty_workspace(mcode_app *app, cui_ctx *ui) {
     }
 }
 
-static void draw_user_message(cui_ctx *ui, const char *thread_id, const char *text) {
+static void draw_user_message(cui_ctx *ui, const char *thread_id, const char *text, bool steered) {
     if (!text) text = "";
     cui_push_id(ui, (thread_id && thread_id[0]) ? thread_id : "thread");
     cui_push_id(ui, "user-msg");
@@ -673,17 +673,29 @@ static void draw_user_message(cui_ctx *ui, const char *thread_id, const char *te
     if (accent == CUI_ACCENT_NEUTRAL) {
         cui_color fg = cui_color_of(ui, CUI_COLOR_FOREGROUND);
         bg = cui_mix(surface, fg, dark ? 0.08f : 0.055f);
-        border_col = cui_color_of(ui, dark ? CUI_COLOR_BORDER : CUI_COLOR_BORDER_SUBTLE);
+        border_col = steered
+            ? cui_alpha(cui_color_of(ui, CUI_COLOR_INFO), dark ? 0.45f : 0.35f)
+            : cui_color_of(ui, dark ? CUI_COLOR_BORDER : CUI_COLOR_BORDER_SUBTLE);
     } else {
         cui_color acc = cui_color_of(ui, CUI_COLOR_ACCENT);
-        bg = cui_mix(surface, acc, dark ? 0.14f : 0.09f);
-        border_col = cui_alpha(acc, dark ? 0.30f : 0.22f);
+        bg = cui_mix(surface, acc, dark ? (steered ? 0.18f : 0.14f) : (steered ? 0.12f : 0.09f));
+        border_col = cui_alpha(acc, dark ? (steered ? 0.50f : 0.30f) : (steered ? 0.40f : 0.22f));
     }
 
     cui_row(ui, .width = CUI_FILL, .justify = CUI_JUSTIFY_END, .pad_top = 10) {
-        cui_column(ui, .max_width = 480, .pad_x = 13, .pad_y = 8,
+        cui_column(ui, .max_width = 480, .pad_x = 13, .pad_y = 8, .gap = 4,
                    .bg = bg, .border = 1.0f, .border_color = border_col,
                    .radius_tl = 18, .radius_tr = 18, .radius_br = 6, .radius_bl = 18) {
+            if (steered) {
+                cui_color tag_col = (accent == CUI_ACCENT_NEUTRAL)
+                    ? cui_color_of(ui, CUI_COLOR_INFO)
+                    : cui_color_of(ui, CUI_COLOR_ACCENT);
+                cui_row(ui, .gap = 4, .align = CUI_ALIGN_CENTER) {
+                    cui_icon(ui, CUI_ICON_ARROW_RIGHT, 11, tag_col);
+                    cui_text(ui, "Steered", .font = CUI_FONT_MEDIUM, .size = 11.0f,
+                             .color = tag_col, .nowrap = true);
+                }
+            }
             cui_text(ui, text, .color = CUI_COLOR_FOREGROUND,
                      .line_height = 1.45f, .selectable = true);
         }
@@ -700,7 +712,7 @@ static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int tur
 
     cui_column(ui, .width = CUI_FILL, .gap = 10) {
         /* User prompt bubble */
-        draw_user_message(ui, thread->id, mcode_str_cstr(&turn->prompt));
+        draw_user_message(ui, thread->id, mcode_str_cstr(&turn->prompt), turn->steered);
 
         /* Assistant stream blocks */
         const char *last_text = NULL;
@@ -762,6 +774,13 @@ static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int tur
             } else if (b->kind == MCODE_BLOCK_ERROR) {
                 cui_alert(ui, "Agent error", .description = mcode_str_cstr(&b->text),
                           .tone = CUI_TONE_DANGER);
+            } else if (b->kind == MCODE_BLOCK_STEER) {
+                const char *stxt = mcode_str_cstr(&b->text);
+                if (stxt[0]) {
+                    cui_push_id(ui, bid);
+                    draw_user_message(ui, thread->id, stxt, true);
+                    cui_pop_id(ui);
+                }
             }
         }
 
@@ -1644,11 +1663,340 @@ static void draw_composer_options_strip(mcode_app *app, cui_ctx *ui, mcode_threa
     }
 }
 
+static bool composer_draft_is_blank(const char *s) {
+    if (!s) return true;
+    while (*s) {
+        if (!isspace((unsigned char)*s)) return false;
+        ++s;
+    }
+    return true;
+}
+
+static void format_single_line_preview(const char *src, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (!src || !src[0]) return;
+    size_t w = 0;
+    bool prev_space = true;
+    for (const char *p = src; *p && w + 1 < cap; ++p) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '\r' || c == '\n' || c == '\t' || c == ' ') {
+            if (!prev_space) {
+                out[w++] = ' ';
+                prev_space = true;
+            }
+        } else {
+            out[w++] = (char)c;
+            prev_space = false;
+        }
+    }
+    while (w > 0 && out[w - 1] == ' ') --w;
+    out[w] = '\0';
+}
+
+static bool draw_composer_action_pill(cui_ctx *ui, const char *id, const char *icon,
+                                      const char *label, bool compact, bool primary,
+                                      bool enabled, const char *tooltip) {
+    cui_id cid = cui_make_id(ui, id);
+    cui_rect r = cui_get_rect(ui, cid);
+    cui_vec2 mp = cui_mouse_pos(ui);
+    bool hov = enabled && r.w > 0.0f &&
+               mp.x >= r.x && mp.x <= r.x + r.w &&
+               mp.y >= r.y && mp.y <= r.y + r.h;
+
+    bool dark = (cui_get_theme_mode(ui) == CUI_THEME_DARK);
+    cui_color fg = cui_color_of(ui, CUI_COLOR_FOREGROUND);
+    cui_color acc = (cui_get_accent(ui) == CUI_ACCENT_NEUTRAL)
+        ? fg : cui_color_of(ui, CUI_COLOR_ACCENT);
+
+    cui_color bg;
+    cui_color bdr;
+    cui_color txt_col;
+    if (!enabled) {
+        bg = CUI_RGBA(0x00000001u);
+        bdr = cui_alpha(fg, dark ? 0.10f : 0.10f);
+        txt_col = CUI_COLOR_TEXT_MUTED;
+    } else if (primary) {
+        bg = cui_alpha(acc, hov ? (dark ? 0.28f : 0.18f) : (dark ? 0.18f : 0.12f));
+        bdr = cui_alpha(acc, dark ? 0.42f : 0.30f);
+        txt_col = (cui_get_accent(ui) == CUI_ACCENT_NEUTRAL) ? CUI_COLOR_FOREGROUND : CUI_COLOR_ACCENT;
+    } else {
+        bg = hov ? cui_alpha(fg, dark ? 0.11f : 0.08f) : cui_alpha(fg, dark ? 0.05f : 0.035f);
+        bdr = cui_alpha(fg, hov ? (dark ? 0.22f : 0.18f) : (dark ? 0.13f : 0.12f));
+        txt_col = hov ? CUI_COLOR_FOREGROUND : CUI_COLOR_TEXT_SECONDARY;
+    }
+
+    bool clicked = cui_card_begin(ui, &(cui_card_opts){
+        .id = id,
+        .dir = CUI_ROW,
+        .align = CUI_ALIGN_CENTER,
+        .width = compact ? CUI_PX(28) : CUI_FIT,
+        .height = CUI_PX(28),
+        .pad_x = compact ? 1 : 9,
+        .pad_y = 1,
+        .gap = compact ? 0 : 5,
+        .hoverable = enabled,
+        .border = 1.0f,
+        .border_color = bdr,
+        .radius = 8,
+        .bg = bg,
+    });
+    if (compact) {
+        cui_row(ui, .width = CUI_FILL, .justify = CUI_JUSTIFY_CENTER, .align = CUI_ALIGN_CENTER) {
+            if (icon && icon[0]) {
+                cui_icon(ui, icon, 13.0f, txt_col);
+            }
+        }
+    } else {
+        if (icon && icon[0]) {
+            cui_icon(ui, icon, 13.0f, txt_col);
+        }
+        if (label && label[0]) {
+            cui_text(ui, label, .font = CUI_FONT_MEDIUM, .size = 12.0f,
+                     .color = txt_col, .nowrap = true);
+        }
+    }
+    cui_card_end(ui);
+    if (tooltip && tooltip[0]) {
+        cui_tooltip(ui, tooltip);
+    }
+    return enabled && clicked;
+}
+
+static void draw_queued_item_row(cui_ctx *ui, const mcode_queued_msg *qm, int idx, bool busy,
+                                 int *act_steer, int *act_up, int *act_edit, int *act_remove) {
+    bool dark = (cui_get_theme_mode(ui) == CUI_THEME_DARK);
+    cui_color fg = cui_color_of(ui, CUI_COLOR_FOREGROUND);
+    cui_push_id(ui, qm->id);
+
+    cui_id rid = cui_make_id(ui, "qrow");
+    cui_rect rr = cui_get_rect(ui, rid);
+    cui_vec2 mp = cui_mouse_pos(ui);
+    bool hov = rr.w > 0.0f && mp.x >= rr.x && mp.x <= rr.x + rr.w &&
+               mp.y >= rr.y && mp.y <= rr.y + rr.h;
+
+    cui_color row_bg = hov
+        ? cui_alpha(fg, dark ? 0.065f : 0.045f)
+        : cui_alpha(fg, dark ? 0.03f : 0.02f);
+
+    char num_lbl[16];
+    snprintf(num_lbl, sizeof num_lbl, "%d", idx + 1);
+    char preview[256];
+    format_single_line_preview(mcode_str_cstr(&qm->text), preview, sizeof preview);
+
+    cui_row(ui, .id = "qrow", .width = CUI_FILL, .pad_x = 8, .pad_y = 5, .gap = 6,
+            .align = CUI_ALIGN_CENTER, .radius = 8, .bg = row_bg) {
+        cui_box(ui, .width = CUI_PX(18), .height = CUI_PX(18), .radius = 5,
+                .bg = cui_alpha(fg, dark ? 0.08f : 0.07f),
+                .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER) {
+            cui_text(ui, num_lbl, .font = CUI_FONT_MONO, .size = 10.5f,
+                     .color = CUI_COLOR_TEXT_MUTED, .tabular = true, .nowrap = true);
+        }
+        cui_text(ui, preview[0] ? preview : "(empty)", .size = 12.5f,
+                 .color = CUI_COLOR_FOREGROUND, .width = CUI_FILL, .nowrap = true);
+        cui_tooltip(ui, mcode_str_cstr(&qm->text));
+
+        cui_row(ui, .gap = 2, .align = CUI_ALIGN_CENTER) {
+            if (idx > 0) {
+                if (cui_icon_button(ui, CUI_ICON_CHEVRON_UP,
+                                    .size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST,
+                                    .width = CUI_PX(24),
+                                    .tooltip = "Move up")) {
+                    *act_up = idx;
+                }
+            }
+            if (cui_icon_button(ui, busy ? CUI_ICON_ARROW_RIGHT : CUI_ICON_ARROW_UP,
+                                .size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST,
+                                .width = CUI_PX(24),
+                                .tooltip = busy ? "Steer now" : "Send now")) {
+                *act_steer = idx;
+            }
+            if (cui_icon_button(ui, CUI_ICON_PENCIL,
+                                .size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST,
+                                .width = CUI_PX(24),
+                                .tooltip = "Edit in composer")) {
+                *act_edit = idx;
+            }
+            if (cui_icon_button(ui, CUI_ICON_X,
+                                .size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST,
+                                .width = CUI_PX(24),
+                                .tooltip = "Remove from queue")) {
+                *act_remove = idx;
+            }
+        }
+    }
+
+    cui_pop_id(ui);
+}
+
+static void draw_message_queue_dock(mcode_app *app, cui_ctx *ui, mcode_thread *thread,
+                                    bool busy, cui_id composer_fid) {
+    bool has_steer = thread->steer_pending && thread->pending_steer.len > 0;
+    bool has_queue = thread->queued_count > 0;
+    if (!has_steer && !has_queue) return;
+
+    bool dark = (cui_get_theme_mode(ui) == CUI_THEME_DARK);
+    cui_color surface = cui_color_of(ui, CUI_COLOR_SURFACE);
+    cui_color fg = cui_color_of(ui, CUI_COLOR_FOREGROUND);
+    cui_color dock_bg = dark ? cui_mix(surface, fg, 0.03f) : cui_color_of(ui, CUI_COLOR_SURFACE_MUTED);
+    cui_color dock_bdr = cui_color_of(ui, CUI_COLOR_BORDER);
+
+    bool act_cancel_steer = false;
+    bool act_send_next = false;
+    bool act_clear = false;
+    int act_steer = -1;
+    int act_up = -1;
+    int act_edit = -1;
+    int act_remove = -1;
+
+    cui_column(ui, .id = "msg-queue-dock", .width = CUI_FILL,
+               .pad_x = 10, .pad_y = 8, .gap = 6,
+               .radius = 12, .border = 1.0f, .border_color = dock_bdr, .bg = dock_bg) {
+        if (has_steer) {
+            char spreview[256];
+            format_single_line_preview(mcode_str_cstr(&thread->pending_steer),
+                                       spreview, sizeof spreview);
+            cui_row(ui, .width = CUI_FILL, .gap = 7, .align = CUI_ALIGN_CENTER) {
+                cui_spinner(ui, 12);
+                cui_badge(ui, "Steering", .tone = CUI_TONE_ACCENT, .size = CUI_SIZE_SM);
+                cui_text(ui, spreview, .size = 12.5f, .color = CUI_COLOR_FOREGROUND,
+                         .width = CUI_FILL, .nowrap = true);
+                cui_tooltip(ui, mcode_str_cstr(&thread->pending_steer));
+                if (cui_icon_button(ui, CUI_ICON_X, .size = CUI_SIZE_SM,
+                                    .variant = CUI_BUTTON_GHOST, .width = CUI_PX(24),
+                                    .tooltip = "Cancel steer")) {
+                    act_cancel_steer = true;
+                }
+            }
+            if (has_queue) {
+                cui_separator(ui);
+            }
+        }
+
+        if (has_queue) {
+            char hdr[64];
+            if (!busy && thread->queue_paused) {
+                snprintf(hdr, sizeof hdr, "Queued (%d) · Paused", thread->queued_count);
+            } else {
+                snprintf(hdr, sizeof hdr, "Queued (%d)", thread->queued_count);
+            }
+            cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
+                cui_icon(ui, CUI_ICON_LIST, 12.5f, CUI_COLOR_TEXT_MUTED);
+                cui_text(ui, hdr, .font = CUI_FONT_MEDIUM, .size = 12.0f,
+                         .color = CUI_COLOR_TEXT_SECONDARY, .nowrap = true);
+                cui_spacer(ui);
+                if (!busy) {
+                    if (cui_button(ui, "Send next", .variant = CUI_BUTTON_SECONDARY,
+                                   .size = CUI_SIZE_SM, .icon = CUI_ICON_PLAY)) {
+                        act_send_next = true;
+                    }
+                }
+                if (thread->queued_count > 1) {
+                    if (cui_button(ui, "Clear", .variant = CUI_BUTTON_GHOST,
+                                   .size = CUI_SIZE_SM)) {
+                        act_clear = true;
+                    }
+                }
+            }
+
+            if (thread->queued_count > 3) {
+                cui_scroll(ui, .id = "msg-queue-list", .width = CUI_FILL,
+                           .height = CUI_PX(136), .gap = 4) {
+                    for (int i = 0; i < thread->queued_count; ++i) {
+                        draw_queued_item_row(ui, &thread->queued_msgs[i], i, busy,
+                                             &act_steer, &act_up, &act_edit, &act_remove);
+                    }
+                }
+            } else {
+                cui_column(ui, .width = CUI_FILL, .gap = 4) {
+                    for (int i = 0; i < thread->queued_count; ++i) {
+                        draw_queued_item_row(ui, &thread->queued_msgs[i], i, busy,
+                                             &act_steer, &act_up, &act_edit, &act_remove);
+                    }
+                }
+            }
+        }
+    }
+
+    if (act_cancel_steer) {
+        mcode_ui_cancel_pending_steer(app, thread);
+    }
+    if (act_send_next) {
+        mcode_ui_send_next_queued(app, ui, thread);
+    } else if (act_clear) {
+        mcode_thread_queue_clear(thread);
+        thread->queue_paused = false;
+        mcode_ui_mark_dirty(app);
+    } else if (act_steer >= 0 && act_steer < thread->queued_count) {
+        mcode_ui_steer_queued_item(app, ui, thread, act_steer);
+    } else if (act_up > 0 && act_up < thread->queued_count) {
+        mcode_thread_queue_move(thread, act_up, act_up - 1);
+        mcode_ui_mark_dirty(app);
+    } else if (act_edit >= 0 && act_edit < thread->queued_count) {
+        char *pulled = strdup(mcode_str_cstr(&thread->queued_msgs[act_edit].text));
+        if (pulled) {
+            if (!composer_draft_is_blank(thread->composer_draft)) {
+                /* Swap current draft into this queue slot so typed text is never lost. */
+                mcode_str_set(&thread->queued_msgs[act_edit].text, thread->composer_draft);
+            } else {
+                mcode_thread_queue_remove(thread, act_edit);
+                if (thread->queued_count == 0) thread->queue_paused = false;
+            }
+            snprintf(thread->composer_draft, sizeof thread->composer_draft, "%s", pulled);
+            free(pulled);
+            mcode_ui_mark_dirty(app);
+            cui_set_focus(ui, composer_fid);
+        }
+    } else if (act_remove >= 0 && act_remove < thread->queued_count) {
+        mcode_thread_queue_remove(thread, act_remove);
+        if (thread->queued_count == 0) thread->queue_paused = false;
+        mcode_ui_mark_dirty(app);
+    }
+}
+
 static void draw_thread_composer(mcode_app *app, cui_ctx *ui, mcode_thread *thread, bool centered) {
     bool busy = (thread->active_run != NULL);
+    const app_settings *settings = app_chrome_settings(app->chrome);
+    bool steer_default = (settings && settings->mcode.busy_submit_mode == APP_BUSY_SUBMIT_STEER);
+    bool draft_blank = composer_draft_is_blank(thread->composer_draft);
+
+    cui_id composer_id = cui_make_id(ui, "thread-composer");
+    cui_id composer_fid = composer_id ^ 0xF1E1Du;
 
     if (!centered) {
         draw_composer_options_strip(app, ui, thread);
+    }
+
+    draw_message_queue_dock(app, ui, thread, busy, composer_fid);
+    /* Refresh blank/busy status in case queue dock actions mutated draft or started a turn */
+    busy = (thread->active_run != NULL);
+    draft_blank = composer_draft_is_blank(thread->composer_draft);
+
+    bool want_queue = false;
+    bool want_steer = false;
+    if (cui_is_focused(ui, composer_fid)) {
+        int mods = cui_key_mods(ui);
+        if (busy && !draft_blank && cui_key_pressed(ui, CUI_KEY_ENTER) && !(mods & CUI_MOD_SHIFT)) {
+            if (mods & (CUI_MOD_PRIMARY | CUI_MOD_ALT)) {
+                cui_key_consume(ui, CUI_KEY_ENTER);
+                if (steer_default) want_queue = true;
+                else want_steer = true;
+            } else if (!(mods & (CUI_MOD_CTRL | CUI_MOD_SUPER))) {
+                cui_key_consume(ui, CUI_KEY_ENTER);
+                if (steer_default) want_steer = true;
+                else want_queue = true;
+            }
+        } else if (draft_blank && thread->queued_count > 0 &&
+                   cui_key_pressed(ui, CUI_KEY_UP) && mods == 0) {
+            cui_key_consume(ui, CUI_KEY_UP);
+            int last = thread->queued_count - 1;
+            snprintf(thread->composer_draft, sizeof thread->composer_draft, "%s",
+                     mcode_str_cstr(&thread->queued_msgs[last].text));
+            mcode_thread_queue_remove(thread, last);
+            if (thread->queued_count == 0) thread->queue_paused = false;
+            mcode_ui_mark_dirty(app);
+            draft_blank = composer_draft_is_blank(thread->composer_draft);
+        }
     }
 
     static const char *const k_first_placeholders[APP_AGENT_COUNT] = {
@@ -1661,13 +2009,34 @@ static void draw_thread_composer(mcode_app *app, cui_ctx *ui, mcode_thread *thre
         "Send a follow-up to Codex...",
         "Send a follow-up to Antigravity CLI...",
     };
-    const char *placeholder = thread->turn_count == 0
-        ? k_first_placeholders[thread->agent]
-        : k_followup_placeholders[thread->agent];
+#ifdef __APPLE__
+    const char *alt_key = "Cmd+Enter";
+#else
+    const char *alt_key = "Ctrl+Enter";
+#endif
+    char busy_placeholder[160];
+    if (steer_default) {
+        snprintf(busy_placeholder, sizeof busy_placeholder,
+                 "Steer %s (Enter) or queue follow-up (%s)...",
+                 mcode_agent_short_label(thread->agent), alt_key);
+    } else {
+        snprintf(busy_placeholder, sizeof busy_placeholder,
+                 "Queue follow-up (Enter) or steer %s (%s)...",
+                 mcode_agent_short_label(thread->agent), alt_key);
+    }
+    const char *placeholder = busy
+        ? busy_placeholder
+        : (thread->turn_count == 0
+               ? k_first_placeholders[thread->agent]
+               : k_followup_placeholders[thread->agent]);
 
     int ev = 0;
     float toolbar_left = 10.0f + cui_theme_get(ui)->control_sm + 6.0f;
     cui_placement pop_place = centered ? CUI_PLACE_BOTTOM_START : CUI_PLACE_TOP_START;
+    float comp_w = cui_get_rect(ui, composer_id).w;
+    bool compact_actions = (comp_w > 0.0f && comp_w < 500.0f);
+    bool live_steer = busy && mcode_agent_supports_live_steer(thread->active_run);
+
     cui_box(ui, .dir = CUI_STACK, .width = CUI_FILL,
             .align = CUI_ALIGN_START, .justify = CUI_JUSTIFY_END) {
         ev = cui_chat_composer(ui, "thread-composer",
@@ -1686,6 +2055,25 @@ static void draw_thread_composer(mcode_app *app, cui_ctx *ui, mcode_thread *thre
             mcode_ui_draw_composer_usage_ring(
                 app, ui, thread,
                 centered ? CUI_PLACE_BOTTOM_END : CUI_PLACE_TOP_END);
+
+            if (busy) {
+                bool can_submit = !composer_draft_is_blank(thread->composer_draft);
+                char qtip[128];
+                snprintf(qtip, sizeof qtip, "Queue for next turn (%s)",
+                         steer_default ? alt_key : "Enter");
+                char stip[160];
+                snprintf(stip, sizeof stip, "%s (%s)",
+                         live_steer ? "Steer active turn live" : "Redirect active turn now",
+                         steer_default ? "Enter" : alt_key);
+                if (draw_composer_action_pill(ui, "cmp-queue-btn", CUI_ICON_LIST, "Queue",
+                                              compact_actions, !steer_default, can_submit, qtip)) {
+                    want_queue = true;
+                }
+                if (draw_composer_action_pill(ui, "cmp-steer-btn", CUI_ICON_ARROW_RIGHT, "Steer",
+                                              compact_actions, steer_default, can_submit, stip)) {
+                    want_steer = true;
+                }
+            }
         }
     }
 
@@ -1710,7 +2098,21 @@ static void draw_thread_composer(mcode_app *app, cui_ctx *ui, mcode_thread *thre
                      "%s@%s ", cur_len > 0 ? " " : "", rel);
         }
     }
-    if ((ev & CUI_COMPOSER_SEND) && thread->composer_draft[0]) {
+    if (want_steer && !composer_draft_is_blank(thread->composer_draft)) {
+        char *copy = strdup(thread->composer_draft);
+        thread->composer_draft[0] = '\0';
+        if (copy) {
+            mcode_ui_steer_message(app, ui, thread, copy);
+            free(copy);
+        }
+    } else if (want_queue && !composer_draft_is_blank(thread->composer_draft)) {
+        char *copy = strdup(thread->composer_draft);
+        thread->composer_draft[0] = '\0';
+        if (copy) {
+            mcode_ui_queue_message(app, ui, thread, copy);
+            free(copy);
+        }
+    } else if ((ev & CUI_COMPOSER_SEND) && !composer_draft_is_blank(thread->composer_draft)) {
         char *copy = strdup(thread->composer_draft);
         thread->composer_draft[0] = '\0';
         if (copy) {

@@ -148,6 +148,19 @@ bool mcode_agent_poll(mcode_agent_run *run, mcode_thread *thread,
 /* Request stopping an active agent run. */
 void mcode_agent_stop(mcode_agent_run *run);
 
+typedef enum {
+    MCODE_STEER_FAILED = 0,
+    MCODE_STEER_INJECTED,     /* Delivered live into the active turn (e.g. Codex turn/steer) */
+    MCODE_STEER_INTERRUPTING, /* Gracefully interrupting active turn so caller runs steer next */
+} mcode_steer_result;
+
+/* Steer an active agent run with a mid-turn redirection message. */
+mcode_steer_result mcode_agent_steer(mcode_agent_run *run, mcode_thread *thread,
+                                     const char *message);
+
+/* True if `run` supports injecting steer messages live into the current turn without interrupting. */
+bool mcode_agent_supports_live_steer(const mcode_agent_run *run);
+
 /* Respond to the active interactive tool approval prompt (if any) and clear it on `thread`. */
 bool mcode_agent_respond_approval(mcode_agent_run *run, mcode_thread *thread,
                                   mcode_approval_decision decision);
