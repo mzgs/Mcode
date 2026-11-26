@@ -49,6 +49,8 @@ typedef struct {
     double usage_checked_at;
     int usage_tab;   /* 0 = Limits, 1 = Activity */
     int usage_scope; /* 0 = Today, 1 = 7d, 2 = All */
+    bool usage_resets_expanded;
+    bool usage_open_requested;
 
     /* Model picker popover state */
     char model_search[128];

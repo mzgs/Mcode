@@ -1339,6 +1339,41 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
 
     bool catalog_updated = mcode_model_catalog_poll(&app->models);
     bool usage_updated = mcode_usage_tracker_poll(&app->usage, &app->cli_status, agy_busy);
+
+    mcode_reset_credit_outcome reset_outcome = MCODE_RESET_OUTCOME_NONE;
+    char reset_err[160] = "";
+    if (mcode_usage_tracker_take_codex_reset_result(&app->usage, &reset_outcome,
+                                                    reset_err, sizeof reset_err)) {
+        usage_updated = true;
+        if (ui) {
+            switch (reset_outcome) {
+            case MCODE_RESET_OUTCOME_RESET:
+                app_chrome_notify(app->chrome, ui,
+                                  "Codex rate limits reset.", CUI_TONE_SUCCESS);
+                break;
+            case MCODE_RESET_OUTCOME_NOTHING_TO_RESET:
+                app_chrome_notify(app->chrome, ui,
+                                  "Codex rate limits are already at 100% — no reset credit used.",
+                                  CUI_TONE_INFO);
+                break;
+            case MCODE_RESET_OUTCOME_NO_CREDIT:
+                app_chrome_notify(app->chrome, ui,
+                                  "No Codex reset credits available.", CUI_TONE_WARNING);
+                break;
+            case MCODE_RESET_OUTCOME_ALREADY_REDEEMED:
+                app_chrome_notify(app->chrome, ui,
+                                  "That Codex reset credit was already redeemed.", CUI_TONE_WARNING);
+                break;
+            case MCODE_RESET_OUTCOME_ERROR:
+            default:
+                app_chrome_notify(app->chrome, ui,
+                                  reset_err[0] ? reset_err : "Failed to redeem Codex reset credit.",
+                                  CUI_TONE_DANGER);
+                break;
+            }
+        }
+    }
+
     if (term_dirty) {
         cui_request_redraw(ui);
     } else if (running > 0 || clone_active || term_visible_running) {
@@ -2179,6 +2214,15 @@ static void on_palette_refresh_usage(cui_ctx *ui, void *user) {
     if (ui) app_chrome_notify(app->chrome, ui, "Refreshing usage limits...", CUI_TONE_INFO);
 }
 
+static void on_palette_open_codex_resets(cui_ctx *ui, void *user) {
+    mcode_app *app = (mcode_app *)user;
+    if (!app) return;
+    app->usage_tab = 0;
+    app->usage_resets_expanded = true;
+    app->usage_open_requested = true;
+    if (ui) cui_request_redraw(ui);
+}
+
 static void on_palette_send_next_queued(cui_ctx *ui, void *user) {
     mcode_app *app = (mcode_app *)user;
     if (!app) return;
@@ -2261,6 +2305,19 @@ void mcode_app_palette_provider(app_palette_builder *builder, void *user) {
             .icon = CUI_ICON_CHART_BAR,
             .group = "Usage",
             .on_trigger = on_palette_refresh_usage,
+            .user = app,
+        });
+    }
+    if (app->cli_status.available[APP_AGENT_CODEX] &&
+        app->usage.quotas[APP_AGENT_CODEX].reset_credits_available > 0) {
+        char title[96];
+        long long avail = (long long)app->usage.quotas[APP_AGENT_CODEX].reset_credits_available;
+        snprintf(title, sizeof title, "Codex Rate Limit Resets (%lld available)", avail);
+        app_palette_add(builder, &(app_palette_command){
+            .title = title,
+            .icon = CUI_ICON_ROTATE_CCW,
+            .group = "Usage",
+            .on_trigger = on_palette_open_codex_resets,
             .user = app,
         });
     }

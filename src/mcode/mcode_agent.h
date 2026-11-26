@@ -32,14 +32,28 @@ typedef struct {
 
 typedef struct mcode_model_fetch mcode_model_fetch;
 typedef struct mcode_usage_fetch mcode_usage_fetch;
+typedef struct mcode_reset_consume mcode_reset_consume;
 typedef struct mcode_simple_fetch mcode_simple_fetch;
+
+typedef enum {
+    MCODE_RESET_OUTCOME_NONE = 0,
+    MCODE_RESET_OUTCOME_RESET,
+    MCODE_RESET_OUTCOME_NOTHING_TO_RESET,
+    MCODE_RESET_OUTCOME_NO_CREDIT,
+    MCODE_RESET_OUTCOME_ALREADY_REDEEMED,
+    MCODE_RESET_OUTCOME_ERROR,
+} mcode_reset_credit_outcome;
 
 typedef struct {
     mcode_provider_quota quotas[APP_AGENT_COUNT];
     mcode_usage_fetch *codex_fetch;
+    mcode_reset_consume *codex_reset;
     mcode_simple_fetch *agy_fetch;
     mcode_simple_fetch *claude_fetch;
     bool agy_refresh_pending;
+    bool codex_reset_done;
+    mcode_reset_credit_outcome codex_reset_outcome;
+    char codex_reset_error[160];
 } mcode_usage_tracker;
 
 typedef struct {
@@ -102,6 +116,13 @@ void mcode_usage_tracker_refresh(mcode_usage_tracker *tracker, const mcode_cli_s
 void mcode_usage_tracker_refresh_agent(mcode_usage_tracker *tracker, const mcode_cli_status *clis,
                                        app_agent_kind agent, bool agy_busy);
 bool mcode_usage_tracker_is_loading(const mcode_usage_tracker *tracker);
+bool mcode_usage_tracker_is_resetting_codex(const mcode_usage_tracker *tracker);
+bool mcode_usage_tracker_consume_codex_reset(mcode_usage_tracker *tracker,
+                                             const mcode_cli_status *clis,
+                                             const char *credit_id);
+bool mcode_usage_tracker_take_codex_reset_result(mcode_usage_tracker *tracker,
+                                                 mcode_reset_credit_outcome *out_outcome,
+                                                 char *err_out, size_t err_cap);
 bool mcode_usage_tracker_poll(mcode_usage_tracker *tracker, const mcode_cli_status *clis,
                               bool agy_busy);
 void mcode_usage_tracker_begin_shutdown(mcode_usage_tracker *tracker);
@@ -110,6 +131,8 @@ void mcode_usage_tracker_free(mcode_usage_tracker *tracker);
 /* Pure parsers exposed for unit tests. */
 bool mcode_agent_parse_codex_rate_limits_json(const char *json, size_t len,
                                               mcode_provider_quota *out);
+mcode_reset_credit_outcome mcode_agent_parse_codex_reset_consume_json(const char *json, size_t len,
+                                                                      char *err_out, size_t err_cap);
 bool mcode_agent_parse_codex_account_usage_json(const char *json, size_t len,
                                                 const char *today_ymd,
                                                 mcode_provider_quota *out);

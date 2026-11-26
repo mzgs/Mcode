@@ -192,6 +192,48 @@ static void format_reset_short(int64_t resets_at, int64_t now_epoch, char *out, 
     }
 }
 
+static void format_expiry_short(int64_t expires_at, int64_t now_epoch, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (expires_at <= 0) return;
+    int64_t diff = expires_at - now_epoch;
+    if (diff <= 0) {
+        snprintf(out, cap, "Expired");
+        return;
+    }
+    if (diff < 86400) {
+        char rel[24];
+        format_reset_short(expires_at, now_epoch, rel, sizeof rel);
+        snprintf(out, cap, "Exp in %s", rel);
+        return;
+    }
+
+    static const char *const k_months[12] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    };
+    time_t t = (time_t)expires_at;
+    struct tm lt;
+    bool have_tm = false;
+#ifdef _WIN32
+    have_tm = (localtime_s(&lt, &t) == 0);
+#else
+    have_tm = (localtime_r(&t, &lt) != NULL);
+#endif
+    int64_t days = diff / 86400;
+    if (have_tm && lt.tm_mon >= 0 && lt.tm_mon < 12) {
+        if (days >= 365) {
+            snprintf(out, cap, "Exp %s %d, %d",
+                     k_months[lt.tm_mon], lt.tm_mday, lt.tm_year + 1900);
+        } else {
+            snprintf(out, cap, "Exp %s %d (%lldd)",
+                     k_months[lt.tm_mon], lt.tm_mday, (long long)days);
+        }
+    } else {
+        snprintf(out, cap, "Exp in %lldd", (long long)days);
+    }
+}
+
 static void format_age_short(int64_t updated_epoch, int64_t now_epoch, char *out, size_t cap) {
     if (!out || cap == 0) return;
     out[0] = '\0';
@@ -306,6 +348,198 @@ static void draw_window_pair(cui_ctx *ui, const char *id,
     cui_pop_id(ui);
 }
 
+static bool reset_credit_can_redeem(const mcode_reset_credit *rc) {
+    if (!rc || !rc->id[0]) return false;
+    return !rc->status[0] || strcmp(rc->status, "available") == 0;
+}
+
+static void draw_codex_reset_credits(mcode_app *app, cui_ctx *ui,
+                                     const mcode_provider_quota *q,
+                                     int64_t now_epoch) {
+    bool resetting = mcode_usage_tracker_is_resetting_codex(&app->usage);
+    if (q->reset_credits_available <= 0 && q->reset_credit_count <= 0 && !resetting) return;
+
+    bool limits_full = q->available &&
+                       (!q->primary.available || q->primary.used_percent <= 0) &&
+                       (!q->secondary.available || q->secondary.used_percent <= 0);
+    const mcode_reset_credit *first_avail = NULL;
+    for (int i = 0; i < q->reset_credit_count; ++i) {
+        if (reset_credit_can_redeem(&q->reset_credits[i])) {
+            first_avail = &q->reset_credits[i];
+            break;
+        }
+    }
+
+    char cnt_lbl[48];
+    if (q->reset_credits_available > 0) {
+        snprintf(cnt_lbl, sizeof cnt_lbl, "%lld %s available",
+                 (long long)q->reset_credits_available,
+                 q->reset_credits_available == 1 ? "reset" : "resets");
+    } else {
+        snprintf(cnt_lbl, sizeof cnt_lbl, "Reset credits");
+    }
+
+    cui_separator(ui);
+
+    cui_push_id(ui, "codex-resets");
+    cui_column(ui, .width = CUI_FILL, .gap = 5) {
+        cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
+            if (q->reset_credit_count > 0) {
+                cui_id tid = cui_make_id(ui, "toggle");
+                cui_rect tr = cui_get_rect(ui, tid);
+                cui_vec2 mp = cui_mouse_pos(ui);
+                bool hov = tr.w > 0.0f &&
+                           mp.x >= tr.x && mp.x <= tr.x + tr.w &&
+                           mp.y >= tr.y && mp.y <= tr.y + tr.h;
+                cui_color bg = hov ? cui_color_of(ui, CUI_COLOR_HOVER) : CUI_RGBA(0x00000001u);
+
+                bool clicked = cui_card_begin(ui, &(cui_card_opts){
+                    .id = "toggle",
+                    .dir = CUI_ROW,
+                    .align = CUI_ALIGN_CENTER,
+                    .pad_x = 4,
+                    .pad_y = 2,
+                    .gap = 4,
+                    .hoverable = true,
+                    .border = -1.0f,
+                    .radius = 5.0f,
+                    .bg = bg,
+                });
+                cui_icon(ui, CUI_ICON_ROTATE_CCW, 12.0f,
+                         q->reset_credits_available > 0 ? CUI_COLOR_ACCENT : CUI_COLOR_TEXT_MUTED);
+                cui_text(ui, cnt_lbl, .font = CUI_FONT_MEDIUM, .size = 11.5f,
+                         .color = CUI_COLOR_FOREGROUND, .tabular = true, .nowrap = true);
+                cui_icon(ui, app->usage_resets_expanded ? CUI_ICON_CHEVRON_DOWN : CUI_ICON_CHEVRON_RIGHT,
+                         11.5f, CUI_COLOR_TEXT_MUTED);
+                cui_card_end(ui);
+                cui_tooltip(ui, app->usage_resets_expanded
+                                    ? "Hide reset credit details"
+                                    : "Show individual reset credits");
+                if (clicked) {
+                    app->usage_resets_expanded = !app->usage_resets_expanded;
+                }
+            } else {
+                cui_row(ui, .gap = 4, .align = CUI_ALIGN_CENTER) {
+                    cui_icon(ui, CUI_ICON_ROTATE_CCW, 12.0f,
+                             q->reset_credits_available > 0 ? CUI_COLOR_ACCENT : CUI_COLOR_TEXT_MUTED);
+                    cui_text(ui, cnt_lbl, .font = CUI_FONT_MEDIUM, .size = 11.5f,
+                             .color = CUI_COLOR_FOREGROUND, .tabular = true, .nowrap = true);
+                }
+            }
+
+            cui_spacer(ui);
+
+            if (resetting) {
+                cui_button(ui, "Resetting", .size = CUI_SIZE_SM,
+                           .variant = CUI_BUTTON_SECONDARY, .loading = true);
+            } else if (q->reset_credits_available > 0) {
+                cui_push_id(ui, "next");
+                if (cui_confirm_button(ui, "Use reset", .icon = CUI_ICON_ROTATE_CCW,
+                                       .confirm_label = "Confirm",
+                                       .variant = CUI_BUTTON_SECONDARY,
+                                       .size = CUI_SIZE_SM, .timeout = 4.0f)) {
+                    if (!mcode_usage_tracker_consume_codex_reset(&app->usage, &app->cli_status, NULL) && ui) {
+                        app_chrome_notify(app->chrome, ui,
+                                          "Could not start Codex reset request.", CUI_TONE_DANGER);
+                    }
+                }
+                cui_tooltip(ui, limits_full
+                                    ? "Codex limits are currently at 100% left. Click twice to check and apply a reset."
+                                    : "Redeem 1 reset credit to clear your Codex rate limits (click twice to confirm).");
+                cui_pop_id(ui);
+            }
+        }
+
+        if (!app->usage_resets_expanded && first_avail) {
+            char exp_s[48];
+            format_expiry_short(first_avail->expires_at, now_epoch, exp_s, sizeof exp_s);
+            char summary[160] = "";
+            if (first_avail->title[0] && exp_s[0]) {
+                snprintf(summary, sizeof summary, "%s · %s", first_avail->title, exp_s);
+            } else if (first_avail->title[0]) {
+                snprintf(summary, sizeof summary, "%s", first_avail->title);
+            } else if (exp_s[0]) {
+                snprintf(summary, sizeof summary, "%s", exp_s);
+            }
+            if (summary[0]) {
+                cui_text(ui, summary, .size = 10.5f, .color = CUI_COLOR_TEXT_MUTED,
+                         .tabular = true, .nowrap = true);
+                if (first_avail->description[0]) {
+                    cui_tooltip(ui, first_avail->description);
+                }
+            }
+        }
+
+        if (app->usage_resets_expanded && q->reset_credit_count > 0) {
+            cui_color row_bg = cui_alpha(cui_color_of(ui, CUI_COLOR_FOREGROUND),
+                                         cui_get_theme_mode(ui) == CUI_THEME_DARK ? 0.045f : 0.035f);
+            cui_column(ui, .width = CUI_FILL, .gap = 4) {
+                for (int ci = 0; ci < q->reset_credit_count; ++ci) {
+                    const mcode_reset_credit *rc = &q->reset_credits[ci];
+                    bool can_use = reset_credit_can_redeem(rc);
+                    const char *title = rc->title[0] ? rc->title : "Rate limit reset";
+                    char exp_s[48];
+                    format_expiry_short(rc->expires_at, now_epoch, exp_s, sizeof exp_s);
+                    char sub[96];
+                    if (exp_s[0]) {
+                        snprintf(sub, sizeof sub, "%s", exp_s);
+                    } else {
+                        snprintf(sub, sizeof sub, "No expiration");
+                    }
+
+                    cui_push_id_int(ui, ci);
+                    cui_box(ui, .width = CUI_FILL, .bg = row_bg, .radius = 6.0f,
+                            .pad_x = 8, .pad_y = 5) {
+                        cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
+                            cui_column(ui, .width = CUI_FILL, .gap = 1, .clip = true) {
+                                cui_text(ui, title, .size = 11.0f,
+                                         .color = can_use ? CUI_COLOR_FOREGROUND : CUI_COLOR_TEXT_MUTED,
+                                         .nowrap = true);
+                                cui_text(ui, sub, .size = 10.0f, .color = CUI_COLOR_TEXT_MUTED,
+                                         .tabular = true, .nowrap = true);
+                            }
+                            if (rc->description[0]) {
+                                cui_tooltip(ui, rc->description);
+                            }
+
+                            if (can_use && !resetting) {
+                                if (cui_confirm_button(ui, "Use", .confirm_label = "Confirm",
+                                                       .variant = CUI_BUTTON_OUTLINE,
+                                                       .size = CUI_SIZE_SM, .timeout = 4.0f)) {
+                                    if (!mcode_usage_tracker_consume_codex_reset(&app->usage,
+                                                                                 &app->cli_status,
+                                                                                 rc->id) && ui) {
+                                        app_chrome_notify(app->chrome, ui,
+                                                          "Could not start Codex reset request.",
+                                                          CUI_TONE_DANGER);
+                                    }
+                                }
+                                cui_tooltip(ui, "Redeem this reset credit (click twice to confirm).");
+                            } else if (can_use && resetting) {
+                                cui_spinner(ui, 11.0f);
+                            } else {
+                                cui_badge(ui, rc->status[0] ? rc->status : "Unavailable",
+                                          .tone = CUI_TONE_NEUTRAL, .size = CUI_SIZE_SM);
+                            }
+                        }
+                    }
+                    cui_pop_id(ui);
+                }
+
+                if (q->reset_credits_available > q->reset_credit_count) {
+                    char more[48];
+                    snprintf(more, sizeof more, "+%lld more reset %s available",
+                             (long long)(q->reset_credits_available - q->reset_credit_count),
+                             (q->reset_credits_available - q->reset_credit_count) == 1 ? "credit" : "credits");
+                    cui_text(ui, more, .size = 10.5f, .color = CUI_COLOR_TEXT_MUTED,
+                             .tabular = true, .nowrap = true);
+                }
+            }
+        }
+    }
+    cui_pop_id(ui);
+}
+
 static void draw_provider_limit_card(mcode_app *app, cui_ctx *ui, app_agent_kind agent,
                                      const usage_snapshot *snap, int64_t now_epoch) {
     const mcode_provider_quota *q = &app->usage.quotas[agent];
@@ -341,7 +575,9 @@ static void draw_provider_limit_card(mcode_app *app, cui_ctx *ui, app_agent_kind
             }
 
             cui_spacer(ui);
-            if (q->loading) {
+            bool card_busy = q->loading ||
+                             (agent == APP_AGENT_CODEX && mcode_usage_tracker_is_resetting_codex(&app->usage));
+            if (card_busy) {
                 cui_spinner(ui, 11.0f);
             } else if (q->updated_epoch > 0) {
                 char age[32];
@@ -386,6 +622,10 @@ static void draw_provider_limit_card(mcode_app *app, cui_ctx *ui, app_agent_kind
                      .size = 11.0f, .color = CUI_COLOR_TEXT_MUTED);
         } else if (q->error[0]) {
             cui_text(ui, q->error, .size = 11.0f, .color = CUI_COLOR_TEXT_MUTED);
+        }
+
+        if (installed && agent == APP_AGENT_CODEX) {
+            draw_codex_reset_credits(app, ui, q, now_epoch);
         }
 
         /* Compact account / Mcode token summary footer */
@@ -703,6 +943,22 @@ static void draw_bar_provider_segment(mcode_app *app, cui_ctx *ui, app_agent_kin
             /* No active rate-limit window yet (e.g. not signed in); never fall back to token counts in the bar. */
             cui_text(ui, "—", .size = text_sz, .color = CUI_COLOR_TEXT_MUTED, .nowrap = true);
         }
+
+        if (agent == APP_AGENT_CODEX) {
+            if (mcode_usage_tracker_is_resetting_codex(&app->usage)) {
+                cui_spinner(ui, 10.0f);
+            } else if (q->reset_credits_available > 0 && vw >= 960.0f) {
+                char rcnt[24];
+                snprintf(rcnt, sizeof rcnt, "%lld", (long long)q->reset_credits_available);
+                cui_color rcol = (peak >= 70) ? cui_color_of(ui, CUI_COLOR_ACCENT)
+                                              : cui_color_of(ui, CUI_COLOR_TEXT_MUTED);
+                cui_row(ui, .gap = 2, .align = CUI_ALIGN_CENTER) {
+                    cui_icon(ui, CUI_ICON_ROTATE_CCW, 10.5f, rcol);
+                    cui_text(ui, rcnt, .size = text_sz, .color = rcol,
+                             .tabular = true, .nowrap = true);
+                }
+            }
+        }
     }
     cui_pop_id(ui);
 }
@@ -773,6 +1029,10 @@ void mcode_ui_draw_status_usage(mcode_app *app, cui_ctx *ui, mcode_thread *threa
 
     if (clicked) {
         cui_popover_toggle(ui, "mcode-usage-pop");
+    }
+    if (app->usage_open_requested) {
+        app->usage_open_requested = false;
+        cui_popover_open(ui, "mcode-usage-pop");
     }
 
     cui_popover(ui, "mcode-usage-pop", .placement = CUI_PLACE_TOP_START,

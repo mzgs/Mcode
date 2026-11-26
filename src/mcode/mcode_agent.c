@@ -459,12 +459,11 @@ static uint64_t splitmix64_next(uint64_t *state) {
     return z ^ (z >> 31);
 }
 
-/* Generate an RFC-4122 v4 UUID string (caller must hold run->mu). */
-static void claude_make_uuid_locked(mcode_agent_run *run, char out[40]) {
-    uint64_t seq = (uint64_t)(++run->next_rpc_id);
+/* Generate an RFC-4122 v4 UUID string. */
+static void make_uuid_v4(uint64_t seq, const void *salt, char out[40]) {
     uint64_t mono_ns = (uint64_t)(mcode_now_mono() * 1e9);
     uint64_t epoch_s = (uint64_t)mcode_now_epoch();
-    uint64_t seed = mono_ns ^ (epoch_s << 21) ^ ((uint64_t)(uintptr_t)run) ^ (seq * 0x9e3779b97f4a7c15ULL);
+    uint64_t seed = mono_ns ^ (epoch_s << 21) ^ ((uint64_t)(uintptr_t)salt) ^ (seq * 0x9e3779b97f4a7c15ULL);
     uint64_t a = splitmix64_next(&seed);
     uint64_t b = splitmix64_next(&seed);
     /* Set RFC-4122 version 4 and variant 10xx */
@@ -476,6 +475,12 @@ static void claude_make_uuid_locked(mcode_agent_run *run, char out[40]) {
              (unsigned)(a & 0xffffU),
              (unsigned)((b >> 48) & 0xffffU),
              (unsigned long long)(b & 0x0000ffffffffffffULL));
+}
+
+/* Generate an RFC-4122 v4 UUID string (caller must hold run->mu). */
+static void claude_make_uuid_locked(mcode_agent_run *run, char out[40]) {
+    uint64_t seq = (uint64_t)(++run->next_rpc_id);
+    make_uuid_v4(seq, run, out);
 }
 
 static bool claude_ctl_send_user_msg(mcode_agent_run *run, const char *uuid,
@@ -3325,6 +3330,17 @@ static void merge_provider_quota(mcode_provider_quota *dst, const mcode_provider
         memcpy(dst->groups, src->groups, (size_t)n * sizeof dst->groups[0]);
         dst->group_count = n;
     }
+    if (src->reset_credits_checked) {
+        dst->reset_credits_checked = true;
+        dst->reset_credits_available = src->reset_credits_available;
+        int n = src->reset_credit_count;
+        if (n < 0) n = 0;
+        if (n > MCODE_MAX_RESET_CREDITS) n = MCODE_MAX_RESET_CREDITS;
+        if (n > 0) {
+            memcpy(dst->reset_credits, src->reset_credits, (size_t)n * sizeof dst->reset_credits[0]);
+        }
+        dst->reset_credit_count = n;
+    }
     if (src->has_credits || src->unlimited_credits || src->credits_balance[0]) {
         dst->has_credits = src->has_credits;
         dst->unlimited_credits = src->unlimited_credits;
@@ -4292,6 +4308,124 @@ int64_t mcode_model_context_window(const mcode_model_catalog *cat, const mcode_t
 
 /* ---- Live Provider Usage & Quota Tracker ---- */
 
+static bool reset_credit_is_available(const mcode_reset_credit *c) {
+    if (!c) return false;
+    return !c->status[0] || strcmp(c->status, "available") == 0;
+}
+
+static bool reset_credit_comes_before(const mcode_reset_credit *a, const mcode_reset_credit *b) {
+    bool a_avail = reset_credit_is_available(a);
+    bool b_avail = reset_credit_is_available(b);
+    if (a_avail != b_avail) return a_avail;
+    bool a_exp = a->expires_at > 0;
+    bool b_exp = b->expires_at > 0;
+    if (a_exp != b_exp) return a_exp;
+    if (a_exp && a->expires_at != b->expires_at) return a->expires_at < b->expires_at;
+    if (a->granted_at != b->granted_at) return a->granted_at < b->granted_at;
+    return strcmp(a->id, b->id) < 0;
+}
+
+static bool parse_codex_reset_credits_val(yyjson_val *res_obj, mcode_provider_quota *out) {
+    if (!yyjson_is_obj(res_obj) || !out) return false;
+    yyjson_val *rc = yyjson_obj_get(res_obj, "rateLimitResetCredits");
+    if (!rc) return false;
+
+    out->reset_credits_checked = true;
+    out->reset_credits_available = 0;
+    out->reset_credit_count = 0;
+    if (yyjson_is_null(rc) || !yyjson_is_obj(rc)) return true;
+
+    yyjson_val *avail_v = yyjson_obj_get(rc, "availableCount");
+    bool has_avail_count = yyjson_is_num(avail_v);
+    if (has_avail_count) {
+        int64_t avail = ji64(rc, "availableCount");
+        out->reset_credits_available = avail > 0 ? avail : 0;
+    }
+
+    yyjson_val *arr = yyjson_obj_get(rc, "credits");
+    int avail_seen = 0;
+    if (yyjson_is_arr(arr)) {
+        size_t idx, max;
+        yyjson_val *cv;
+        yyjson_arr_foreach(arr, idx, max, cv) {
+            if (!yyjson_is_obj(cv)) continue;
+            const char *cid = jstr(cv, "id");
+            if (!cid || !cid[0]) continue;
+
+            mcode_reset_credit item;
+            memset(&item, 0, sizeof item);
+            snprintf(item.id, sizeof item.id, "%s", cid);
+            const char *rtype = jstr(cv, "resetType");
+            if (rtype && rtype[0]) snprintf(item.reset_type, sizeof item.reset_type, "%s", rtype);
+            const char *st = jstr(cv, "status");
+            if (st && st[0]) snprintf(item.status, sizeof item.status, "%s", st);
+            item.granted_at = ji64(cv, "grantedAt");
+            item.expires_at = ji64(cv, "expiresAt");
+            const char *title = jstr(cv, "title");
+            if (title && title[0]) snprintf(item.title, sizeof item.title, "%s", title);
+            const char *desc = jstr(cv, "description");
+            if (desc && desc[0]) snprintf(item.description, sizeof item.description, "%s", desc);
+
+            if (reset_credit_is_available(&item)) ++avail_seen;
+
+            if (out->reset_credit_count < MCODE_MAX_RESET_CREDITS) {
+                out->reset_credits[out->reset_credit_count++] = item;
+            } else {
+                /* Keep the highest-priority (available, soonest-expiring) entries if list exceeds cap. */
+                int worst = 0;
+                for (int i = 1; i < out->reset_credit_count; ++i) {
+                    if (reset_credit_comes_before(&out->reset_credits[worst], &out->reset_credits[i])) {
+                        worst = i;
+                    }
+                }
+                if (reset_credit_comes_before(&item, &out->reset_credits[worst])) {
+                    out->reset_credits[worst] = item;
+                }
+            }
+        }
+    }
+
+    for (int i = 1; i < out->reset_credit_count; ++i) {
+        mcode_reset_credit key = out->reset_credits[i];
+        int j = i - 1;
+        while (j >= 0 && reset_credit_comes_before(&key, &out->reset_credits[j])) {
+            out->reset_credits[j + 1] = out->reset_credits[j];
+            --j;
+        }
+        out->reset_credits[j + 1] = key;
+    }
+
+    if (!has_avail_count) {
+        out->reset_credits_available = avail_seen;
+    }
+    return true;
+}
+
+static bool parse_codex_rate_limits_result(yyjson_val *src, mcode_provider_quota *out) {
+    if (!yyjson_is_obj(src) || !out) return false;
+    bool got_rc = parse_codex_reset_credits_val(src, out);
+    yyjson_val *rl = yyjson_obj_get(src, "rateLimits");
+    if (!yyjson_is_obj(rl)) {
+        yyjson_val *by_id = yyjson_obj_get(src, "rateLimitsByLimitId");
+        if (yyjson_is_obj(by_id)) {
+            yyjson_val *codex_rl = yyjson_obj_get(by_id, "codex");
+            if (yyjson_is_obj(codex_rl)) {
+                rl = codex_rl;
+            } else {
+                size_t idx, max;
+                yyjson_val *k, *v;
+                yyjson_obj_foreach(by_id, idx, max, k, v) {
+                    (void)k;
+                    if (yyjson_is_obj(v)) { rl = v; break; }
+                }
+            }
+        }
+    }
+    if (!yyjson_is_obj(rl)) rl = src;
+    bool got_rl = parse_codex_rate_snapshot(rl, out);
+    return got_rl || got_rc;
+}
+
 bool mcode_agent_parse_codex_rate_limits_json(const char *json, size_t len,
                                               mcode_provider_quota *out) {
     if (!json || len == 0 || !out) return false;
@@ -4302,29 +4436,68 @@ bool mcode_agent_parse_codex_rate_limits_json(const char *json, size_t len,
     if (yyjson_is_obj(root)) {
         yyjson_val *res = yyjson_obj_get(root, "result");
         if (yyjson_is_obj(res)) src = res;
-        yyjson_val *rl = yyjson_obj_get(src, "rateLimits");
-        if (yyjson_is_obj(rl)) {
-            src = rl;
-        } else {
-            yyjson_val *by_id = yyjson_obj_get(src, "rateLimitsByLimitId");
-            if (yyjson_is_obj(by_id)) {
-                yyjson_val *codex_rl = yyjson_obj_get(by_id, "codex");
-                if (yyjson_is_obj(codex_rl)) {
-                    src = codex_rl;
-                } else {
-                    size_t idx, max;
-                    yyjson_val *k, *v;
-                    yyjson_obj_foreach(by_id, idx, max, k, v) {
-                        (void)k;
-                        if (yyjson_is_obj(v)) { src = v; break; }
-                    }
-                }
-            }
-        }
     }
-    bool ok = parse_codex_rate_snapshot(src, out);
+    bool ok = parse_codex_rate_limits_result(src, out);
     yyjson_doc_free(doc);
     return ok;
+}
+
+static mcode_reset_credit_outcome parse_codex_reset_consume_result_val(yyjson_val *res_v,
+                                                                       char *err_out,
+                                                                       size_t err_cap) {
+    if (err_out && err_cap) err_out[0] = '\0';
+    if (!yyjson_is_obj(res_v)) {
+        if (err_out && err_cap) {
+            snprintf(err_out, err_cap, "Unexpected reset credit response from Codex.");
+        }
+        return MCODE_RESET_OUTCOME_ERROR;
+    }
+    const char *outcome = jstr(res_v, "outcome");
+    if (!outcome || !outcome[0]) {
+        if (err_out && err_cap) {
+            snprintf(err_out, err_cap, "Codex response did not include a reset outcome.");
+        }
+        return MCODE_RESET_OUTCOME_ERROR;
+    }
+    if (strcmp(outcome, "reset") == 0) return MCODE_RESET_OUTCOME_RESET;
+    if (strcmp(outcome, "nothingToReset") == 0) return MCODE_RESET_OUTCOME_NOTHING_TO_RESET;
+    if (strcmp(outcome, "noCredit") == 0) return MCODE_RESET_OUTCOME_NO_CREDIT;
+    if (strcmp(outcome, "alreadyRedeemed") == 0) return MCODE_RESET_OUTCOME_ALREADY_REDEEMED;
+    if (err_out && err_cap) {
+        snprintf(err_out, err_cap, "Unknown reset outcome: %s", outcome);
+    }
+    return MCODE_RESET_OUTCOME_ERROR;
+}
+
+mcode_reset_credit_outcome mcode_agent_parse_codex_reset_consume_json(const char *json, size_t len,
+                                                                      char *err_out, size_t err_cap) {
+    if (err_out && err_cap) err_out[0] = '\0';
+    if (!json || len == 0) return MCODE_RESET_OUTCOME_ERROR;
+    yyjson_doc *doc = yyjson_read(json, len, 0);
+    if (!doc) {
+        if (err_out && err_cap) snprintf(err_out, err_cap, "Invalid JSON from Codex.");
+        return MCODE_RESET_OUTCOME_ERROR;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    mcode_reset_credit_outcome out = MCODE_RESET_OUTCOME_ERROR;
+    if (yyjson_is_obj(root)) {
+        yyjson_val *err_v = yyjson_obj_get(root, "error");
+        if (yyjson_is_obj(err_v)) {
+            const char *emsg = jstr(err_v, "message");
+            if (err_out && err_cap) {
+                snprintf(err_out, err_cap, "%s",
+                         (emsg && emsg[0]) ? emsg : "Codex failed to redeem reset credit.");
+            }
+        } else {
+            yyjson_val *res_v = yyjson_obj_get(root, "result");
+            out = parse_codex_reset_consume_result_val(yyjson_is_obj(res_v) ? res_v : root,
+                                                       err_out, err_cap);
+        }
+    } else if (err_out && err_cap) {
+        snprintf(err_out, err_cap, "Unexpected reset credit response from Codex.");
+    }
+    yyjson_doc_free(doc);
+    return out;
 }
 
 static bool parse_codex_account_usage_val(yyjson_val *src, const char *today_ymd,
@@ -4396,7 +4569,7 @@ static void usage_fetch_send_queries(mcode_usage_fetch *f) {
     static const char k_queries[] =
         "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\"}\n"
         "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"account/rateLimits/read\","
-        "\"params\":{\"excludeResetCreditDetails\":true}}\n"
+        "\"params\":{\"excludeResetCreditDetails\":false}}\n"
         "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"account/usage/read\",\"params\":{}}\n";
     mcode_proc_write(f->proc, k_queries, sizeof k_queries - 1);
 }
@@ -4442,12 +4615,7 @@ static void usage_fetch_handle_line(mcode_usage_fetch *f, const char *line) {
                     snprintf(f->result.error, sizeof f->result.error, "%s", emsg);
                 }
             } else if (yyjson_is_obj(res_v)) {
-                yyjson_val *rl = yyjson_obj_get(res_v, "rateLimits");
-                if (!yyjson_is_obj(rl)) {
-                    yyjson_val *by_id = yyjson_obj_get(res_v, "rateLimitsByLimitId");
-                    if (yyjson_is_obj(by_id)) rl = yyjson_obj_get(by_id, "codex");
-                }
-                parse_codex_rate_snapshot(rl, &f->result);
+                parse_codex_rate_limits_result(res_v, &f->result);
             }
             if (f->got_account_usage) should_stop = true;
         } else if (rid == 3) {
@@ -4505,6 +4673,166 @@ static void usage_fetch_destroy(mcode_usage_fetch *f) {
     mcode_str_free(&f->out_line);
     pthread_mutex_destroy(&f->mu);
     free(f);
+}
+
+struct mcode_reset_consume {
+    mcode_proc *proc;
+    pthread_mutex_t mu;
+    mcode_str out_line;
+    char idempotency_key[40];
+    char credit_id[128];
+    double started_mono;
+    bool sent_consume;
+    bool got_consume;
+    bool sent_refresh;
+    bool got_refresh;
+    bool timed_out;
+    bool finished;
+    mcode_reset_credit_outcome outcome;
+    char error[160];
+    mcode_provider_quota refreshed_quota;
+};
+
+static void reset_consume_send_consume(mcode_reset_consume *c) {
+    if (!c || !c->proc) return;
+    static const char k_initialized[] = "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\"}\n";
+    mcode_proc_write(c->proc, k_initialized, sizeof k_initialized - 1);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
+    yyjson_mut_obj_add_int(doc, root, "id", 2);
+    yyjson_mut_obj_add_str(doc, root, "method", "account/rateLimitResetCredit/consume");
+    yyjson_mut_val *params = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_strcpy(doc, params, "idempotencyKey", c->idempotency_key);
+    if (c->credit_id[0]) {
+        yyjson_mut_obj_add_strcpy(doc, params, "creditId", c->credit_id);
+    }
+    yyjson_mut_obj_add_val(doc, root, "params", params);
+    send_json_doc(c->proc, doc);
+    yyjson_mut_doc_free(doc);
+}
+
+static void reset_consume_send_refresh(mcode_reset_consume *c) {
+    if (!c || !c->proc) return;
+    static const char k_refresh[] =
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"account/rateLimits/read\","
+        "\"params\":{\"excludeResetCreditDetails\":false}}\n";
+    mcode_proc_write(c->proc, k_refresh, sizeof k_refresh - 1);
+}
+
+static void reset_consume_handle_line(mcode_reset_consume *c, const char *line) {
+    if (!c || !line) return;
+    while (*line && isspace((unsigned char)*line)) ++line;
+    if (*line != '{') return;
+
+    yyjson_doc *doc = yyjson_read(line, strlen(line), 0);
+    if (!doc) return;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    if (!yyjson_is_obj(root)) {
+        yyjson_doc_free(doc);
+        return;
+    }
+
+    yyjson_val *id_v = yyjson_obj_get(root, "id");
+    if (yyjson_is_int(id_v)) {
+        int64_t rid = yyjson_get_sint(id_v);
+        yyjson_val *err_v = yyjson_obj_get(root, "error");
+        yyjson_val *res_v = yyjson_obj_get(root, "result");
+
+        bool should_send_consume = false;
+        bool should_send_refresh = false;
+        bool should_stop = false;
+
+        pthread_mutex_lock(&c->mu);
+        if (rid == 1) {
+            if (err_v) {
+                const char *emsg = jstr(err_v, "message");
+                snprintf(c->error, sizeof c->error, "%s",
+                         (emsg && emsg[0]) ? emsg : "Codex initialize failed.");
+                c->outcome = MCODE_RESET_OUTCOME_ERROR;
+                should_stop = true;
+            } else if (!c->sent_consume) {
+                c->sent_consume = true;
+                should_send_consume = true;
+            }
+        } else if (rid == 2) {
+            c->got_consume = true;
+            if (err_v) {
+                const char *emsg = jstr(err_v, "message");
+                snprintf(c->error, sizeof c->error, "%s",
+                         (emsg && emsg[0]) ? emsg : "Codex failed to redeem reset credit.");
+                c->outcome = MCODE_RESET_OUTCOME_ERROR;
+                should_stop = true;
+            } else {
+                c->outcome = parse_codex_reset_consume_result_val(res_v, c->error, sizeof c->error);
+                if (c->outcome != MCODE_RESET_OUTCOME_ERROR && !c->sent_refresh) {
+                    c->sent_refresh = true;
+                    should_send_refresh = true;
+                } else {
+                    should_stop = true;
+                }
+            }
+        } else if (rid == 3) {
+            if (!err_v && yyjson_is_obj(res_v)) {
+                if (parse_codex_rate_limits_result(res_v, &c->refreshed_quota)) {
+                    c->got_refresh = true;
+                }
+            }
+            should_stop = true;
+        }
+        pthread_mutex_unlock(&c->mu);
+
+        if (should_send_consume) {
+            reset_consume_send_consume(c);
+        } else if (should_send_refresh) {
+            reset_consume_send_refresh(c);
+        } else if (should_stop && c->proc) {
+            mcode_proc_close_stdin(c->proc);
+            mcode_proc_stop(c->proc);
+        }
+    }
+
+    yyjson_doc_free(doc);
+}
+
+static void on_reset_consume_bytes(const char *data, size_t len, bool is_stderr, void *user) {
+    if (is_stderr) return;
+    mcode_reset_consume *c = (mcode_reset_consume *)user;
+    for (size_t i = 0; i < len; ++i) {
+        if (data[i] == '\n') {
+            reset_consume_handle_line(c, mcode_str_cstr(&c->out_line));
+            mcode_str_clear(&c->out_line);
+        } else if (c->out_line.len < 256 * 1024) {
+            mcode_str_append(&c->out_line, &data[i], 1);
+        }
+    }
+}
+
+static void on_reset_consume_exit(int exit_code, bool killed, void *user) {
+    (void)exit_code;
+    (void)killed;
+    mcode_reset_consume *c = (mcode_reset_consume *)user;
+    if (c->out_line.len > 0) {
+        reset_consume_handle_line(c, mcode_str_cstr(&c->out_line));
+        mcode_str_clear(&c->out_line);
+    }
+    pthread_mutex_lock(&c->mu);
+    c->finished = true;
+    pthread_mutex_unlock(&c->mu);
+}
+
+static void reset_consume_destroy(mcode_reset_consume *c) {
+    if (!c) return;
+    if (c->proc) {
+        mcode_proc_destroy(c->proc);
+        c->proc = NULL;
+    }
+    mcode_str_free(&c->out_line);
+    pthread_mutex_destroy(&c->mu);
+    free(c);
 }
 
 static void format_local_today_ymd(char *out, size_t cap) {
@@ -4925,8 +5253,76 @@ void mcode_usage_tracker_refresh(mcode_usage_tracker *tracker, const mcode_cli_s
 bool mcode_usage_tracker_is_loading(const mcode_usage_tracker *tracker) {
     if (!tracker) return false;
     return tracker->codex_fetch != NULL ||
+           tracker->codex_reset != NULL ||
            tracker->agy_fetch != NULL ||
            tracker->claude_fetch != NULL;
+}
+
+bool mcode_usage_tracker_is_resetting_codex(const mcode_usage_tracker *tracker) {
+    return tracker && tracker->codex_reset != NULL;
+}
+
+bool mcode_usage_tracker_consume_codex_reset(mcode_usage_tracker *tracker,
+                                             const mcode_cli_status *clis,
+                                             const char *credit_id) {
+    if (!tracker || !clis) return false;
+    if (!clis->available[APP_AGENT_CODEX] || !clis->resolved_path[APP_AGENT_CODEX][0]) return false;
+    if (tracker->codex_reset) return false;
+
+    mcode_reset_consume *c = calloc(1, sizeof *c);
+    if (!c) return false;
+    pthread_mutex_init(&c->mu, NULL);
+    mcode_str_init(&c->out_line);
+    c->started_mono = mcode_now_mono();
+
+    static uint64_t s_reset_seq = 0;
+    make_uuid_v4(++s_reset_seq, c, c->idempotency_key);
+    if (credit_id && credit_id[0]) {
+        snprintf(c->credit_id, sizeof c->credit_id, "%s", credit_id);
+    }
+
+    const char *argv[] = {
+        clis->resolved_path[APP_AGENT_CODEX], "app-server", "--listen", "stdio://", NULL
+    };
+    c->proc = mcode_proc_spawn(&(mcode_proc_desc){
+        .argv = argv,
+        .cwd = NULL,
+        .merge_stderr = false,
+        .open_stdin = true,
+        .on_bytes = on_reset_consume_bytes,
+        .on_exit = on_reset_consume_exit,
+        .user = c,
+    });
+    if (!c->proc) {
+        reset_consume_destroy(c);
+        return false;
+    }
+
+    static const char k_init[] =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+        "\"params\":{\"clientInfo\":{\"name\":\"mcode\",\"version\":\"0.1.0\"}}}\n";
+    mcode_proc_write(c->proc, k_init, sizeof k_init - 1);
+
+    tracker->codex_reset = c;
+    tracker->codex_reset_done = false;
+    tracker->codex_reset_outcome = MCODE_RESET_OUTCOME_NONE;
+    tracker->codex_reset_error[0] = '\0';
+    return true;
+}
+
+bool mcode_usage_tracker_take_codex_reset_result(mcode_usage_tracker *tracker,
+                                                 mcode_reset_credit_outcome *out_outcome,
+                                                 char *err_out, size_t err_cap) {
+    if (err_out && err_cap) err_out[0] = '\0';
+    if (!tracker || !tracker->codex_reset_done) return false;
+    if (out_outcome) *out_outcome = tracker->codex_reset_outcome;
+    if (err_out && err_cap) {
+        snprintf(err_out, err_cap, "%s", tracker->codex_reset_error);
+    }
+    tracker->codex_reset_done = false;
+    tracker->codex_reset_outcome = MCODE_RESET_OUTCOME_NONE;
+    tracker->codex_reset_error[0] = '\0';
+    return true;
 }
 
 bool mcode_usage_tracker_poll(mcode_usage_tracker *tracker, const mcode_cli_status *clis,
@@ -4957,7 +5353,8 @@ bool mcode_usage_tracker_poll(mcode_usage_tracker *tracker, const mcode_cli_stat
         } else {
             mcode_provider_quota *dst = &tracker->quotas[APP_AGENT_CODEX];
             dst->loading = false;
-            if (f->result.available || f->result.account_lifetime_tokens > 0 ||
+            if (f->result.available || f->result.reset_credits_checked ||
+                f->result.account_lifetime_tokens > 0 ||
                 f->result.account_today_tokens > 0) {
                 f->result.auth_checked = true;
                 f->result.logged_in = true;
@@ -4974,6 +5371,58 @@ bool mcode_usage_tracker_poll(mcode_usage_tracker *tracker, const mcode_cli_stat
             }
             usage_fetch_destroy(f);
             tracker->codex_fetch = NULL;
+        }
+    }
+
+    /* 1b. Codex rate-limit reset credit redemption */
+    if (tracker->codex_reset) {
+        mcode_reset_consume *c = tracker->codex_reset;
+        pthread_mutex_lock(&c->mu);
+        bool finished = c->finished;
+        pthread_mutex_unlock(&c->mu);
+
+        if (!finished) {
+            if (!c->timed_out && (mcode_now_mono() - c->started_mono) > 15.0) {
+                c->timed_out = true;
+                if (c->proc) {
+                    mcode_proc_close_stdin(c->proc);
+                    mcode_proc_stop(c->proc);
+                }
+            }
+        } else {
+            mcode_reset_credit_outcome final_outcome = MCODE_RESET_OUTCOME_ERROR;
+            char final_err[160] = "";
+            if (c->got_consume) {
+                final_outcome = c->outcome;
+                snprintf(final_err, sizeof final_err, "%s", c->error);
+            } else if (c->outcome == MCODE_RESET_OUTCOME_ERROR && c->error[0]) {
+                final_outcome = MCODE_RESET_OUTCOME_ERROR;
+                snprintf(final_err, sizeof final_err, "%s", c->error);
+            } else if (c->timed_out) {
+                snprintf(final_err, sizeof final_err, "Timed out redeeming Codex reset credit.");
+            } else {
+                snprintf(final_err, sizeof final_err, "%s",
+                         c->error[0] ? c->error : "Codex exited before completing reset.");
+            }
+
+            if (c->got_refresh) {
+                mcode_provider_quota *dst = &tracker->quotas[APP_AGENT_CODEX];
+                c->refreshed_quota.auth_checked = true;
+                c->refreshed_quota.logged_in = true;
+                merge_provider_quota(dst, &c->refreshed_quota);
+                dst->updated_mono = mcode_now_mono();
+                dst->updated_epoch = mcode_now_epoch();
+            } else if (final_outcome != MCODE_RESET_OUTCOME_ERROR && clis) {
+                start_codex_usage_fetch(tracker, clis);
+            }
+
+            tracker->codex_reset_done = true;
+            tracker->codex_reset_outcome = final_outcome;
+            snprintf(tracker->codex_reset_error, sizeof tracker->codex_reset_error, "%s", final_err);
+
+            reset_consume_destroy(c);
+            tracker->codex_reset = NULL;
+            updated = true;
         }
     }
 
@@ -5048,6 +5497,9 @@ void mcode_usage_tracker_begin_shutdown(mcode_usage_tracker *tracker) {
     if (tracker->codex_fetch && tracker->codex_fetch->proc) {
         mcode_proc_kill(tracker->codex_fetch->proc);
     }
+    if (tracker->codex_reset && tracker->codex_reset->proc) {
+        mcode_proc_kill(tracker->codex_reset->proc);
+    }
     if (tracker->agy_fetch && tracker->agy_fetch->proc) {
         mcode_proc_kill(tracker->agy_fetch->proc);
     }
@@ -5062,6 +5514,10 @@ void mcode_usage_tracker_free(mcode_usage_tracker *tracker) {
         usage_fetch_destroy(tracker->codex_fetch);
         tracker->codex_fetch = NULL;
     }
+    if (tracker->codex_reset) {
+        reset_consume_destroy(tracker->codex_reset);
+        tracker->codex_reset = NULL;
+    }
     if (tracker->agy_fetch) {
         simple_fetch_destroy(tracker->agy_fetch);
         tracker->agy_fetch = NULL;
@@ -5071,6 +5527,9 @@ void mcode_usage_tracker_free(mcode_usage_tracker *tracker) {
         tracker->claude_fetch = NULL;
     }
     tracker->agy_refresh_pending = false;
+    tracker->codex_reset_done = false;
+    tracker->codex_reset_outcome = MCODE_RESET_OUTCOME_NONE;
+    tracker->codex_reset_error[0] = '\0';
     for (int i = 0; i < APP_AGENT_COUNT; ++i) {
         tracker->quotas[i].loading = false;
     }

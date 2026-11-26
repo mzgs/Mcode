@@ -99,6 +99,7 @@ typedef struct {
 
 enum {
     MCODE_MAX_QUOTA_GROUPS = 4,
+    MCODE_MAX_RESET_CREDITS = 8,
 };
 
 typedef struct {
@@ -115,6 +116,16 @@ typedef struct {
 } mcode_quota_group;
 
 typedef struct {
+    char id[128];              /* Opaque backend identifier */
+    char reset_type[32];       /* e.g. "codexRateLimits" */
+    char status[24];           /* e.g. "available", "redeeming", "redeemed" */
+    int64_t granted_at;        /* Unix epoch seconds, 0 if unknown */
+    int64_t expires_at;        /* Unix epoch seconds, 0 if none/unknown */
+    char title[96];            /* e.g. "Full reset (Weekly + 5 hr)" */
+    char description[256];     /* Backend-provided display description */
+} mcode_reset_credit;
+
+typedef struct {
     bool available;
     bool loading;
     bool auth_checked;
@@ -125,6 +136,10 @@ typedef struct {
     mcode_rate_window secondary; /* rolling weekly window (e.g. 7d) */
     mcode_quota_group groups[MCODE_MAX_QUOTA_GROUPS];
     int group_count;
+    bool reset_credits_checked;
+    int64_t reset_credits_available;
+    mcode_reset_credit reset_credits[MCODE_MAX_RESET_CREDITS];
+    int reset_credit_count;
     bool has_credits;
     bool unlimited_credits;
     char credits_balance[32];
