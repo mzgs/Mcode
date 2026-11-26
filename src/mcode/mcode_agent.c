@@ -3825,7 +3825,9 @@ bool mcode_agent_parse_agy_usage_json(const char *json, size_t len,
                 double rem = yyjson_get_num(rem_v);
                 if (rem < 0.0) rem = 0.0;
                 if (rem > 1.0) rem = 1.0;
-                int used_pct = clamp_percent((int)((1.0 - rem) * 100.0 + 0.5));
+                /* Match `agy -p "/usage"` terminal display by flooring remaining_fraction * 100. */
+                int rem_pct = clamp_percent((int)(rem * 100.0 + 1e-9));
+                int used_pct = clamp_percent(100 - rem_pct);
                 int64_t resets = parse_iso8601_utc_epoch(jstr(bv, "reset_time"));
                 const char *win = jstr(bv, "window");
                 const char *bid = jstr(bv, "id");

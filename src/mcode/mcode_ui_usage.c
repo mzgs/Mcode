@@ -218,6 +218,13 @@ static void format_plan_label(const char *plan, char *out, size_t cap) {
     }
 }
 
+static int remaining_percent(int used_percent) {
+    int left = 100 - used_percent;
+    if (left < 0) return 0;
+    if (left > 100) return 100;
+    return left;
+}
+
 static cui_tone tone_for_percent(int pct) {
     if (pct >= 90) return CUI_TONE_DANGER;
     if (pct >= 70) return CUI_TONE_WARNING;
@@ -267,10 +274,11 @@ static void draw_window_pair(cui_ctx *ui, const char *id,
         for (int i = 0; i < 2; ++i) {
             if (!has[i]) continue;
             const mcode_rate_window *w = ws[i];
+            int left_pct = remaining_percent(w->used_percent);
             char wtag[16];
             format_window_short(w->window_mins, lbls[i], wtag, sizeof wtag);
-            char pct_s[16];
-            snprintf(pct_s, sizeof pct_s, "%d%%", w->used_percent);
+            char pct_s[24];
+            snprintf(pct_s, sizeof pct_s, "%d%% left", left_pct);
             char rst_s[24];
             format_reset_short(w->resets_at, now_epoch, rst_s, sizeof rst_s);
 
@@ -288,7 +296,7 @@ static void draw_window_pair(cui_ctx *ui, const char *id,
                                  .tabular = true, .nowrap = true);
                     }
                 }
-                cui_progress(ui, (float)w->used_percent / 100.0f,
+                cui_progress(ui, (float)left_pct / 100.0f,
                              .tone = tone_for_percent(w->used_percent),
                              .height = 4.5f, .width = CUI_FILL);
             }
@@ -666,24 +674,26 @@ static void draw_bar_provider_segment(mcode_app *app, cui_ctx *ui, app_agent_kin
 
         if (has_prim || has_sec) {
             const mcode_rate_window *first = has_prim ? prim : sec;
+            int first_left = remaining_percent(first->used_percent);
             char txt[32];
             if (vw >= 1120.0f) {
                 char wlbl[12];
                 format_window_short(first->window_mins, has_prim ? "5h" : "7d", wlbl, sizeof wlbl);
-                snprintf(txt, sizeof txt, "%s %d%%", wlbl, first->used_percent);
+                snprintf(txt, sizeof txt, "%s %d%%", wlbl, first_left);
             } else {
-                snprintf(txt, sizeof txt, "%d%%", first->used_percent);
+                snprintf(txt, sizeof txt, "%d%%", first_left);
             }
             cui_text(ui, txt, .size = text_sz, .color = fg, .tabular = true, .nowrap = true);
             if (vw >= 840.0f) {
-                cui_progress(ui, (float)first->used_percent / 100.0f,
+                cui_progress(ui, (float)first_left / 100.0f,
                              .tone = tone_for_percent(first->used_percent),
                              .height = 4.0f, .width = CUI_PX(28));
             }
             if (has_prim && has_sec && vw >= 1220.0f) {
+                int sec_left = remaining_percent(sec->used_percent);
                 char w2[12], txt2[24];
                 format_window_short(sec->window_mins, "7d", w2, sizeof w2);
-                snprintf(txt2, sizeof txt2, "%s %d%%", w2, sec->used_percent);
+                snprintf(txt2, sizeof txt2, "%s %d%%", w2, sec_left);
                 cui_text(ui, txt2, .size = text_sz, .color = CUI_COLOR_TEXT_MUTED,
                          .tabular = true, .nowrap = true);
             }
@@ -760,42 +770,6 @@ void mcode_ui_draw_status_usage(mcode_app *app, cui_ctx *ui, mcode_thread *threa
     }
 
     cui_card_end(ui);
-
-    /* Concise multi-provider tooltip */
-    char tip[256] = "";
-    int tpos = 0;
-    for (int oi = 0; oi < APP_AGENT_COUNT; ++oi) {
-        app_agent_kind ag = k_order[oi];
-        if (!app->cli_status.available[ag]) continue;
-        const mcode_provider_quota *q = &app->usage.quotas[ag];
-        const mcode_rate_window *pw = &q->primary;
-        const mcode_rate_window *sw = &q->secondary;
-        if (ag == APP_AGENT_AGY) {
-            const mcode_quota_group *grp = select_agy_bar_group(app, thread);
-            if (grp) { pw = &grp->primary; sw = &grp->secondary; }
-        }
-        if (tpos > 0 && (size_t)tpos < sizeof tip) {
-            tpos += snprintf(tip + tpos, sizeof tip - (size_t)tpos, " · ");
-        }
-        if (q->available && pw->available && sw->available) {
-            tpos += snprintf(tip + tpos, sizeof tip - (size_t)tpos, "%s %d%%/%d%%",
-                             mcode_agent_short_label(ag), pw->used_percent, sw->used_percent);
-        } else if (q->available && pw->available) {
-            tpos += snprintf(tip + tpos, sizeof tip - (size_t)tpos, "%s %d%%",
-                             mcode_agent_short_label(ag), pw->used_percent);
-        } else if (q->auth_checked && !q->logged_in) {
-            tpos += snprintf(tip + tpos, sizeof tip - (size_t)tpos, "%s not signed in",
-                             mcode_agent_short_label(ag));
-        } else {
-            tpos += snprintf(tip + tpos, sizeof tip - (size_t)tpos, "%s ready",
-                             mcode_agent_short_label(ag));
-        }
-    }
-    if ((size_t)tpos < sizeof tip) {
-        snprintf(tip + tpos, sizeof tip - (size_t)tpos, "%sClick for usage details",
-                 tpos > 0 ? " — " : "");
-    }
-    cui_tooltip(ui, tip);
 
     if (clicked) {
         cui_popover_toggle(ui, "mcode-usage-pop");
