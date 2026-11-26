@@ -3,6 +3,7 @@
 
 #include "app_chrome.h"
 #include "mcode_agent.h"
+#include "mcode_cli_updates.h"
 #include "mcode_files.h"
 #include "mcode_git.h"
 #include "mcode_proc.h"
@@ -44,6 +45,11 @@ typedef struct {
 
     mcode_cli_status cli_status;
     double cli_checked_at;
+    mcode_cli_updates cli_updates;
+    double cli_updates_checked_at;
+    double cli_updates_local_recheck_at;
+    bool cli_updates_open_requested;
+    bool cli_updates_manual_check_pending;
     mcode_model_catalog models;
     mcode_usage_tracker usage;
     double usage_checked_at;

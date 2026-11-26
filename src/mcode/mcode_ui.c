@@ -1096,6 +1096,7 @@ void mcode_app_init(mcode_app *app, app_chrome *chrome) {
 
     mcode_agent_detect_clis(chrome ? app_chrome_settings(chrome) : NULL, &app->cli_status);
     app->cli_checked_at = mcode_now_mono();
+    mcode_cli_updates_init(&app->cli_updates);
     mcode_model_catalog_init(&app->models);
     mcode_model_catalog_refresh(&app->models, &app->cli_status);
     mcode_usage_tracker_init(&app->usage);
@@ -1104,6 +1105,8 @@ void mcode_app_init(mcode_app *app, app_chrome *chrome) {
     if (!(chrome && chrome->env_screenshot_mode)) {
         mcode_usage_tracker_refresh(&app->usage, &app->cli_status, false);
         app->usage_checked_at = mcode_now_mono();
+        mcode_cli_updates_check_all(&app->cli_updates, &app->cli_status, false);
+        app->cli_updates_checked_at = mcode_now_mono();
     }
     if (app->store.project_count == 0) {
         mcode_ui_refresh_discovered_repos(app);
@@ -1122,6 +1125,7 @@ void mcode_app_shutdown(mcode_app *app) {
     double shutdown_start = mcode_now_mono();
     mcode_usage_tracker_begin_shutdown(&app->usage);
     mcode_model_catalog_begin_shutdown(&app->models);
+    mcode_cli_updates_begin_shutdown(&app->cli_updates);
     if (app->clone_proc) {
         mcode_proc_stop(app->clone_proc);
     }
@@ -1146,6 +1150,7 @@ void mcode_app_shutdown(mcode_app *app) {
     /* Reap disposable read-only probes (already SIGKILLed above). */
     mcode_usage_tracker_free(&app->usage);
     mcode_model_catalog_free(&app->models);
+    mcode_cli_updates_free(&app->cli_updates);
 
     /* Reap active agent turns and clones sharing a single short grace budget. */
     enum { SHUTDOWN_GRACE_MS = 80 };
@@ -1339,6 +1344,40 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
 
     bool catalog_updated = mcode_model_catalog_poll(&app->models);
     bool usage_updated = mcode_usage_tracker_poll(&app->usage, &app->cli_status, agy_busy);
+    bool cli_updates_changed = mcode_cli_updates_poll(&app->cli_updates, &app->cli_status);
+
+    mcode_cli_update_result cli_upd_res;
+    while (mcode_cli_updates_take_result(&app->cli_updates, &cli_upd_res)) {
+        cli_updates_changed = true;
+        if (cli_upd_res.ok) {
+            mcode_agent_detect_clis(app_chrome_settings(app->chrome), &app->cli_status);
+            app->cli_checked_at = mcode_now_mono();
+            mcode_model_catalog_refresh(&app->models, &app->cli_status);
+        }
+        if (ui && cli_upd_res.message[0]) {
+            app_chrome_notify(app->chrome, ui, cli_upd_res.message,
+                              cli_upd_res.ok ? CUI_TONE_SUCCESS : CUI_TONE_WARNING);
+        }
+    }
+
+    if (app->cli_updates_manual_check_pending && !mcode_cli_updates_is_busy(&app->cli_updates)) {
+        app->cli_updates_manual_check_pending = false;
+        int avail = mcode_cli_updates_available_count(&app->cli_updates);
+        if (ui) {
+            if (avail > 0) {
+                char msg[96];
+                snprintf(msg, sizeof msg, "%d provider CLI update%s available.",
+                         avail, avail == 1 ? "" : "s");
+                app_chrome_notify(app->chrome, ui, msg, CUI_TONE_INFO);
+                app->cli_updates_open_requested = true;
+            } else {
+                app_chrome_notify(app->chrome, ui,
+                                  "All installed provider CLIs are up to date.",
+                                  CUI_TONE_SUCCESS);
+            }
+        }
+        cli_updates_changed = true;
+    }
 
     mcode_reset_credit_outcome reset_outcome = MCODE_RESET_OUTCOME_NONE;
     char reset_err[160] = "";
@@ -1379,9 +1418,10 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
     } else if (running > 0 || clone_active || term_visible_running) {
         cui_request_wakeup(ui, 0.033f);
     } else if (title_running > 0 || app->models.loading_agy ||
-               mcode_usage_tracker_is_loading(&app->usage)) {
+               mcode_usage_tracker_is_loading(&app->usage) ||
+               mcode_cli_updates_is_busy(&app->cli_updates)) {
         cui_request_wakeup(ui, 0.1f);
-    } else if (any_finished || catalog_updated || usage_updated) {
+    } else if (any_finished || catalog_updated || usage_updated || cli_updates_changed) {
         cui_request_redraw(ui);
     }
 
@@ -1404,28 +1444,38 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
                 mcode_usage_tracker_refresh(&app->usage, &app->cli_status, agy_busy);
                 app->usage_checked_at = now;
             }
+            /* Re-verify local CLI versions on focus if updates were pending (e.g. upgraded in external shell). */
+            if (mcode_cli_updates_available_count(&app->cli_updates) > 0 &&
+                (now - app->cli_updates_local_recheck_at) >= 15.0) {
+                mcode_cli_updates_check_all(&app->cli_updates, &app->cli_status, true);
+                app->cli_updates_local_recheck_at = now;
+            }
         }
     }
 
     /* Refresh CLI availability periodically when settings dialog closes or every 30s */
     if (now - app->cli_checked_at > 30.0) {
-        bool had_claude = app->cli_status.available[APP_AGENT_CLAUDE];
-        bool had_codex = app->cli_status.available[APP_AGENT_CODEX];
-        bool had_agy = app->cli_status.available[APP_AGENT_AGY];
+        mcode_cli_status prev_clis = app->cli_status;
         mcode_agent_detect_clis(app_chrome_settings(app->chrome), &app->cli_status);
         app->cli_checked_at = now;
-        if (app->cli_status.available[APP_AGENT_AGY] && (!had_agy || !app->models.loaded_agy)) {
+        if (app->cli_status.available[APP_AGENT_AGY] &&
+            (!prev_clis.available[APP_AGENT_AGY] || !app->models.loaded_agy)) {
             mcode_model_catalog_refresh(&app->models, &app->cli_status);
         }
         if (!(app->chrome && app->chrome->env_screenshot_mode)) {
-            if (app->cli_status.available[APP_AGENT_CLAUDE] && !had_claude) {
-                mcode_usage_tracker_refresh_agent(&app->usage, &app->cli_status, APP_AGENT_CLAUDE, agy_busy);
-            }
-            if (app->cli_status.available[APP_AGENT_CODEX] && !had_codex) {
-                mcode_usage_tracker_refresh_agent(&app->usage, &app->cli_status, APP_AGENT_CODEX, agy_busy);
-            }
-            if (app->cli_status.available[APP_AGENT_AGY] && !had_agy) {
-                mcode_usage_tracker_refresh_agent(&app->usage, &app->cli_status, APP_AGENT_AGY, agy_busy);
+            for (int i = 0; i < APP_AGENT_COUNT; ++i) {
+                bool avail = app->cli_status.available[i];
+                bool had = prev_clis.available[i];
+                bool path_changed = (strcmp(app->cli_status.resolved_path[i],
+                                            prev_clis.resolved_path[i]) != 0);
+                if (avail && !had) {
+                    mcode_usage_tracker_refresh_agent(&app->usage, &app->cli_status,
+                                                      (app_agent_kind)i, agy_busy);
+                }
+                if (avail != had || path_changed) {
+                    mcode_cli_updates_check_agent(&app->cli_updates, &app->cli_status,
+                                                  (app_agent_kind)i, false);
+                }
             }
         }
     }
@@ -1435,6 +1485,13 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
         (now - app->usage_checked_at) >= 300.0) {
         mcode_usage_tracker_refresh(&app->usage, &app->cli_status, agy_busy);
         app->usage_checked_at = now;
+    }
+
+    /* Re-check provider CLI updates periodically (every 4 hours) */
+    if (!(app->chrome && app->chrome->env_screenshot_mode) &&
+        (now - app->cli_updates_checked_at) >= 14400.0) {
+        mcode_cli_updates_check_all(&app->cli_updates, &app->cli_status, false);
+        app->cli_updates_checked_at = now;
     }
 
     /* Debounced atomic save of workspace state */
@@ -1457,6 +1514,8 @@ static void draw_status_bar(mcode_app *app, cui_ctx *ui, mcode_thread *thread, i
             snprintf(run_buf, sizeof run_buf, "%d running###sb-run", running_count);
             cui_status_bar_text(ui, run_buf, .icon = CUI_ICON_ACTIVITY, .tone = CUI_TONE_INFO);
         }
+
+        mcode_ui_draw_status_cli_updates(app, ui);
     }
 }
 
@@ -2223,6 +2282,24 @@ static void on_palette_open_codex_resets(cui_ctx *ui, void *user) {
     if (ui) cui_request_redraw(ui);
 }
 
+static void on_palette_check_cli_updates(cui_ctx *ui, void *user) {
+    mcode_app *app = (mcode_app *)user;
+    if (!app) return;
+    mcode_agent_detect_clis(app_chrome_settings(app->chrome), &app->cli_status);
+    app->cli_checked_at = mcode_now_mono();
+    mcode_cli_updates_check_all(&app->cli_updates, &app->cli_status, false);
+    app->cli_updates_checked_at = mcode_now_mono();
+    app->cli_updates_manual_check_pending = true;
+    if (ui) app_chrome_notify(app->chrome, ui, "Checking for provider CLI updates...", CUI_TONE_INFO);
+}
+
+static void on_palette_open_cli_updates(cui_ctx *ui, void *user) {
+    mcode_app *app = (mcode_app *)user;
+    if (!app) return;
+    app->cli_updates_open_requested = true;
+    if (ui) cui_request_redraw(ui);
+}
+
 static void on_palette_send_next_queued(cui_ctx *ui, void *user) {
     mcode_app *app = (mcode_app *)user;
     if (!app) return;
@@ -2307,6 +2384,25 @@ void mcode_app_palette_provider(app_palette_builder *builder, void *user) {
             .on_trigger = on_palette_refresh_usage,
             .user = app,
         });
+        app_palette_add(builder, &(app_palette_command){
+            .title = "Check for Provider CLI Updates",
+            .icon = CUI_ICON_REFRESH_CW,
+            .group = "Updates",
+            .on_trigger = on_palette_check_cli_updates,
+            .user = app,
+        });
+        int cli_upd_avail = mcode_cli_updates_available_count(&app->cli_updates);
+        if (cli_upd_avail > 0) {
+            char title[96];
+            snprintf(title, sizeof title, "Provider CLI Updates (%d available)", cli_upd_avail);
+            app_palette_add(builder, &(app_palette_command){
+                .title = title,
+                .icon = CUI_ICON_DOWNLOAD,
+                .group = "Updates",
+                .on_trigger = on_palette_open_cli_updates,
+                .user = app,
+            });
+        }
     }
     if (app->cli_status.available[APP_AGENT_CODEX] &&
         app->usage.quotas[APP_AGENT_CODEX].reset_credits_available > 0) {
