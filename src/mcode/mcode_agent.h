@@ -62,6 +62,7 @@ void mcode_agent_detect_clis(const app_settings *settings, mcode_cli_status *out
 void mcode_model_catalog_init(mcode_model_catalog *cat);
 void mcode_model_catalog_refresh(mcode_model_catalog *cat, const mcode_cli_status *clis);
 bool mcode_model_catalog_poll(mcode_model_catalog *cat);
+void mcode_model_catalog_begin_shutdown(mcode_model_catalog *cat);
 void mcode_model_catalog_free(mcode_model_catalog *cat);
 
 /* Default model configured in settings for `agent` (empty string if none). */
@@ -103,6 +104,7 @@ void mcode_usage_tracker_refresh_agent(mcode_usage_tracker *tracker, const mcode
 bool mcode_usage_tracker_is_loading(const mcode_usage_tracker *tracker);
 bool mcode_usage_tracker_poll(mcode_usage_tracker *tracker, const mcode_cli_status *clis,
                               bool agy_busy);
+void mcode_usage_tracker_begin_shutdown(mcode_usage_tracker *tracker);
 void mcode_usage_tracker_free(mcode_usage_tracker *tracker);
 
 /* Pure parsers exposed for unit tests. */
@@ -172,6 +174,9 @@ bool mcode_agent_respond_approval(mcode_agent_run *run, mcode_thread *thread,
 /* Destroy an agent run (stops and joins background thread if still active). */
 void mcode_agent_destroy(mcode_agent_run *run);
 
+/* Destroy an agent run with an explicit graceful-SIGTERM wait budget in ms (0 = immediate SIGKILL). */
+void mcode_agent_destroy_timeout(mcode_agent_run *run, int grace_ms);
+
 /* Start an asynchronous one-shot title generation request using `thread->agent`.
  * Returns a handle owned by the caller (stored on `thread->title_run`), or NULL. */
 mcode_title_run *mcode_agent_start_title(const mcode_thread *thread,
@@ -184,6 +189,9 @@ bool mcode_agent_poll_title(mcode_title_run *run, char *out_title, size_t cap, b
 
 /* Non-blocking request to stop a pending title generation subprocess. */
 void mcode_agent_title_stop(mcode_title_run *run);
+
+/* Non-blocking immediate SIGKILL for a disposable title generation subprocess (used on shutdown). */
+void mcode_agent_title_kill(mcode_title_run *run);
 
 /* Destroy a title request (stops and joins background process if still running). */
 void mcode_agent_title_destroy(mcode_title_run *run);

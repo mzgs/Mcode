@@ -28,8 +28,10 @@ mcode_proc *mcode_proc_spawn_shell(const char *command, const char *cwd,
     return NULL;
 }
 void mcode_proc_stop(mcode_proc *proc) { (void)proc; }
+void mcode_proc_kill(mcode_proc *proc) { (void)proc; }
 bool mcode_proc_is_running(const mcode_proc *proc) { (void)proc; return false; }
 void mcode_proc_destroy(mcode_proc *proc) { free(proc); }
+void mcode_proc_destroy_timeout(mcode_proc *proc, int grace_ms) { (void)grace_ms; free(proc); }
 bool mcode_proc_run_capture(const char *const *argv, const char *cwd,
                             bool merge_stderr, int *out_exit,
                             char **out_buf, size_t *out_len) {
@@ -42,12 +44,13 @@ bool mcode_find_executable(const char *name_or_path, char *out, size_t cap) {
 #else
 
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
-#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 struct mcode_proc {
@@ -55,6 +58,7 @@ struct mcode_proc {
     int stdin_fd;
     int stdout_fd;
     int stderr_fd;
+    int wake_pipe[2];
     mcode_proc_bytes_fn on_bytes;
     mcode_proc_exit_fn on_exit;
     void *user;
@@ -62,9 +66,11 @@ struct mcode_proc {
     pthread_t thread;
     bool thread_started;
     pthread_mutex_t mu;
+    pthread_cond_t done_cond;
     pthread_mutex_t write_mu;
     bool running;
     bool stop_requested;
+    bool abort_io;
 };
 
 static bool is_executable_file(const char *path) {
@@ -179,48 +185,133 @@ static void set_cloexec(int fd) {
     if (flags >= 0) (void)fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 }
 
+static void clear_cloexec(int fd) {
+    if (fd < 0) return;
+    int flags = fcntl(fd, F_GETFD);
+    if (flags >= 0 && (flags & FD_CLOEXEC)) (void)fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC);
+}
+
+static void set_nonblock(int fd) {
+    if (fd < 0) return;
+    int flags = fcntl(fd, F_GETFL);
+    if (flags >= 0) (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+static void proc_wake(mcode_proc *proc) {
+    if (!proc || proc->wake_pipe[1] < 0) return;
+    char b = 1;
+    ssize_t ignored = write(proc->wake_pipe[1], &b, 1);
+    (void)ignored;
+}
+
+static void proc_drain_fd(mcode_proc *proc, int *fd_p, bool is_stderr) {
+    char buf[4096];
+    while (*fd_p >= 0) {
+        pthread_mutex_lock(&proc->mu);
+        bool aborted = proc->abort_io;
+        pthread_mutex_unlock(&proc->mu);
+        if (aborted) return;
+
+        ssize_t n = read(*fd_p, buf, sizeof buf);
+        if (n > 0) {
+            if (proc->on_bytes) proc->on_bytes(buf, (size_t)n, is_stderr, proc->user);
+        } else if (n == 0) {
+            close(*fd_p);
+            *fd_p = -1;
+            return;
+        } else {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            close(*fd_p);
+            *fd_p = -1;
+            return;
+        }
+    }
+}
+
 static void *proc_reader_main(void *arg) {
     mcode_proc *proc = (mcode_proc *)arg;
     int fd_out = proc->stdout_fd;
     int fd_err = proc->stderr_fd;
-    char buf[4096];
+    int fd_wake = proc->wake_pipe[0];
+    int status = 0;
+    bool reaped = false;
 
     while (fd_out >= 0 || fd_err >= 0) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        int maxfd = -1;
+        pthread_mutex_lock(&proc->mu);
+        bool aborted = proc->abort_io;
+        pthread_mutex_unlock(&proc->mu);
+        if (aborted) break;
+
+        struct pollfd pfds[3];
+        nfds_t nfds = 0;
+        int idx_wake = -1, idx_out = -1, idx_err = -1;
+        if (fd_wake >= 0) {
+            idx_wake = (int)nfds;
+            pfds[nfds++] = (struct pollfd){ .fd = fd_wake, .events = POLLIN, .revents = 0 };
+        }
         if (fd_out >= 0) {
-            FD_SET(fd_out, &rfds);
-            if (fd_out > maxfd) maxfd = fd_out;
+            idx_out = (int)nfds;
+            pfds[nfds++] = (struct pollfd){ .fd = fd_out, .events = POLLIN, .revents = 0 };
         }
         if (fd_err >= 0) {
-            FD_SET(fd_err, &rfds);
-            if (fd_err > maxfd) maxfd = fd_err;
+            idx_err = (int)nfds;
+            pfds[nfds++] = (struct pollfd){ .fd = fd_err, .events = POLLIN, .revents = 0 };
         }
-        struct timeval tv = { 0, 100000 }; /* 100ms */
-        int ready = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+
+        int ready = poll(pfds, nfds, 100);
         if (ready < 0) {
             if (errno == EINTR) continue;
             break;
         }
-        if (ready == 0) continue;
+        if (idx_wake >= 0 && (pfds[idx_wake].revents & (POLLIN | POLLHUP | POLLERR))) {
+            char discard[64];
+            while (read(fd_wake, discard, sizeof discard) > 0) {}
+            pthread_mutex_lock(&proc->mu);
+            aborted = proc->abort_io;
+            pthread_mutex_unlock(&proc->mu);
+            if (aborted) break;
+        }
+        if (ready == 0) {
+            /* If the direct child already exited while a detached grandchild keeps
+             * stdout/stderr open, drain any buffered output and finish cleanly. */
+            if (!reaped && proc->pid > 0) {
+                pid_t w = waitpid(proc->pid, &status, WNOHANG);
+                if (w == proc->pid) {
+                    reaped = true;
+                    if (fd_out >= 0) proc_drain_fd(proc, &fd_out, false);
+                    if (fd_err >= 0) proc_drain_fd(proc, &fd_err, true);
+                    break;
+                } else if (w < 0 && errno == ECHILD) {
+                    reaped = true;
+                    break;
+                }
+            }
+            continue;
+        }
 
-        if (fd_out >= 0 && FD_ISSET(fd_out, &rfds)) {
-            ssize_t n = read(fd_out, buf, sizeof buf);
-            if (n > 0) {
-                if (proc->on_bytes) proc->on_bytes(buf, (size_t)n, false, proc->user);
-            } else if (n == 0 || (n < 0 && errno != EINTR)) {
+        if (idx_out >= 0 && (pfds[idx_out].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
+            if (pfds[idx_out].revents & POLLNVAL) {
                 close(fd_out);
                 fd_out = -1;
+            } else {
+                proc_drain_fd(proc, &fd_out, false);
+                if (fd_out >= 0 && (pfds[idx_out].revents & POLLERR)) {
+                    close(fd_out);
+                    fd_out = -1;
+                }
             }
         }
-        if (fd_err >= 0 && FD_ISSET(fd_err, &rfds)) {
-            ssize_t n = read(fd_err, buf, sizeof buf);
-            if (n > 0) {
-                if (proc->on_bytes) proc->on_bytes(buf, (size_t)n, true, proc->user);
-            } else if (n == 0 || (n < 0 && errno != EINTR)) {
+        if (idx_err >= 0 && (pfds[idx_err].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
+            if (pfds[idx_err].revents & POLLNVAL) {
                 close(fd_err);
                 fd_err = -1;
+            } else {
+                proc_drain_fd(proc, &fd_err, true);
+                if (fd_err >= 0 && (pfds[idx_err].revents & POLLERR)) {
+                    close(fd_err);
+                    fd_err = -1;
+                }
             }
         }
     }
@@ -230,8 +321,15 @@ static void *proc_reader_main(void *arg) {
     proc->stdout_fd = -1;
     proc->stderr_fd = -1;
 
-    int status = 0;
-    while (waitpid(proc->pid, &status, 0) < 0 && errno == EINTR) {
+    while (!reaped && proc->pid > 0) {
+        pid_t w = waitpid(proc->pid, &status, 0);
+        if (w == proc->pid) {
+            reaped = true;
+        } else if (w < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
     }
 
     int exit_code = -1;
@@ -244,11 +342,14 @@ static void *proc_reader_main(void *arg) {
     }
 
     pthread_mutex_lock(&proc->mu);
+    bool skip_cb = proc->abort_io;
     if (proc->stop_requested) killed = true;
+    proc->pid = -1;
     proc->running = false;
+    pthread_cond_broadcast(&proc->done_cond);
     pthread_mutex_unlock(&proc->mu);
 
-    if (proc->on_exit) proc->on_exit(exit_code, killed, proc->user);
+    if (!skip_cb && proc->on_exit) proc->on_exit(exit_code, killed, proc->user);
     return NULL;
 }
 
@@ -258,6 +359,7 @@ mcode_proc *mcode_proc_spawn(const mcode_proc_desc *desc) {
     int in_pipe[2] = { -1, -1 };
     int out_pipe[2] = { -1, -1 };
     int err_pipe[2] = { -1, -1 };
+    int wake_pipe[2] = { -1, -1 };
     if (desc->open_stdin) {
         if (pipe(in_pipe) != 0) return NULL;
     }
@@ -273,7 +375,15 @@ mcode_proc *mcode_proc_spawn(const mcode_proc_desc *desc) {
             return NULL;
         }
     }
+    if (pipe(wake_pipe) != 0) {
+        if (in_pipe[0] >= 0) { close(in_pipe[0]); close(in_pipe[1]); }
+        close(out_pipe[0]);
+        close(out_pipe[1]);
+        if (err_pipe[0] >= 0) { close(err_pipe[0]); close(err_pipe[1]); }
+        return NULL;
+    }
 
+    if (in_pipe[0] >= 0) set_cloexec(in_pipe[0]);
     if (in_pipe[1] >= 0) {
         set_cloexec(in_pipe[1]);
 #ifdef F_SETNOSIGPIPE
@@ -281,7 +391,17 @@ mcode_proc *mcode_proc_spawn(const mcode_proc_desc *desc) {
 #endif
     }
     set_cloexec(out_pipe[0]);
-    if (err_pipe[0] >= 0) set_cloexec(err_pipe[0]);
+    set_cloexec(out_pipe[1]);
+    set_nonblock(out_pipe[0]);
+    if (err_pipe[0] >= 0) {
+        set_cloexec(err_pipe[0]);
+        set_nonblock(err_pipe[0]);
+    }
+    if (err_pipe[1] >= 0) set_cloexec(err_pipe[1]);
+    set_cloexec(wake_pipe[0]);
+    set_cloexec(wake_pipe[1]);
+    set_nonblock(wake_pipe[0]);
+    set_nonblock(wake_pipe[1]);
 
     /* Copy argv into mutable array before fork for execvp */
     size_t argc = 0;
@@ -291,6 +411,7 @@ mcode_proc *mcode_proc_spawn(const mcode_proc_desc *desc) {
         if (in_pipe[0] >= 0) { close(in_pipe[0]); close(in_pipe[1]); }
         close(out_pipe[0]); close(out_pipe[1]);
         if (err_pipe[0] >= 0) { close(err_pipe[0]); close(err_pipe[1]); }
+        close(wake_pipe[0]); close(wake_pipe[1]);
         return NULL;
     }
     for (size_t i = 0; i < argc; ++i) {
@@ -306,6 +427,7 @@ mcode_proc *mcode_proc_spawn(const mcode_proc_desc *desc) {
         if (in_pipe[0] >= 0) { close(in_pipe[0]); close(in_pipe[1]); }
         close(out_pipe[0]); close(out_pipe[1]);
         if (err_pipe[0] >= 0) { close(err_pipe[0]); close(err_pipe[1]); }
+        close(wake_pipe[0]); close(wake_pipe[1]);
         return NULL;
     }
 
@@ -313,26 +435,31 @@ mcode_proc *mcode_proc_spawn(const mcode_proc_desc *desc) {
         /* Child process */
         setpgid(0, 0);
         if (in_pipe[0] >= 0) {
-            dup2(in_pipe[0], STDIN_FILENO);
-            close(in_pipe[0]);
-            close(in_pipe[1]);
+            if (in_pipe[0] != STDIN_FILENO) dup2(in_pipe[0], STDIN_FILENO);
+            clear_cloexec(STDIN_FILENO);
+            if (in_pipe[0] > STDERR_FILENO) close(in_pipe[0]);
+            if (in_pipe[1] > STDERR_FILENO) close(in_pipe[1]);
         } else {
             int devnull = open("/dev/null", O_RDONLY);
             if (devnull >= 0) {
                 dup2(devnull, STDIN_FILENO);
-                if (devnull > 2) close(devnull);
+                if (devnull > STDERR_FILENO) close(devnull);
             }
         }
-        dup2(out_pipe[1], STDOUT_FILENO);
+        if (out_pipe[1] != STDOUT_FILENO) dup2(out_pipe[1], STDOUT_FILENO);
+        clear_cloexec(STDOUT_FILENO);
         if (desc->merge_stderr) {
             dup2(out_pipe[1], STDERR_FILENO);
         } else {
-            dup2(err_pipe[1], STDERR_FILENO);
+            if (err_pipe[1] != STDERR_FILENO) dup2(err_pipe[1], STDERR_FILENO);
         }
-        close(out_pipe[0]);
-        close(out_pipe[1]);
-        if (err_pipe[0] >= 0) close(err_pipe[0]);
-        if (err_pipe[1] >= 0) close(err_pipe[1]);
+        clear_cloexec(STDERR_FILENO);
+        if (out_pipe[0] > STDERR_FILENO) close(out_pipe[0]);
+        if (out_pipe[1] > STDERR_FILENO) close(out_pipe[1]);
+        if (err_pipe[0] > STDERR_FILENO) close(err_pipe[0]);
+        if (err_pipe[1] > STDERR_FILENO) close(err_pipe[1]);
+        if (wake_pipe[0] > STDERR_FILENO) close(wake_pipe[0]);
+        if (wake_pipe[1] > STDERR_FILENO) close(wake_pipe[1]);
 
         if (child_cwd && chdir(child_cwd) != 0) {
             _exit(126);
@@ -357,6 +484,8 @@ mcode_proc *mcode_proc_spawn(const mcode_proc_desc *desc) {
         if (in_pipe[1] >= 0) close(in_pipe[1]);
         close(out_pipe[0]);
         if (err_pipe[0] >= 0) close(err_pipe[0]);
+        close(wake_pipe[0]);
+        close(wake_pipe[1]);
         kill(-pid, SIGKILL);
         waitpid(pid, NULL, 0);
         return NULL;
@@ -365,20 +494,26 @@ mcode_proc *mcode_proc_spawn(const mcode_proc_desc *desc) {
     proc->stdin_fd = in_pipe[1];
     proc->stdout_fd = out_pipe[0];
     proc->stderr_fd = err_pipe[0];
+    proc->wake_pipe[0] = wake_pipe[0];
+    proc->wake_pipe[1] = wake_pipe[1];
     proc->on_bytes = desc->on_bytes;
     proc->on_exit = desc->on_exit;
     proc->user = desc->user;
     proc->running = true;
     pthread_mutex_init(&proc->mu, NULL);
+    pthread_cond_init(&proc->done_cond, NULL);
     pthread_mutex_init(&proc->write_mu, NULL);
 
     if (pthread_create(&proc->thread, NULL, proc_reader_main, proc) != 0) {
         if (proc->stdin_fd >= 0) close(proc->stdin_fd);
         close(proc->stdout_fd);
         if (proc->stderr_fd >= 0) close(proc->stderr_fd);
+        close(proc->wake_pipe[0]);
+        close(proc->wake_pipe[1]);
         kill(-pid, SIGKILL);
         waitpid(pid, NULL, 0);
         pthread_mutex_destroy(&proc->write_mu);
+        pthread_cond_destroy(&proc->done_cond);
         pthread_mutex_destroy(&proc->mu);
         free(proc);
         return NULL;
@@ -456,6 +591,22 @@ void mcode_proc_stop(mcode_proc *proc) {
     }
 }
 
+void mcode_proc_kill(mcode_proc *proc) {
+    if (!proc) return;
+    mcode_proc_close_stdin(proc);
+    pthread_mutex_lock(&proc->mu);
+    bool running = proc->running;
+    proc->stop_requested = true;
+    proc->abort_io = true;
+    pid_t pid = proc->pid;
+    pthread_mutex_unlock(&proc->mu);
+    if (running && pid > 0) {
+        kill(-pid, SIGKILL);
+        kill(pid, SIGKILL);
+    }
+    proc_wake(proc);
+}
+
 bool mcode_proc_is_running(const mcode_proc *proc) {
     if (!proc) return false;
     mcode_proc *mp = (mcode_proc *)proc;
@@ -465,26 +616,61 @@ bool mcode_proc_is_running(const mcode_proc *proc) {
     return r;
 }
 
-void mcode_proc_destroy(mcode_proc *proc) {
+static void proc_wait_exit(mcode_proc *proc, int timeout_ms) {
+    if (!proc || timeout_ms <= 0) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += timeout_ms / 1000;
+    ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec += 1;
+        ts.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&proc->mu);
+    while (proc->running) {
+        int rc = pthread_cond_timedwait(&proc->done_cond, &proc->mu, &ts);
+        if (rc == ETIMEDOUT) break;
+        if (rc != 0 && rc != EINTR) break;
+    }
+    pthread_mutex_unlock(&proc->mu);
+}
+
+static void proc_free_resources(mcode_proc *proc) {
     if (!proc) return;
     mcode_proc_close_stdin(proc);
-    if (mcode_proc_is_running(proc)) {
-        mcode_proc_stop(proc);
-        /* Give graceful SIGTERM a brief chance before escalating */
-        for (int i = 0; i < 15 && mcode_proc_is_running(proc); ++i) {
-            usleep(20000);
+    if (proc->wake_pipe[0] >= 0) close(proc->wake_pipe[0]);
+    if (proc->wake_pipe[1] >= 0) close(proc->wake_pipe[1]);
+    pthread_mutex_destroy(&proc->write_mu);
+    pthread_cond_destroy(&proc->done_cond);
+    pthread_mutex_destroy(&proc->mu);
+    free(proc);
+}
+
+void mcode_proc_destroy_timeout(mcode_proc *proc, int grace_ms) {
+    if (!proc) return;
+    mcode_proc_close_stdin(proc);
+    pthread_mutex_lock(&proc->mu);
+    bool running = proc->running;
+    bool already_killing = proc->abort_io;
+    pthread_mutex_unlock(&proc->mu);
+    if (running && !already_killing) {
+        if (grace_ms > 0) {
+            mcode_proc_stop(proc);
+            proc_wait_exit(proc, grace_ms);
         }
-        if (mcode_proc_is_running(proc) && proc->pid > 0) {
-            kill(-proc->pid, SIGKILL);
-            kill(proc->pid, SIGKILL);
+        if (mcode_proc_is_running(proc)) {
+            mcode_proc_kill(proc);
         }
     }
     if (proc->thread_started) {
         pthread_join(proc->thread, NULL);
+        proc->thread_started = false;
     }
-    pthread_mutex_destroy(&proc->write_mu);
-    pthread_mutex_destroy(&proc->mu);
-    free(proc);
+    proc_free_resources(proc);
+}
+
+void mcode_proc_destroy(mcode_proc *proc) {
+    mcode_proc_destroy_timeout(proc, 150);
 }
 
 typedef struct {
@@ -539,10 +725,7 @@ bool mcode_proc_run_capture(const char *const *argv, const char *cwd,
         pthread_join(proc->thread, NULL);
         proc->thread_started = false;
     }
-    mcode_proc_close_stdin(proc);
-    pthread_mutex_destroy(&proc->write_mu);
-    pthread_mutex_destroy(&proc->mu);
-    free(proc);
+    proc_free_resources(proc);
     pthread_mutex_destroy(&ctx.mu);
 
     if (out_exit) *out_exit = ctx.exit_code;

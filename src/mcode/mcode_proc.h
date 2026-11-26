@@ -33,14 +33,20 @@ mcode_proc *mcode_proc_spawn_shell(const char *command, const char *cwd,
                                    mcode_proc_bytes_fn on_bytes,
                                    mcode_proc_exit_fn on_exit, void *user);
 
-/* Request termination (SIGTERM then SIGKILL to process group). */
+/* Request termination (SIGTERM to process group). */
 void mcode_proc_stop(mcode_proc *proc);
+
+/* Immediately force-terminate (SIGKILL to process group) and abort reader I/O. */
+void mcode_proc_kill(mcode_proc *proc);
 
 /* True while the process has not yet finished its exit callback. */
 bool mcode_proc_is_running(const mcode_proc *proc);
 
 /* Wait for reader thread to finish and release resources. */
 void mcode_proc_destroy(mcode_proc *proc);
+
+/* Destroy with an explicit graceful-SIGTERM wait budget in ms (0 = immediate SIGKILL). */
+void mcode_proc_destroy_timeout(mcode_proc *proc, int grace_ms);
 
 /* Run a command synchronously and capture stdout (and optionally stderr).
  * Returns true if the process ran; *out_exit receives exit code.

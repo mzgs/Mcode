@@ -1,4 +1,5 @@
 #import <Cocoa/Cocoa.h>
+#import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #include "app_config.h"
 #include "platform.h"
@@ -136,6 +137,7 @@ static void macos_layout_traffic_lights(NSWindow *win, CGFloat titlebar_height) 
     NSView *titlebarView = closeBtn.superview;
     if (!titlebarView) return;
 
+    bool moved = false;
     NSView *container = titlebarView.superview;
     if (container && container.superview) {
         NSRect tfBounds = container.superview.bounds;
@@ -145,12 +147,14 @@ static void macos_layout_traffic_lights(NSWindow *win, CGFloat titlebar_height) 
             cf.origin.y = NSMaxY(tfBounds) - titlebar_height;
             cf.size.height = titlebar_height;
             container.frame = cf;
+            moved = true;
         }
         NSRect tvf = titlebarView.frame;
         if (fabs(tvf.size.height - titlebar_height) > 0.5 || fabs(tvf.origin.y) > 0.5) {
             tvf.origin.y = 0.0;
             tvf.size.height = titlebar_height;
             titlebarView.frame = tvf;
+            moved = true;
         }
     }
 
@@ -162,11 +166,18 @@ static void macos_layout_traffic_lights(NSWindow *win, CGFloat titlebar_height) 
         NSRect bf = btns[i].frame;
         CGFloat btnH = bf.size.height;
         CGFloat topOffset = floor((titlebar_height - btnH) * 0.5);
-        bf.origin.x = leftX + (CGFloat)i * spacing;
-        bf.origin.y = titlebarView.isFlipped ? topOffset : (viewH - topOffset - btnH);
-        btns[i].frame = bf;
+        CGFloat targetX = leftX + (CGFloat)i * spacing;
+        CGFloat targetY = titlebarView.isFlipped ? topOffset : (viewH - topOffset - btnH);
+        if (fabs(bf.origin.x - targetX) > 0.5 || fabs(bf.origin.y - targetY) > 0.5) {
+            bf.origin.x = targetX;
+            bf.origin.y = targetY;
+            btns[i].frame = bf;
+            moved = true;
+        }
     }
-    [titlebarView updateTrackingAreas];
+    if (moved) {
+        [titlebarView updateTrackingAreas];
+    }
 }
 
 static BOOL macos_content_view_cannot_move_window(id self, SEL _cmd) {
@@ -236,12 +247,15 @@ static BOOL macos_content_view_cannot_move_window(id self, SEL _cmd) {
 }
 
 - (void)windowWillClose:(NSNotification *)note {
-    (void)note;
+    NSWindow *win = [note.object isKindOfClass:[NSWindow class]] ? (NSWindow *)note.object : nil;
     void (*on_closing)(void *) = _hooks.on_closing;
     void *user = _hooks.user;
     _hooks.on_closing = NULL;
     if (on_closing) {
         on_closing(user);
+    }
+    if (win) {
+        [win orderOut:nil];
     }
 }
 
@@ -316,6 +330,29 @@ void app_window_set_hooks(void *native_window, const char *backend, const app_wi
             }
         }
         g_window_observer = obs;
+    }
+}
+
+void app_platform_flush_window_close(void) {
+    @autoreleasepool {
+        [CATransaction flush];
+        if (NSApp) {
+            for (NSWindow *win in NSApp.windows) {
+                [win orderOut:nil];
+            }
+            NSEvent *ev;
+            int limit = 16;
+            while (limit-- > 0 &&
+                   (ev = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                            untilDate:[NSDate distantPast]
+                                               inMode:NSDefaultRunLoopMode
+                                              dequeue:YES]) != nil) {
+                [NSApp sendEvent:ev];
+            }
+            [NSApp updateWindows];
+            [CATransaction flush];
+        }
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, false);
     }
 }
 
@@ -538,7 +575,7 @@ forHTTPHeaderField:@"User-Agent"];
 
     bool aborted = false;
     for (;;) {
-        if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC)) == 0) break;
+        if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_MSEC)) == 0) break;
         if (!aborted && should_abort && should_abort(abort_user)) {
             aborted = true;
             [task cancel];

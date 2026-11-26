@@ -274,6 +274,9 @@ void app_window_titlebar_double_click(void *native_window, const char *backend) 
     (void)backend;
 }
 
+void app_platform_flush_window_close(void) {
+}
+
 void app_platform_shutdown(void) {
     if (g_hook_hwnd && IsWindow(g_hook_hwnd) && g_prev_wndproc) {
         SetWindowLongPtrW(g_hook_hwnd, GWLP_WNDPROC, (LONG_PTR)g_prev_wndproc);

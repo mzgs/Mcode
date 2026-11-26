@@ -4106,6 +4106,13 @@ bool mcode_model_catalog_poll(mcode_model_catalog *cat) {
     return updated;
 }
 
+void mcode_model_catalog_begin_shutdown(mcode_model_catalog *cat) {
+    if (!cat) return;
+    if (cat->agy_fetch && cat->agy_fetch->proc) {
+        mcode_proc_kill(cat->agy_fetch->proc);
+    }
+}
+
 void mcode_model_catalog_free(mcode_model_catalog *cat) {
     if (!cat) return;
     if (cat->agy_fetch) {
@@ -5036,6 +5043,19 @@ bool mcode_usage_tracker_poll(mcode_usage_tracker *tracker, const mcode_cli_stat
     return updated;
 }
 
+void mcode_usage_tracker_begin_shutdown(mcode_usage_tracker *tracker) {
+    if (!tracker) return;
+    if (tracker->codex_fetch && tracker->codex_fetch->proc) {
+        mcode_proc_kill(tracker->codex_fetch->proc);
+    }
+    if (tracker->agy_fetch && tracker->agy_fetch->proc) {
+        mcode_proc_kill(tracker->agy_fetch->proc);
+    }
+    if (tracker->claude_fetch && tracker->claude_fetch->proc) {
+        mcode_proc_kill(tracker->claude_fetch->proc);
+    }
+}
+
 void mcode_usage_tracker_free(mcode_usage_tracker *tracker) {
     if (!tracker) return;
     if (tracker->codex_fetch) {
@@ -5642,10 +5662,10 @@ bool mcode_agent_respond_approval(mcode_agent_run *run, mcode_thread *thread,
     return ok;
 }
 
-void mcode_agent_destroy(mcode_agent_run *run) {
+void mcode_agent_destroy_timeout(mcode_agent_run *run, int grace_ms) {
     if (!run) return;
     if (run->proc) {
-        mcode_proc_destroy(run->proc);
+        mcode_proc_destroy_timeout(run->proc, grace_ms);
         run->proc = NULL;
     }
     pthread_mutex_lock(&run->mu);
@@ -5684,6 +5704,10 @@ void mcode_agent_destroy(mcode_agent_run *run) {
     mcode_str_free(&run->stderr_tail);
     pthread_mutex_destroy(&run->mu);
     free(run);
+}
+
+void mcode_agent_destroy(mcode_agent_run *run) {
+    mcode_agent_destroy_timeout(run, 150);
 }
 
 /* ---- Asynchronous thread title generation ---- */
@@ -6183,6 +6207,11 @@ bool mcode_agent_poll_title(mcode_title_run *run, char *out_title, size_t cap, b
 void mcode_agent_title_stop(mcode_title_run *run) {
     if (!run || !run->proc) return;
     mcode_proc_stop(run->proc);
+}
+
+void mcode_agent_title_kill(mcode_title_run *run) {
+    if (!run || !run->proc) return;
+    mcode_proc_kill(run->proc);
 }
 
 void mcode_agent_title_destroy(mcode_title_run *run) {

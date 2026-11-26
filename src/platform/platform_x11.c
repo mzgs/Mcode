@@ -287,6 +287,12 @@ void app_window_titlebar_double_click(void *native_window, const char *backend) 
     (void)backend;
 }
 
+void app_platform_flush_window_close(void) {
+#ifdef APP_HAVE_X11
+    if (g_x11_dpy) XFlush(g_x11_dpy);
+#endif
+}
+
 void app_platform_shutdown(void) {
 #ifdef APP_HAVE_X11
     if (g_x11_dpy) {

@@ -1109,28 +1109,60 @@ void mcode_app_init(mcode_app *app, app_chrome *chrome) {
 
 void mcode_app_shutdown(mcode_app *app) {
     if (!app) return;
-    mcode_usage_tracker_free(&app->usage);
-    mcode_model_catalog_free(&app->models);
+
+    /* Flush the native window close immediately so the window vanishes on screen
+     * before background subprocess teardown runs. */
+    app_platform_flush_window_close();
+
+    /* Signal all background subprocesses in parallel first so they exit concurrently
+     * instead of paying sequential per-process wait timeouts. */
+    double shutdown_start = mcode_now_mono();
+    mcode_usage_tracker_begin_shutdown(&app->usage);
+    mcode_model_catalog_begin_shutdown(&app->models);
     if (app->clone_proc) {
-        mcode_proc_destroy(app->clone_proc);
-        app->clone_proc = NULL;
+        mcode_proc_stop(app->clone_proc);
+    }
+    for (int i = 0; i < app->store.thread_count; ++i) {
+        if (app->store.threads[i].title_run) {
+            mcode_agent_title_kill(app->store.threads[i].title_run);
+        }
+        if (app->store.threads[i].active_run) {
+            mcode_agent_stop(app->store.threads[i].active_run);
+        }
+    }
+
+    /* Persist workspace state and close the PTY while signaled processes exit. */
+    if (app->state_path[0]) {
+        mcode_store_save(&app->store, app->state_path);
     }
     if (app->term) {
         cui_vterm_destroy(app->term);
         app->term = NULL;
     }
+
+    /* Reap disposable read-only probes (already SIGKILLed above). */
+    mcode_usage_tracker_free(&app->usage);
+    mcode_model_catalog_free(&app->models);
+
+    /* Reap active agent turns and clones sharing a single short grace budget. */
+    enum { SHUTDOWN_GRACE_MS = 80 };
+    if (app->clone_proc) {
+        int elapsed = (int)((mcode_now_mono() - shutdown_start) * 1000.0);
+        int rem = SHUTDOWN_GRACE_MS - elapsed;
+        mcode_proc_destroy_timeout(app->clone_proc, rem > 0 ? rem : 0);
+        app->clone_proc = NULL;
+    }
     for (int i = 0; i < app->store.thread_count; ++i) {
-        if (app->store.threads[i].active_run) {
-            mcode_agent_destroy(app->store.threads[i].active_run);
-            app->store.threads[i].active_run = NULL;
-        }
         if (app->store.threads[i].title_run) {
             mcode_agent_title_destroy(app->store.threads[i].title_run);
             app->store.threads[i].title_run = NULL;
         }
-    }
-    if (app->state_path[0]) {
-        mcode_store_save(&app->store, app->state_path);
+        if (app->store.threads[i].active_run) {
+            int elapsed = (int)((mcode_now_mono() - shutdown_start) * 1000.0);
+            int rem = SHUTDOWN_GRACE_MS - elapsed;
+            mcode_agent_destroy_timeout(app->store.threads[i].active_run, rem > 0 ? rem : 0);
+            app->store.threads[i].active_run = NULL;
+        }
     }
     mcode_store_free(&app->store);
     mcode_file_tree_free(&app->file_tree);
