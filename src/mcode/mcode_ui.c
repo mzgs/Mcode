@@ -399,6 +399,7 @@ static void nav_history_jump(mcode_app *app, cui_ctx *ui, int target_idx) {
     mcode_thread *t = mcode_store_find_thread(&app->store, target_id);
     if (!t) return;
     app->nav_index = target_idx;
+    t->has_unread = false;
     mcode_ui_focus_composer(app, ui);
     if (!was_selected || strcmp(app->store.selected_thread_id, t->id) != 0) {
         snprintf(app->store.selected_thread_id, sizeof app->store.selected_thread_id, "%s", t->id);
@@ -418,6 +419,7 @@ void mcode_ui_select_thread(mcode_app *app, const char *thread_id) {
     discard_draft_threads(app, target_id);
     mcode_thread *t = mcode_store_find_thread(&app->store, target_id);
     if (!t) return;
+    t->has_unread = false;
     mcode_ui_focus_composer(app, NULL);
     if (!t->is_draft) nav_history_push(app, t->id);
     if (was_selected && strcmp(app->store.selected_thread_id, t->id) == 0) {
@@ -870,6 +872,7 @@ static bool start_thread_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread,
     bool was_draft = thread->is_draft;
 
     thread->state = MCODE_THREAD_ACTIVE;
+    thread->has_unread = false;
     thread->stop_requested = false;
     thread->queue_paused = false;
     char err[256] = "";
@@ -1258,6 +1261,10 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
             if (t->active_run) {
                 ++running;
             } else {
+                if (!was_stopped && !last_failed &&
+                    strcmp(app->store.selected_thread_id, t->id) != 0) {
+                    t->has_unread = true;
+                }
                 char msg[220];
                 snprintf(msg, sizeof msg, "Finished: %s", t->title);
                 app_chrome_notify(app->chrome, ui, msg, CUI_TONE_SUCCESS);
@@ -1561,7 +1568,7 @@ static cui_color project_badge_color(const char *name) {
     return CUI_RGBA(k_palette[h % (sizeof k_palette / sizeof k_palette[0])]);
 }
 
-static void draw_project_badge(cui_ctx *ui, const char *name) {
+void mcode_ui_draw_project_badge(cui_ctx *ui, const char *name, float size) {
     char letter[2] = "P";
     if (name) {
         for (const char *p = name; *p; ++p) {
@@ -1571,10 +1578,10 @@ static void draw_project_badge(cui_ctx *ui, const char *name) {
             }
         }
     }
-    cui_box(ui, .width = CUI_PX(18), .height = CUI_PX(18), .radius = 5,
+    cui_box(ui, .width = CUI_PX(size), .height = CUI_PX(size), .radius = size * 0.5f,
             .bg = project_badge_color(name),
             .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER) {
-        cui_text(ui, letter, .font = CUI_FONT_MEDIUM, .size = 10.5f,
+        cui_text(ui, letter, .font = CUI_FONT_MEDIUM, .size = size * 0.56f,
                  .color = CUI_RGBA(0xffffffffu), .nowrap = true);
     }
 }
@@ -1846,7 +1853,7 @@ static void draw_topbar_main_segment(mcode_app *app, cui_ctx *ui, mcode_thread *
         if (thread) {
             cui_row(ui, .gap = 8, .align = CUI_ALIGN_CENTER, .max_width = 620, .clip = true) {
                 if (proj) {
-                    draw_project_badge(ui, proj->name);
+                    mcode_ui_draw_project_badge(ui, proj->name, 18.0f);
                     cui_text(ui, proj->name, .font = CUI_FONT_BODY, .size = 13.0f,
                              .color = CUI_COLOR_TEXT_SECONDARY, .nowrap = true);
                     char tip[MCODE_PATH_MAX + 64];
@@ -1879,7 +1886,7 @@ static void draw_topbar_main_segment(mcode_app *app, cui_ctx *ui, mcode_thread *
             }
         } else if (proj) {
             cui_row(ui, .gap = 8, .align = CUI_ALIGN_CENTER) {
-                draw_project_badge(ui, proj->name);
+                mcode_ui_draw_project_badge(ui, proj->name, 18.0f);
                 cui_text(ui, proj->name, .font = CUI_FONT_BODY, .size = 13.0f,
                          .color = CUI_COLOR_TEXT_SECONDARY, .nowrap = true);
             }

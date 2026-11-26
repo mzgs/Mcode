@@ -43,7 +43,8 @@ static cui_color sidebar_hover_bg(cui_ctx *ui, float strength) {
 }
 
 static void draw_thread_status_glyph(cui_ctx *ui, const mcode_thread *t,
-                                     bool running, bool needs_review, bool last_failed) {
+                                     bool running, bool needs_review,
+                                     bool last_failed, bool is_selected) {
     bool dark = (cui_get_theme_mode(ui) == CUI_THEME_DARK);
     cui_color fg = cui_color_of(ui, CUI_COLOR_FOREGROUND);
 
@@ -62,9 +63,13 @@ static void draw_thread_status_glyph(cui_ctx *ui, const mcode_thread *t,
         } else if (t->state == MCODE_THREAD_SNOOZED) {
             cui_icon(ui, CUI_ICON_CLOCK, 12.0f,
                      cui_alpha(cui_color_of(ui, CUI_COLOR_WARNING), 0.85f));
-        } else if (t->turn_count > 0) {
+        } else if (t->has_unread && !is_selected) {
             cui_box(ui, .width = CUI_PX(6), .height = CUI_PX(6), .radius = 3.0f,
                     .bg = CUI_COLOR_SUCCESS) {}
+        } else if (t->turn_count > 0) {
+            cui_box(ui, .width = CUI_PX(5), .height = CUI_PX(5), .radius = 2.5f,
+                    .bg = cui_alpha(fg, is_selected ? (dark ? 0.45f : 0.40f)
+                                                    : (dark ? 0.24f : 0.22f))) {}
         } else {
             cui_box(ui, .width = CUI_PX(6), .height = CUI_PX(6), .radius = 3.0f,
                     .border = 1.25f,
@@ -122,7 +127,7 @@ static bool draw_thread_row(mcode_app *app, cui_ctx *ui, int idx, bool show_proj
 
     /* Top line: aligned status glyph + title + live timer/review + subtle provider icon */
     cui_row(ui, .width = CUI_FILL, .gap = 7, .align = CUI_ALIGN_CENTER) {
-        draw_thread_status_glyph(ui, t, running, needs_review, last_failed);
+        draw_thread_status_glyph(ui, t, running, needs_review, last_failed, is_selected);
 
         cui_color title_color;
         if (is_selected) {
@@ -312,7 +317,7 @@ static bool draw_project_section(mcode_app *app, cui_ctx *ui, int proj_idx, bool
                 .align = CUI_ALIGN_CENTER,
                 .width = CUI_FILL,
                 .pad_x = 6,
-                .pad_y = 5,
+                .pad_y = 4,
                 .gap = 6,
                 .hoverable = true,
                 .border = -1.0f,
@@ -322,16 +327,7 @@ static bool draw_project_section(mcode_app *app, cui_ctx *ui, int proj_idx, bool
             cui_icon(ui, expanded ? CUI_ICON_CHEVRON_DOWN : CUI_ICON_CHEVRON_RIGHT,
                      11.5f, cui_alpha(fg, hdr_hov ? 0.65f : 0.40f));
 
-            cui_color folder_col;
-            if (is_active_proj && cui_get_accent(ui) != CUI_ACCENT_NEUTRAL) {
-                folder_col = CUI_COLOR_ACCENT;
-            } else if (is_active_proj || expanded) {
-                folder_col = CUI_COLOR_TEXT_SECONDARY;
-            } else {
-                folder_col = CUI_COLOR_TEXT_MUTED;
-            }
-            cui_icon(ui, expanded ? CUI_ICON_FOLDER_OPEN : CUI_ICON_FOLDER,
-                     13.5f, folder_col);
+            mcode_ui_draw_project_badge(ui, p->name, 18.0f);
 
             cui_text(ui, p->name,
                      .font = CUI_FONT_MEDIUM,

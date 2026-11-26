@@ -219,6 +219,7 @@ typedef struct {
 
     /* Live runtime state (not persisted) */
     bool is_draft;
+    bool has_unread;
     struct mcode_agent_run *active_run;
     struct mcode_title_run *title_run;
     bool title_pending;

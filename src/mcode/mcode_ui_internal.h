@@ -51,6 +51,7 @@ void mcode_ui_run_terminal_cmd(mcode_app *app, cui_ctx *ui, const char *cmd, con
 void mcode_ui_stop_terminal(mcode_app *app);
 
 void mcode_ui_format_elapsed(float seconds, char *out, size_t cap);
+void mcode_ui_draw_project_badge(cui_ctx *ui, const char *name, float size);
 void mcode_ui_draw_provider_icon(mcode_app *app, cui_ctx *ui, app_agent_kind agent,
                                  float size, cui_color tint);
 
