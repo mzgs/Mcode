@@ -26,7 +26,6 @@ static bool rect_contains(cui_rect r, cui_vec2 p) {
 static bool thread_matches_query(mcode_app *app, const mcode_thread *t, const mcode_project *p) {
     if (!app->thread_search[0]) return true;
     if (contains_icase(t->title, app->thread_search)) return true;
-    if (contains_icase(t->branch, app->thread_search)) return true;
     if (p && contains_icase(p->name, app->thread_search)) return true;
     return false;
 }
@@ -170,13 +169,9 @@ static bool draw_thread_row(mcode_app *app, cui_ctx *ui, int idx, bool show_proj
 
     /* Optional second line: cleanly indented under the title text */
     char meta[192] = "";
-    if (show_project_name && p && t->branch[0]) {
-        snprintf(meta, sizeof meta, "%s · %s", p->name, t->branch);
-    } else if (show_project_name && p) {
-        snprintf(meta, sizeof meta, "%s", p->name);
-    } else if (t->branch[0]) {
+    if (show_project_name && p) {
         snprintf(meta, sizeof meta, "%s%s",
-                 t->branch,
+                 p->name,
                  (t->state == MCODE_THREAD_SNOOZED) ? " · snoozed" : "");
     } else if (t->state == MCODE_THREAD_SNOOZED) {
         snprintf(meta, sizeof meta, "Snoozed");
