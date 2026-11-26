@@ -150,16 +150,15 @@ void mcode_agent_stop(mcode_agent_run *run);
 
 typedef enum {
     MCODE_STEER_FAILED = 0,
-    MCODE_STEER_INJECTED,     /* Delivered live into the active turn (e.g. Codex turn/steer) */
+    MCODE_STEER_INJECTED,     /* Delivered live into the active turn */
     MCODE_STEER_INTERRUPTING, /* Gracefully interrupting active turn so caller runs steer next */
 } mcode_steer_result;
 
 /* Steer an active agent run with a mid-turn redirection message.
- * - Codex RPC (`turn/steer`) & Antigravity ACP (live `session/prompt`): inject live
- *   into the active turn without canceling (falling back to next turn if rejected
- *   or if blocked on an approval prompt).
- * - Claude CTL: gracefully interrupts via `control_request` (`interrupt`) and
- *   redirects on the same session as soon as the turn winds down. */
+ * - Codex RPC (`turn/steer`), Claude CTL (live `stream-json` `user` frame with
+ *   `priority: "next"`), and Antigravity ACP (live `session/prompt`): inject live
+ *   into the active turn without canceling (falling back to next turn if rejected,
+ *   unstarted before exit, or blocked on an approval prompt). */
 mcode_steer_result mcode_agent_steer(mcode_agent_run *run, mcode_thread *thread,
                                      const char *message);
 

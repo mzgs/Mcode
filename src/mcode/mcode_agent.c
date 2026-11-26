@@ -75,6 +75,13 @@ typedef struct agent_ev {
     struct agent_ev *next;
 } agent_ev;
 
+typedef struct claude_live_steer {
+    char uuid[40];
+    char *text;
+    bool started;
+    bool completed;
+} claude_live_steer;
+
 struct mcode_agent_run {
     app_agent_kind agent;
     agent_proto_kind proto;
@@ -93,6 +100,7 @@ struct mcode_agent_run {
     int next_rpc_id;
     bool rpc_prompt_sent;
     bool rpc_turn_done;
+    bool stop_requested;
     bool steer_interrupting;
     bool deferred_interrupt;
     double interrupt_requested_at;
@@ -105,6 +113,13 @@ struct mcode_agent_run {
     int64_t codex_ctx_window;
     bool codex_emitted_live_usage;
     int64_t claude_last_ctx_tokens;
+    bool claude_pass_had_text;
+    bool claude_seen_replay_support;
+    char claude_init_uuid[40];
+    double claude_waiting_steer_at;
+    claude_live_steer *claude_steers;
+    int claude_steer_count;
+    int claude_steer_cap;
 
     /* Codex & Antigravity ACP live-steer tracking (protected by mu) */
     char **pending_live_steers;
@@ -436,6 +451,109 @@ static char *stringify_json_val(yyjson_val *val) {
 }
 
 /* ---- Claude Code stream-json parser ---- */
+
+static uint64_t splitmix64_next(uint64_t *state) {
+    uint64_t z = (*state += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+/* Generate an RFC-4122 v4 UUID string (caller must hold run->mu). */
+static void claude_make_uuid_locked(mcode_agent_run *run, char out[40]) {
+    uint64_t seq = (uint64_t)(++run->next_rpc_id);
+    uint64_t mono_ns = (uint64_t)(mcode_now_mono() * 1e9);
+    uint64_t epoch_s = (uint64_t)mcode_now_epoch();
+    uint64_t seed = mono_ns ^ (epoch_s << 21) ^ ((uint64_t)(uintptr_t)run) ^ (seq * 0x9e3779b97f4a7c15ULL);
+    uint64_t a = splitmix64_next(&seed);
+    uint64_t b = splitmix64_next(&seed);
+    /* Set RFC-4122 version 4 and variant 10xx */
+    a = (a & 0xffffffffffff0fffULL) | 0x0000000000004000ULL;
+    b = (b & 0x3fffffffffffffffULL) | 0x8000000000000000ULL;
+    snprintf(out, 40, "%08x-%04x-%04x-%04x-%012llx",
+             (unsigned)((a >> 32) & 0xffffffffU),
+             (unsigned)((a >> 16) & 0xffffU),
+             (unsigned)(a & 0xffffU),
+             (unsigned)((b >> 48) & 0xffffU),
+             (unsigned long long)(b & 0x0000ffffffffffffULL));
+}
+
+static bool claude_ctl_send_user_msg(mcode_agent_run *run, const char *uuid,
+                                     const char *priority, const char *text) {
+    if (!run || !run->proc || !text || !text[0]) return false;
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return false;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "type", "user");
+    if (uuid && uuid[0]) {
+        yyjson_mut_obj_add_strcpy(doc, root, "uuid", uuid);
+    }
+    if (priority && priority[0]) {
+        yyjson_mut_obj_add_strcpy(doc, root, "priority", priority);
+    }
+    yyjson_mut_val *msg = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, msg, "role", "user");
+    yyjson_mut_obj_add_strcpy(doc, msg, "content", text);
+    yyjson_mut_obj_add_val(doc, root, "message", msg);
+    bool ok = send_json_doc(run->proc, doc);
+    yyjson_mut_doc_free(doc);
+    return ok;
+}
+
+static void claude_mark_steer_started(mcode_agent_run *run, const char *uuid) {
+    if (!run || !uuid || !uuid[0]) return;
+    pthread_mutex_lock(&run->mu);
+    run->claude_seen_replay_support = true;
+    for (int i = 0; i < run->claude_steer_count; ++i) {
+        if (strcmp(run->claude_steers[i].uuid, uuid) == 0) {
+            run->claude_steers[i].started = true;
+            run->claude_waiting_steer_at = 0.0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&run->mu);
+}
+
+static void claude_reject_steer_uuid(mcode_agent_run *run, const char *uuid) {
+    if (!run || !uuid || !uuid[0]) return;
+    char *rejected_text = NULL;
+    bool close_now = false;
+    pthread_mutex_lock(&run->mu);
+    for (int i = 0; i < run->claude_steer_count; ++i) {
+        if (strcmp(run->claude_steers[i].uuid, uuid) == 0 && !run->claude_steers[i].started) {
+            rejected_text = run->claude_steers[i].text;
+            for (int j = i + 1; j < run->claude_steer_count; ++j) {
+                run->claude_steers[j - 1] = run->claude_steers[j];
+            }
+            run->claude_steer_count--;
+            break;
+        }
+    }
+    if (run->claude_waiting_steer_at > 0.0) {
+        int unstarted = 0;
+        for (int i = 0; i < run->claude_steer_count; ++i) {
+            if (!run->claude_steers[i].started && !run->claude_steers[i].completed) {
+                ++unstarted;
+            }
+        }
+        if (unstarted == 0) {
+            run->claude_waiting_steer_at = 0.0;
+            run->rpc_turn_done = true;
+            close_now = true;
+        }
+    }
+    pthread_mutex_unlock(&run->mu);
+
+    if (rejected_text && rejected_text[0]) {
+        emit_simple(run, EV_STEER_REJECTED, rejected_text);
+    }
+    free(rejected_text);
+    if (close_now && run->proc) {
+        mcode_proc_close_stdin(run->proc);
+    }
+}
+
 static void parse_claude_json(mcode_agent_run *run, yyjson_val *root) {
     const char *type = jstr(root, "type");
     const char *sid = jstr(root, "session_id");
@@ -443,6 +561,36 @@ static void parse_claude_json(mcode_agent_run *run, yyjson_val *root) {
     if (!type) return;
 
     if (strcmp(type, "system") == 0) {
+        const char *subtype = jstr(root, "subtype");
+        if (subtype && strcmp(subtype, "status") == 0 && run->proto == AGENT_PROTO_CLAUDE_CTL) {
+            yyjson_val *uuids = yyjson_obj_get(root, "user_message_uuids");
+            if (yyjson_is_arr(uuids)) {
+                size_t idx, max;
+                yyjson_val *item;
+                yyjson_arr_foreach(uuids, idx, max, item) {
+                    if (yyjson_is_str(item)) {
+                        claude_mark_steer_started(run, yyjson_get_str(item));
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    if (strcmp(type, "command_lifecycle") == 0 && run->proto == AGENT_PROTO_CLAUDE_CTL) {
+        pthread_mutex_lock(&run->mu);
+        run->claude_seen_replay_support = true;
+        pthread_mutex_unlock(&run->mu);
+        const char *cmd_uuid = jstr(root, "command_uuid");
+        if (!cmd_uuid || !cmd_uuid[0]) cmd_uuid = jstr(root, "uuid");
+        const char *state = jstr(root, "state");
+        if (cmd_uuid && cmd_uuid[0] && state) {
+            if (strcmp(state, "started") == 0) {
+                claude_mark_steer_started(run, cmd_uuid);
+            } else if (strcmp(state, "discarded") == 0 || strcmp(state, "refused") == 0) {
+                claude_reject_steer_uuid(run, cmd_uuid);
+            }
+        }
         return;
     }
 
@@ -529,6 +677,7 @@ static void parse_claude_json(mcode_agent_run *run, yyjson_val *root) {
                 const char *txt = jstr(delta, "text");
                 if (txt && txt[0]) {
                     run->streamed_text_deltas = true;
+                    run->claude_pass_had_text = true;
                     emit_simple(run, EV_TEXT_DELTA, txt);
                     emit_simple(run, EV_STATUS, "Responding...");
                 }
@@ -577,7 +726,8 @@ static void parse_claude_json(mcode_agent_run *run, yyjson_val *root) {
             if (strcmp(it, "text") == 0) {
                 const char *txt = jstr(item, "text");
                 if (txt && txt[0] && !run->streamed_text_deltas) {
-                    emit_simple(run, EV_TEXT_FALLBACK, txt);
+                    run->claude_pass_had_text = true;
+                    emit_simple(run, EV_TEXT_DELTA, txt);
                 }
             } else if (strcmp(it, "thinking") == 0) {
                 const char *th = jstr(item, "thinking");
@@ -607,6 +757,19 @@ static void parse_claude_json(mcode_agent_run *run, yyjson_val *root) {
     }
 
     if (strcmp(type, "user") == 0) {
+        yyjson_val *is_rep_v = yyjson_obj_get(root, "isReplay");
+        if (yyjson_is_bool(is_rep_v) && yyjson_get_bool(is_rep_v)) {
+            if (run->proto == AGENT_PROTO_CLAUDE_CTL) {
+                const char *uuid = jstr(root, "uuid");
+                pthread_mutex_lock(&run->mu);
+                run->claude_seen_replay_support = true;
+                pthread_mutex_unlock(&run->mu);
+                if (uuid && uuid[0]) {
+                    claude_mark_steer_started(run, uuid);
+                }
+            }
+            return;
+        }
         yyjson_val *msg = yyjson_obj_get(root, "message");
         yyjson_val *content = yyjson_is_obj(msg) ? yyjson_obj_get(msg, "content") : NULL;
         if (!yyjson_is_arr(content)) return;
@@ -677,17 +840,39 @@ static void parse_claude_json(mcode_agent_run *run, yyjson_val *root) {
     }
 
     if (strcmp(type, "result") == 0) {
+        bool steer_int = false;
+        bool wait_for_followup = false;
         pthread_mutex_lock(&run->mu);
-        bool steer_int = run->steer_interrupting;
+        steer_int = run->steer_interrupting;
+        if (run->proto == AGENT_PROTO_CLAUDE_CTL) {
+            int unstarted = 0;
+            for (int i = 0; i < run->claude_steer_count; ++i) {
+                if (run->claude_steers[i].started) {
+                    run->claude_steers[i].completed = true;
+                } else if (!run->claude_steers[i].completed) {
+                    ++unstarted;
+                }
+            }
+            if (!steer_int && run->claude_seen_replay_support && unstarted > 0) {
+                wait_for_followup = true;
+                run->claude_waiting_steer_at = mcode_now_mono();
+            } else {
+                run->rpc_turn_done = true;
+                run->claude_waiting_steer_at = 0.0;
+            }
+        }
         pthread_mutex_unlock(&run->mu);
         yyjson_val *is_err_v = yyjson_obj_get(root, "is_error");
         bool is_err = yyjson_is_bool(is_err_v) && yyjson_get_bool(is_err_v);
         const char *res_text = jstr(root, "result");
         if (is_err && res_text && res_text[0] && !steer_int) {
             emit_simple(run, EV_ERROR, res_text);
-        } else if (!is_err && res_text && res_text[0]) {
-            emit_simple(run, EV_TEXT_FALLBACK, res_text);
+        } else if (!is_err && res_text && res_text[0] && !run->claude_pass_had_text) {
+            emit_simple(run, EV_TEXT_DELTA, res_text);
         }
+        run->claude_pass_had_text = false;
+        run->streamed_text_deltas = false;
+        run->streamed_thinking_deltas = false;
         yyjson_val *usage = yyjson_obj_get(root, "usage");
         yyjson_val *cost = yyjson_obj_get(root, "total_cost_usd");
         yyjson_val *model_usage = yyjson_obj_get(root, "modelUsage");
@@ -714,10 +899,11 @@ static void parse_claude_json(mcode_agent_run *run, yyjson_val *root) {
             emit_usage_ev(run, in_tok, out_tok, cached_tok, ctx_tok, ctx_win, usd, false);
         }
         if (run->proto == AGENT_PROTO_CLAUDE_CTL) {
-            pthread_mutex_lock(&run->mu);
-            run->rpc_turn_done = true;
-            pthread_mutex_unlock(&run->mu);
-            mcode_proc_close_stdin(run->proc);
+            if (wait_for_followup) {
+                emit_simple(run, EV_STATUS, "Applying steer...");
+            } else {
+                mcode_proc_close_stdin(run->proc);
+            }
         }
     }
 }
@@ -1946,8 +2132,13 @@ static void flush_unsent_live_steers(mcode_agent_run *run) {
     int queued_n = 0;
     char *unacked[16];
     int unacked_n = 0;
+    claude_live_steer *cl_steers = NULL;
+    int cl_n = 0;
+    bool cl_can_reject = false;
+    bool user_stopped = false;
 
     pthread_mutex_lock(&run->mu);
+    user_stopped = run->stop_requested;
     if (run->pending_live_steer_count > 0) {
         queued = run->pending_live_steers;
         queued_n = run->pending_live_steer_count;
@@ -1960,21 +2151,38 @@ static void flush_unsent_live_steers(mcode_agent_run *run) {
         run->inflight_steer_texts[i] = NULL;
     }
     run->inflight_steer_count = 0;
+    if (run->claude_steer_count > 0) {
+        cl_steers = run->claude_steers;
+        cl_n = run->claude_steer_count;
+        cl_can_reject = (run->claude_seen_replay_support || !run->rpc_turn_done);
+        run->claude_steers = NULL;
+        run->claude_steer_count = 0;
+        run->claude_steer_cap = 0;
+    }
     pthread_mutex_unlock(&run->mu);
 
     for (int i = 0; i < unacked_n; ++i) {
-        if (unacked[i] && unacked[i][0]) {
+        if (!user_stopped && unacked[i] && unacked[i][0]) {
             emit_simple(run, EV_STEER_REJECTED, unacked[i]);
         }
         free(unacked[i]);
     }
     for (int i = 0; i < queued_n; ++i) {
-        if (queued[i] && queued[i][0]) {
+        if (!user_stopped && queued[i] && queued[i][0]) {
             emit_simple(run, EV_STEER_REJECTED, queued[i]);
         }
         free(queued[i]);
     }
     free(queued);
+    for (int i = 0; i < cl_n; ++i) {
+        if (!user_stopped && cl_can_reject &&
+            !cl_steers[i].started && !cl_steers[i].completed &&
+            cl_steers[i].text && cl_steers[i].text[0]) {
+            emit_simple(run, EV_STEER_REJECTED, cl_steers[i].text);
+        }
+        free(cl_steers[i].text);
+    }
+    free(cl_steers);
 }
 
 static void codex_rpc_finish_turn(mcode_agent_run *run) {
@@ -4909,6 +5117,7 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
         argv[n++] = "stream-json";
         argv[n++] = "--verbose";
         argv[n++] = "--include-partial-messages";
+        argv[n++] = "--replay-user-messages";
         if (thread->session_id[0]) {
             argv[n++] = "--resume";
             argv[n++] = thread->session_id;
@@ -5007,18 +5216,11 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
     }
 
     if (proto == AGENT_PROTO_CLAUDE_CTL) {
-        yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
-        if (doc) {
-            yyjson_mut_val *root = yyjson_mut_obj(doc);
-            yyjson_mut_doc_set_root(doc, root);
-            yyjson_mut_obj_add_str(doc, root, "type", "user");
-            yyjson_mut_val *msg = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, msg, "role", "user");
-            yyjson_mut_obj_add_strcpy(doc, msg, "content", prompt);
-            yyjson_mut_obj_add_val(doc, root, "message", msg);
-            send_json_doc(run->proc, doc);
-            yyjson_mut_doc_free(doc);
-        }
+        pthread_mutex_lock(&run->mu);
+        claude_make_uuid_locked(run, run->claude_init_uuid);
+        run->rpc_prompt_sent = true;
+        pthread_mutex_unlock(&run->mu);
+        claude_ctl_send_user_msg(run, run->claude_init_uuid, NULL, prompt);
     } else if (proto == AGENT_PROTO_CODEX_RPC) {
         codex_rpc_send_initialize(run);
     } else if (proto == AGENT_PROTO_AGY_ACP) {
@@ -5061,6 +5263,7 @@ bool mcode_agent_poll(mcode_agent_run *run, mcode_thread *thread,
     if (!run || !thread || thread->turn_count == 0) return false;
 
     bool escalate_stop = false;
+    bool close_claude_stdin = false;
     pthread_mutex_lock(&run->mu);
     agent_ev *list = run->head;
     run->head = NULL;
@@ -5071,10 +5274,18 @@ bool mcode_agent_poll(mcode_agent_run *run, mcode_thread *thread,
         run->interrupt_requested_at = -1.0;
         escalate_stop = true;
     }
+    if (!finished && run->proto == AGENT_PROTO_CLAUDE_CTL &&
+        run->claude_waiting_steer_at > 0.0 &&
+        (mcode_now_mono() - run->claude_waiting_steer_at) > 3.0) {
+        run->claude_waiting_steer_at = -1.0;
+        close_claude_stdin = true;
+    }
     pthread_mutex_unlock(&run->mu);
 
     if (escalate_stop && run->proc) {
         mcode_proc_stop(run->proc);
+    } else if (close_claude_stdin && run->proc) {
+        mcode_proc_close_stdin(run->proc);
     }
 
     bool changed = false;
@@ -5095,6 +5306,9 @@ bool mcode_agent_poll(mcode_agent_run *run, mcode_thread *thread,
 
 void mcode_agent_stop(mcode_agent_run *run) {
     if (!run || !run->proc) return;
+    pthread_mutex_lock(&run->mu);
+    run->stop_requested = true;
+    pthread_mutex_unlock(&run->mu);
     if (run->proto == AGENT_PROTO_CODEX_RPC) {
         codex_rpc_send_turn_interrupt(run);
     } else if (run->proto == AGENT_PROTO_CLAUDE_CTL) {
@@ -5107,7 +5321,9 @@ void mcode_agent_stop(mcode_agent_run *run) {
 
 bool mcode_agent_supports_live_steer(const mcode_agent_run *run) {
     return run != NULL &&
-           (run->proto == AGENT_PROTO_CODEX_RPC || run->proto == AGENT_PROTO_AGY_ACP);
+           (run->proto == AGENT_PROTO_CODEX_RPC ||
+            run->proto == AGENT_PROTO_AGY_ACP ||
+            run->proto == AGENT_PROTO_CLAUDE_CTL);
 }
 
 mcode_steer_result mcode_agent_steer(mcode_agent_run *run, mcode_thread *thread,
@@ -5188,15 +5404,55 @@ mcode_steer_result mcode_agent_steer(mcode_agent_run *run, mcode_thread *thread,
     }
 
     if (run->proto == AGENT_PROTO_CLAUDE_CTL) {
+        char steer_uuid[40] = "";
+        bool oom = false;
+
         pthread_mutex_lock(&run->mu);
         if (run->rpc_turn_done || run->finished) {
             pthread_mutex_unlock(&run->mu);
             return MCODE_STEER_INTERRUPTING;
         }
-        run->steer_interrupting = true;
-        run->interrupt_requested_at = mcode_now_mono();
+        if (run->claude_steer_count >= run->claude_steer_cap) {
+            int nc = run->claude_steer_cap ? run->claude_steer_cap * 2 : 4;
+            claude_live_steer *grown = realloc(run->claude_steers, (size_t)nc * sizeof *grown);
+            if (grown) {
+                run->claude_steers = grown;
+                run->claude_steer_cap = nc;
+            } else {
+                oom = true;
+            }
+        }
+        if (!oom) {
+            char *dup = strdup(message);
+            if (dup) {
+                claude_make_uuid_locked(run, steer_uuid);
+                claude_live_steer *s = &run->claude_steers[run->claude_steer_count++];
+                snprintf(s->uuid, sizeof s->uuid, "%s", steer_uuid);
+                s->text = dup;
+                s->started = false;
+                s->completed = false;
+            } else {
+                oom = true;
+            }
+        }
         pthread_mutex_unlock(&run->mu);
-        claude_ctl_send_interrupt(run);
+
+        if (oom) return MCODE_STEER_FAILED;
+        if (claude_ctl_send_user_msg(run, steer_uuid, "next", message)) {
+            return MCODE_STEER_INJECTED;
+        }
+        pthread_mutex_lock(&run->mu);
+        for (int i = 0; i < run->claude_steer_count; ++i) {
+            if (strcmp(run->claude_steers[i].uuid, steer_uuid) == 0) {
+                free(run->claude_steers[i].text);
+                for (int j = i + 1; j < run->claude_steer_count; ++j) {
+                    run->claude_steers[j - 1] = run->claude_steers[j];
+                }
+                run->claude_steer_count--;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&run->mu);
         return MCODE_STEER_INTERRUPTING;
     }
 
@@ -5409,6 +5665,13 @@ void mcode_agent_destroy(mcode_agent_run *run) {
         run->inflight_steer_texts[i] = NULL;
     }
     run->inflight_steer_count = 0;
+    for (int i = 0; i < run->claude_steer_count; ++i) {
+        free(run->claude_steers[i].text);
+    }
+    free(run->claude_steers);
+    run->claude_steers = NULL;
+    run->claude_steer_count = 0;
+    run->claude_steer_cap = 0;
     pthread_mutex_unlock(&run->mu);
     while (cur) {
         agent_ev *next = cur->next;
