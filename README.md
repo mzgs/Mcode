@@ -1,4 +1,4 @@
-# C-GUI-Template
+# Mcode
 
 A cross-platform, resizable C99 desktop app template using [Better-C-UI](https://github.com/mzgs/Better-C-UI).
 Add your state, registered actions, and UI calls inside `main.c` (`app_state`, `app_chrome_register_actions()`, and `frame()`). Template scaffolding lives under `src/`.
@@ -68,8 +68,8 @@ Run on macOS:
 open "build/C GUI Template.app"
 ```
 
-Run on Linux: `./build/empty_gui`. With Visual Studio on Windows:
-`build\Release\empty_gui.exe` (MinGW: `build\empty_gui.exe`).
+Run on Linux: `./build/mcode`. With Visual Studio on Windows:
+`build\Release\mcode.exe` (MinGW: `build\mcode.exe`).
 
 Verify window creation, rendering, and clean exit:
 
@@ -94,7 +94,7 @@ This auto-increments `VERSION` in `CMakeLists.txt` (`0.1.0` → `0.1.1`), commit
 Install or update directly from GitHub Releases (avoids browser `com.apple.quarantine` Gatekeeper warnings for non-notarized macOS builds):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/mzgs/C-GUI-Template/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/mzgs/Mcode/main/install.sh | sh
 ```
 
 Pass a specific tag with `sh -s -- v0.1.3`, or override `REPO`, `VERSION`, and `INSTALL_DIR` via environment variables. On macOS this installs into `/Applications` (or `~/Applications` if `/Applications` is not writable); on Linux it installs the binary into `~/.local/bin` along with its `.desktop` entry and icon into `~/.local/share`. Update `REPO` at the top of `install.sh` when forking this template.

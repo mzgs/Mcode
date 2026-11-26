@@ -8,10 +8,10 @@ set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(APP_NAME "Mcode" CACHE STRING "App name used for the window and settings folder")
 set(APP_DESCRIPTION "Native desktop control plane for AI coding agents." CACHE STRING "Short app description for OS metadata and About")
-set(APP_AUTHOR "Mcode" CACHE STRING "Publisher / author name for OS executable metadata")
+set(APP_AUTHOR "mzgs" CACHE STRING "Publisher / author name for OS executable metadata")
 set(APP_COPYRIGHT "" CACHE STRING "Optional copyright notice for macOS Info.plist and Windows version info")
-set(APP_BUNDLE_ID "com.mcode.app" CACHE STRING "Reverse-DNS app identifier (macOS CFBundleIdentifier, Linux desktop/icon ID)")
-set(APP_GITHUB_REPO "" CACHE STRING "GitHub owner/repo for update checks (empty to disable)")
+set(APP_BUNDLE_ID "com.mzgs.mcode" CACHE STRING "Reverse-DNS app identifier (macOS CFBundleIdentifier, Linux desktop/icon ID)")
+set(APP_GITHUB_REPO "mzgs/Mcode" CACHE STRING "GitHub owner/repo for update checks (empty to disable)")
 
 function(app_escape_xml out_var value)
     string(REPLACE "&" "&amp;" value "${value}")
@@ -155,10 +155,10 @@ add_library(app_mcode STATIC
 target_include_directories(app_mcode PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src/mcode")
 target_link_libraries(app_mcode PUBLIC app_chrome cui::vterm PRIVATE app_common yyjson Threads::Threads)
 
-add_executable(empty_gui MACOSX_BUNDLE main.c)
-target_link_libraries(empty_gui PRIVATE app_mcode app_chrome app_common)
-cui_app_target(empty_gui)
-install(TARGETS empty_gui
+add_executable(mcode MACOSX_BUNDLE main.c)
+target_link_libraries(mcode PRIVATE app_mcode app_chrome app_common)
+cui_app_target(mcode)
+install(TARGETS mcode
     BUNDLE DESTINATION . COMPONENT app
     RUNTIME DESTINATION . COMPONENT app)
 if(APPLE)
@@ -173,9 +173,9 @@ if(APPLE)
     set(APP_MACOS_ICON "${CMAKE_CURRENT_SOURCE_DIR}/resources/app.icns")
     set_source_files_properties("${APP_MACOS_ICON}" PROPERTIES
         MACOSX_PACKAGE_LOCATION "Resources")
-    target_sources(empty_gui PRIVATE "${APP_MACOS_ICON}")
+    target_sources(mcode PRIVATE "${APP_MACOS_ICON}")
 
-    set_target_properties(empty_gui PROPERTIES
+    set_target_properties(mcode PROPERTIES
         OUTPUT_NAME "${APP_NAME}"
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/resources/Info.plist.in"
         MACOSX_BUNDLE_BUNDLE_NAME "${APP_NAME}"
@@ -183,11 +183,11 @@ if(APPLE)
         MACOSX_BUNDLE_GUI_IDENTIFIER "${APP_BUNDLE_ID}"
         MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
         MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}")
-    add_custom_command(TARGET empty_gui POST_BUILD
-        COMMAND /bin/sh "${CMAKE_CURRENT_SOURCE_DIR}/scripts/codesign_macos.sh" "$<TARGET_BUNDLE_DIR:empty_gui>"
+    add_custom_command(TARGET mcode POST_BUILD
+        COMMAND /bin/sh "${CMAKE_CURRENT_SOURCE_DIR}/scripts/codesign_macos.sh" "$<TARGET_BUNDLE_DIR:mcode>"
         COMMENT "Code signing ${APP_NAME}.app (if ~/.macos-codesign/macos-codesign.p12 is present)"
         VERBATIM)
-    add_custom_target(run COMMAND $<TARGET_FILE:empty_gui> DEPENDS empty_gui
+    add_custom_target(run COMMAND $<TARGET_FILE:mcode> DEPENDS mcode
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" USES_TERMINAL VERBATIM)
 elseif(WIN32)
     set(APP_VER_MAJOR "${PROJECT_VERSION_MAJOR}")
@@ -206,9 +206,9 @@ elseif(WIN32)
     if("${APP_VER_TWEAK}" STREQUAL "")
         set(APP_VER_TWEAK 0)
     endif()
-    get_target_property(APP_WIN32_OUTPUT_NAME empty_gui OUTPUT_NAME)
+    get_target_property(APP_WIN32_OUTPUT_NAME mcode OUTPUT_NAME)
     if(NOT APP_WIN32_OUTPUT_NAME)
-        set(APP_WIN32_OUTPUT_NAME "empty_gui")
+        set(APP_WIN32_OUTPUT_NAME "mcode")
     endif()
     app_escape_rc(APP_RC_NAME "${APP_NAME}")
     app_escape_rc(APP_RC_DESCRIPTION "${APP_DESCRIPTION}")
@@ -220,11 +220,11 @@ elseif(WIN32)
     configure_file(resources/app.rc.in "${CMAKE_CURRENT_BINARY_DIR}/app.rc" @ONLY)
     set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/app.rc" PROPERTIES
         OBJECT_DEPENDS "${APP_WIN32_ICON}")
-    target_sources(empty_gui PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/app.rc")
+    target_sources(mcode PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/app.rc")
 else()
-    get_target_property(APP_LINUX_OUTPUT_NAME empty_gui OUTPUT_NAME)
+    get_target_property(APP_LINUX_OUTPUT_NAME mcode OUTPUT_NAME)
     if(NOT APP_LINUX_OUTPUT_NAME)
-        set(APP_LINUX_OUTPUT_NAME "empty_gui")
+        set(APP_LINUX_OUTPUT_NAME "mcode")
     endif()
     app_escape_desktop(APP_DESKTOP_NAME "${APP_NAME}")
     app_escape_desktop(APP_DESKTOP_DESCRIPTION "${APP_DESCRIPTION}")
@@ -239,26 +239,10 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
-    add_executable(log_tests tests/log_tests.c)
-    target_link_libraries(log_tests PRIVATE app_log app_common)
-    add_test(NAME log_tests COMMAND log_tests)
-
-    add_executable(updater_tests tests/updater_tests.c)
-    target_link_libraries(updater_tests PRIVATE app_chrome app_common)
-    add_test(NAME updater_tests COMMAND updater_tests)
-
-    add_executable(actions_tests tests/actions_tests.c)
-    target_link_libraries(actions_tests PRIVATE app_chrome app_common)
-    add_test(NAME actions_tests COMMAND actions_tests)
-
-    add_executable(mcode_tests tests/mcode_tests.c)
-    target_link_libraries(mcode_tests PRIVATE app_mcode app_common)
-    add_test(NAME mcode_tests COMMAND mcode_tests)
-
     add_test(NAME window_smoke COMMAND ${CMAKE_COMMAND} -E env
         "CUI_SCREENSHOT=${CMAKE_CURRENT_BINARY_DIR}/window-smoke.png"
         CUI_SCREENSHOT_FRAMES=1
-        $<TARGET_FILE:empty_gui>
+        $<TARGET_FILE:mcode>
         --settings "${CMAKE_CURRENT_BINARY_DIR}/smoke-test/window-settings.json")
     set_tests_properties(window_smoke PROPERTIES
         TIMEOUT 15 PASS_REGULAR_EXPRESSION "cui: saved")

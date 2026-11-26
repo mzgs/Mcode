@@ -3,15 +3,15 @@ set -eu
 
 # Install or update the latest GitHub Release on macOS (or Linux).
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/mzgs/C-GUI-Template/main/install.sh | sh
-#   curl -fsSL https://raw.githubusercontent.com/mzgs/C-GUI-Template/main/install.sh | sh -s -- v0.1.3
+#   curl -fsSL https://raw.githubusercontent.com/mzgs/Mcode/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/mzgs/Mcode/main/install.sh | sh -s -- v0.1.3
 #
 # Environment overrides:
-#   REPO         GitHub "owner/repo" (default: mzgs/C-GUI-Template)
+#   REPO         GitHub "owner/repo" (default: mzgs/Mcode)
 #   VERSION      Release tag to install (default: latest)
 #   INSTALL_DIR  Destination directory (default: /Applications on macOS, ~/.local/bin on Linux)
 
-REPO="${REPO:-mzgs/C-GUI-Template}"
+REPO="${REPO:-mzgs/Mcode}"
 VERSION="${VERSION:-${1:-}}"
 
 case "$REPO" in

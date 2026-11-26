@@ -42,7 +42,7 @@ or dependencies.
   end calls must run. Use explicit begin/end APIs when early exits are needed.
 - Keep the frame callback responsive. The app sleeps when idle; leave
   continuous rendering off unless the feature needs it.
-- Retain `cui::cui` linking and `cui_app_target(empty_gui)` in CMake so platform
+- Retain `cui::cui` linking and `cui_app_target(mcode)` in CMake so platform
   libraries and GUI executable flags remain correct.
 
 ## Build and verify

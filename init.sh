@@ -726,7 +726,11 @@ awk '
     function replace_target_line(line, old_t, new_t) {
         if (old_t == "" || old_t == new_t) return line
         line = replace_literal(line, "$<TARGET_FILE:" old_t ">", "$<TARGET_FILE:" new_t ">")
-        line = replace_after_prefix(line, "^[[:space:]]*(add_executable|target_link_libraries|cui_app_target|target_sources|set_target_properties)\\([[:space:]]*", old_t, new_t)
+        line = replace_literal(line, "$<TARGET_FILE_DIR:" old_t ">", "$<TARGET_FILE_DIR:" new_t ">")
+        line = replace_literal(line, "$<TARGET_BUNDLE_DIR:" old_t ">", "$<TARGET_BUNDLE_DIR:" new_t ">")
+        line = replace_literal(line, "$<TARGET_BUNDLE_CONTENT_DIR:" old_t ">", "$<TARGET_BUNDLE_CONTENT_DIR:" new_t ">")
+        line = replace_after_prefix(line, "^[[:space:]]*(add_executable|target_link_libraries|cui_app_target|target_sources|set_target_properties|add_dependencies)\\([[:space:]]*", old_t, new_t)
+        line = replace_after_prefix(line, "^[[:space:]]*add_custom_command\\([[:space:]]*TARGET[[:space:]]+", old_t, new_t)
         line = replace_after_prefix(line, "^[[:space:]]*install\\([[:space:]]*TARGETS[[:space:]]+", old_t, new_t)
         line = replace_after_prefix(line, "^[[:space:]]*get_target_property\\([[:space:]]*APP_(WIN32|LINUX)_OUTPUT_NAME[[:space:]]+", old_t, new_t)
         line = replace_after_prefix(line, "^[[:space:]]*set\\([[:space:]]*APP_(WIN32|LINUX)_OUTPUT_NAME[[:space:]]+\"", old_t, new_t)
@@ -833,6 +837,7 @@ if [ -f README.md ]; then
         {
             line = $0
             line = replace_all(line, "build/" ENVIRON["OLD_NAME"] ".app", "build/" ENVIRON["NEW_NAME"] ".app")
+            line = replace_all(line, "build/C GUI Template.app", "build/" ENVIRON["NEW_NAME"] ".app")
             line = replace_all(line, "./build/" ENVIRON["OLD_TARGET"], "./build/" ENVIRON["NEW_TARGET"])
             line = replace_all(line, "build\\Release\\" ENVIRON["OLD_TARGET"] ".exe", "build\\Release\\" ENVIRON["NEW_TARGET"] ".exe")
             line = replace_all(line, "build\\" ENVIRON["OLD_TARGET"] ".exe", "build\\" ENVIRON["NEW_TARGET"] ".exe")
