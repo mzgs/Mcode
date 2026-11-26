@@ -441,8 +441,11 @@ bool mcode_store_load(mcode_store *store, const char *path) {
                     turn->created_at = (int64_t)jnum_or(trv, "created_at", 0);
                     turn->duration_sec = (float)jnum_or(trv, "duration_sec", 0.0);
                     turn->failed = jbool_or(trv, "failed", false);
-                    turn->input_tokens = jint_or(trv, "input_tokens", 0);
-                    turn->output_tokens = jint_or(trv, "output_tokens", 0);
+                    turn->input_tokens = (int64_t)jnum_or(trv, "input_tokens", 0.0);
+                    turn->output_tokens = (int64_t)jnum_or(trv, "output_tokens", 0.0);
+                    turn->cached_tokens = (int64_t)jnum_or(trv, "cached_tokens", 0.0);
+                    turn->context_tokens = (int64_t)jnum_or(trv, "context_tokens", 0.0);
+                    turn->context_window = (int64_t)jnum_or(trv, "context_window", 0.0);
                     turn->cost_usd = jnum_or(trv, "cost_usd", 0.0);
 
                     yyjson_val *blocks = yyjson_obj_get(trv, "blocks");
@@ -590,8 +593,17 @@ bool mcode_store_save(const mcode_store *store, const char *path) {
             yyjson_mut_obj_add_sint(doc, tro, "created_at", tr->created_at);
             yyjson_mut_obj_add_real(doc, tro, "duration_sec", tr->duration_sec);
             yyjson_mut_obj_add_bool(doc, tro, "failed", tr->failed);
-            yyjson_mut_obj_add_int(doc, tro, "input_tokens", tr->input_tokens);
-            yyjson_mut_obj_add_int(doc, tro, "output_tokens", tr->output_tokens);
+            yyjson_mut_obj_add_sint(doc, tro, "input_tokens", tr->input_tokens);
+            yyjson_mut_obj_add_sint(doc, tro, "output_tokens", tr->output_tokens);
+            if (tr->cached_tokens > 0) {
+                yyjson_mut_obj_add_sint(doc, tro, "cached_tokens", tr->cached_tokens);
+            }
+            if (tr->context_tokens > 0) {
+                yyjson_mut_obj_add_sint(doc, tro, "context_tokens", tr->context_tokens);
+            }
+            if (tr->context_window > 0) {
+                yyjson_mut_obj_add_sint(doc, tro, "context_window", tr->context_window);
+            }
             yyjson_mut_obj_add_real(doc, tro, "cost_usd", tr->cost_usd);
 
             yyjson_mut_val *blocks = yyjson_mut_arr(doc);

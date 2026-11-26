@@ -12,6 +12,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#ifndef _WIN32
+#include <dirent.h>
+#include <sys/stat.h>
+#endif
 
 typedef enum {
     EV_SESSION = 0,
@@ -26,6 +32,7 @@ typedef enum {
     EV_APPROVAL_CLEAR,
     EV_STATUS,
     EV_USAGE,
+    EV_RATE_LIMIT,
     EV_ERROR,
     EV_DONE,
 } agent_ev_kind;
@@ -54,10 +61,15 @@ typedef struct agent_ev {
     char *tool_detail;
     char *extra_a; /* approval reason */
     char *extra_b; /* approval raw details */
-    bool flag; /* failed / killed / can_allow_session */
-    int int_a; /* exit_code or input_tokens */
-    int int_b; /* output_tokens */
+    bool flag; /* failed / killed / can_allow_session / replace_usage */
+    int int_a; /* exit_code */
+    int64_t tok_in;
+    int64_t tok_out;
+    int64_t tok_cached;
+    int64_t tok_ctx;
+    int64_t tok_ctx_win;
     double dbl_a; /* cost_usd */
+    mcode_provider_quota *quota; /* non-NULL only for EV_RATE_LIMIT */
     struct agent_ev *next;
 } agent_ev;
 
@@ -79,8 +91,13 @@ struct mcode_agent_run {
     bool rpc_turn_done;
     bool has_emitted_text;
     bool need_text_sep;
-    int codex_turn_in_tokens;
-    int codex_turn_out_tokens;
+    int64_t codex_turn_in_tokens;
+    int64_t codex_turn_out_tokens;
+    int64_t codex_turn_cached_tokens;
+    int64_t codex_last_ctx_tokens;
+    int64_t codex_ctx_window;
+    bool codex_emitted_live_usage;
+    int64_t claude_last_ctx_tokens;
 
     /* Pending approval RPC metadata (protected by mu) */
     bool approval_pending;
@@ -117,6 +134,7 @@ static void ev_free(agent_ev *ev) {
     free(ev->tool_detail);
     free(ev->extra_a);
     free(ev->extra_b);
+    free(ev->quota);
     free(ev);
 }
 
@@ -233,6 +251,100 @@ static const char *jstr(yyjson_val *obj, const char *key) {
     if (!yyjson_is_obj(obj)) return NULL;
     yyjson_val *v = yyjson_obj_get(obj, key);
     return yyjson_is_str(v) ? yyjson_get_str(v) : NULL;
+}
+
+static int64_t ji64(yyjson_val *obj, const char *key) {
+    if (!yyjson_is_obj(obj)) return 0;
+    yyjson_val *v = yyjson_obj_get(obj, key);
+    if (yyjson_is_sint(v)) return yyjson_get_sint(v);
+    if (yyjson_is_uint(v)) return (int64_t)yyjson_get_uint(v);
+    if (yyjson_is_num(v)) return (int64_t)yyjson_get_num(v);
+    return 0;
+}
+
+static int clamp_percent(int pct) {
+    if (pct < 0) return 0;
+    if (pct > 100) return 100;
+    return pct;
+}
+
+static void parse_codex_rate_window(yyjson_val *w, mcode_rate_window *out) {
+    if (!yyjson_is_obj(w) || !out) return;
+    yyjson_val *pct_v = yyjson_obj_get(w, "usedPercent");
+    if (!yyjson_is_num(pct_v)) return;
+    out->available = true;
+    out->used_percent = clamp_percent((int)(yyjson_get_num(pct_v) + 0.5));
+    int64_t mins = ji64(w, "windowDurationMins");
+    if (mins > 0) out->window_mins = mins;
+    int64_t resets = ji64(w, "resetsAt");
+    if (resets > 0) out->resets_at = resets;
+}
+
+static bool parse_codex_rate_snapshot(yyjson_val *rl, mcode_provider_quota *out) {
+    if (!yyjson_is_obj(rl) || !out) return false;
+    bool got = false;
+    const char *plan = jstr(rl, "planType");
+    if (plan && plan[0]) {
+        snprintf(out->plan, sizeof out->plan, "%s", plan);
+    }
+    yyjson_val *prim = yyjson_obj_get(rl, "primary");
+    if (yyjson_is_obj(prim)) {
+        parse_codex_rate_window(prim, &out->primary);
+        if (out->primary.available) got = true;
+    }
+    yyjson_val *sec = yyjson_obj_get(rl, "secondary");
+    if (yyjson_is_obj(sec)) {
+        parse_codex_rate_window(sec, &out->secondary);
+        if (out->secondary.available) got = true;
+    }
+    yyjson_val *cred = yyjson_obj_get(rl, "credits");
+    if (yyjson_is_obj(cred)) {
+        yyjson_val *hc = yyjson_obj_get(cred, "hasCredits");
+        yyjson_val *un = yyjson_obj_get(cred, "unlimited");
+        if (yyjson_is_bool(hc)) out->has_credits = yyjson_get_bool(hc);
+        if (yyjson_is_bool(un)) out->unlimited_credits = yyjson_get_bool(un);
+        const char *bal = jstr(cred, "balance");
+        if (bal && bal[0]) {
+            snprintf(out->credits_balance, sizeof out->credits_balance, "%s", bal);
+        }
+    }
+    if (got) {
+        out->available = true;
+        out->updated_mono = mcode_now_mono();
+        out->updated_epoch = mcode_now_epoch();
+        out->error[0] = '\0';
+    }
+    return got;
+}
+
+static void emit_usage_ev(mcode_agent_run *run, int64_t in_tok, int64_t out_tok,
+                          int64_t cached_tok, int64_t ctx_tok, int64_t ctx_win,
+                          double cost_usd, bool replace) {
+    agent_ev *uev = calloc(1, sizeof *uev);
+    if (!uev) return;
+    uev->kind = EV_USAGE;
+    uev->tok_in = in_tok;
+    uev->tok_out = out_tok;
+    uev->tok_cached = cached_tok;
+    uev->tok_ctx = ctx_tok;
+    uev->tok_ctx_win = ctx_win;
+    uev->dbl_a = cost_usd;
+    uev->flag = replace;
+    push_ev(run, uev);
+}
+
+static void emit_rate_limit_ev(mcode_agent_run *run, const mcode_provider_quota *quota) {
+    if (!run || !quota || !quota->available) return;
+    agent_ev *ev = calloc(1, sizeof *ev);
+    if (!ev) return;
+    ev->kind = EV_RATE_LIMIT;
+    ev->quota = malloc(sizeof *ev->quota);
+    if (!ev->quota) {
+        free(ev);
+        return;
+    }
+    *ev->quota = *quota;
+    push_ev(run, ev);
 }
 
 static void summarize_command_detail(const char *cmd, char *detail, size_t cap) {
@@ -416,6 +528,13 @@ static void parse_claude_json(mcode_agent_run *run, yyjson_val *root) {
 
     if (strcmp(type, "assistant") == 0) {
         yyjson_val *msg = yyjson_obj_get(root, "message");
+        yyjson_val *msg_usage = yyjson_is_obj(msg) ? yyjson_obj_get(msg, "usage") : NULL;
+        if (yyjson_is_obj(msg_usage)) {
+            int64_t ctx = ji64(msg_usage, "input_tokens")
+                        + ji64(msg_usage, "cache_read_input_tokens")
+                        + ji64(msg_usage, "cache_creation_input_tokens");
+            if (ctx > 0) run->claude_last_ctx_tokens = ctx;
+        }
         yyjson_val *content = yyjson_is_obj(msg) ? yyjson_obj_get(msg, "content") : NULL;
         if (!yyjson_is_arr(content)) return;
 
@@ -494,6 +613,38 @@ static void parse_claude_json(mcode_agent_run *run, yyjson_val *root) {
         return;
     }
 
+    if (strcmp(type, "rate_limit_event") == 0) {
+        yyjson_val *info = yyjson_obj_get(root, "rate_limit_info");
+        if (yyjson_is_obj(info)) {
+            const char *rl_type = jstr(info, "rateLimitType");
+            yyjson_val *util_v = yyjson_obj_get(info, "utilization");
+            int64_t resets_at = ji64(info, "resetsAt");
+            if (yyjson_is_num(util_v)) {
+                double u = yyjson_get_num(util_v);
+                int pct = clamp_percent((int)((u <= 1.0 ? u * 100.0 : u) + 0.5));
+                mcode_provider_quota q;
+                memset(&q, 0, sizeof q);
+                q.available = true;
+                q.updated_mono = mcode_now_mono();
+                q.updated_epoch = mcode_now_epoch();
+                if (rl_type && (strcmp(rl_type, "seven_day") == 0 || strstr(rl_type, "7d") != NULL ||
+                                strstr(rl_type, "week") != NULL)) {
+                    q.secondary.available = true;
+                    q.secondary.used_percent = pct;
+                    q.secondary.window_mins = 10080;
+                    q.secondary.resets_at = resets_at;
+                } else {
+                    q.primary.available = true;
+                    q.primary.used_percent = pct;
+                    q.primary.window_mins = 300;
+                    q.primary.resets_at = resets_at;
+                }
+                emit_rate_limit_ev(run, &q);
+            }
+        }
+        return;
+    }
+
     if (strcmp(type, "result") == 0) {
         yyjson_val *is_err_v = yyjson_obj_get(root, "is_error");
         bool is_err = yyjson_is_bool(is_err_v) && yyjson_get_bool(is_err_v);
@@ -505,19 +656,28 @@ static void parse_claude_json(mcode_agent_run *run, yyjson_val *root) {
         }
         yyjson_val *usage = yyjson_obj_get(root, "usage");
         yyjson_val *cost = yyjson_obj_get(root, "total_cost_usd");
+        yyjson_val *model_usage = yyjson_obj_get(root, "modelUsage");
         if (yyjson_is_obj(usage) || yyjson_is_num(cost)) {
-            agent_ev *uev = calloc(1, sizeof *uev);
-            if (uev) {
-                uev->kind = EV_USAGE;
-                if (yyjson_is_obj(usage)) {
-                    yyjson_val *in_v = yyjson_obj_get(usage, "input_tokens");
-                    yyjson_val *out_v = yyjson_obj_get(usage, "output_tokens");
-                    if (yyjson_is_num(in_v)) uev->int_a = (int)yyjson_get_num(in_v);
-                    if (yyjson_is_num(out_v)) uev->int_b = (int)yyjson_get_num(out_v);
-                }
-                if (yyjson_is_num(cost)) uev->dbl_a = yyjson_get_num(cost);
-                push_ev(run, uev);
+            int64_t in_tok = 0, out_tok = 0, cached_tok = 0, cache_create = 0, ctx_win = 0;
+            if (yyjson_is_obj(usage)) {
+                in_tok = ji64(usage, "input_tokens");
+                out_tok = ji64(usage, "output_tokens");
+                cached_tok = ji64(usage, "cache_read_input_tokens");
+                cache_create = ji64(usage, "cache_creation_input_tokens");
+                in_tok += cached_tok + cache_create;
             }
+            if (yyjson_is_obj(model_usage)) {
+                size_t idx, max;
+                yyjson_val *key, *val;
+                yyjson_obj_foreach(model_usage, idx, max, key, val) {
+                    (void)key;
+                    int64_t cw = ji64(val, "contextWindow");
+                    if (cw > ctx_win) ctx_win = cw;
+                }
+            }
+            int64_t ctx_tok = run->claude_last_ctx_tokens > 0 ? run->claude_last_ctx_tokens : in_tok;
+            double usd = yyjson_is_num(cost) ? yyjson_get_num(cost) : 0.0;
+            emit_usage_ev(run, in_tok, out_tok, cached_tok, ctx_tok, ctx_win, usd, false);
         }
         if (run->proto == AGENT_PROTO_CLAUDE_CTL) {
             pthread_mutex_lock(&run->mu);
@@ -1180,15 +1340,10 @@ static void parse_codex_json(mcode_agent_run *run, yyjson_val *root) {
     if (strcmp(type, "turn.completed") == 0) {
         yyjson_val *usage = yyjson_obj_get(root, "usage");
         if (yyjson_is_obj(usage)) {
-            agent_ev *uev = calloc(1, sizeof *uev);
-            if (uev) {
-                uev->kind = EV_USAGE;
-                yyjson_val *in_v = yyjson_obj_get(usage, "input_tokens");
-                yyjson_val *out_v = yyjson_obj_get(usage, "output_tokens");
-                if (yyjson_is_num(in_v)) uev->int_a = (int)yyjson_get_num(in_v);
-                if (yyjson_is_num(out_v)) uev->int_b = (int)yyjson_get_num(out_v);
-                push_ev(run, uev);
-            }
+            int64_t in_tok = ji64(usage, "input_tokens");
+            int64_t out_tok = ji64(usage, "output_tokens");
+            int64_t cached = ji64(usage, "cached_input_tokens");
+            emit_usage_ev(run, in_tok, out_tok, cached, 0, 0, 0.0, false);
         }
         return;
     }
@@ -1204,14 +1359,14 @@ static void parse_codex_json(mcode_agent_run *run, yyjson_val *root) {
 /* ---- Antigravity CLI (`agy`) stream-json parser ---- */
 static void emit_agy_usage(mcode_agent_run *run, yyjson_val *usage) {
     if (!yyjson_is_obj(usage)) return;
-    agent_ev *uev = calloc(1, sizeof *uev);
-    if (!uev) return;
-    uev->kind = EV_USAGE;
-    yyjson_val *in_v = yyjson_obj_get(usage, "input_tokens");
-    yyjson_val *out_v = yyjson_obj_get(usage, "output_tokens");
-    if (yyjson_is_num(in_v)) uev->int_a = (int)yyjson_get_num(in_v);
-    if (yyjson_is_num(out_v)) uev->int_b = (int)yyjson_get_num(out_v);
-    push_ev(run, uev);
+    int64_t in_tok = ji64(usage, "input_tokens");
+    int64_t out_tok = ji64(usage, "output_tokens");
+    int64_t cached = ji64(usage, "cached_input_tokens");
+    if (cached == 0) cached = ji64(usage, "cache_read_input_tokens");
+    int64_t ctx_win = ji64(usage, "context_window");
+    if (in_tok > 0 || out_tok > 0 || cached > 0) {
+        emit_usage_ev(run, in_tok, out_tok, cached, 0, ctx_win, 0.0, false);
+    }
 }
 
 static void parse_agy_result_obj(mcode_agent_run *run, yyjson_val *res) {
@@ -1596,14 +1751,11 @@ static void codex_rpc_send_turn_start(mcode_agent_run *run) {
 }
 
 static void codex_rpc_finish_turn(mcode_agent_run *run) {
-    if (run->codex_turn_in_tokens > 0 || run->codex_turn_out_tokens > 0) {
-        agent_ev *uev = calloc(1, sizeof *uev);
-        if (uev) {
-            uev->kind = EV_USAGE;
-            uev->int_a = run->codex_turn_in_tokens;
-            uev->int_b = run->codex_turn_out_tokens;
-            push_ev(run, uev);
-        }
+    if (!run->codex_emitted_live_usage &&
+        (run->codex_turn_in_tokens > 0 || run->codex_turn_out_tokens > 0)) {
+        emit_usage_ev(run, run->codex_turn_in_tokens, run->codex_turn_out_tokens,
+                      run->codex_turn_cached_tokens, run->codex_last_ctx_tokens,
+                      run->codex_ctx_window, 0.0, true);
     }
     pthread_mutex_lock(&run->mu);
     run->rpc_turn_done = true;
@@ -1937,14 +2089,38 @@ static void parse_codex_rpc_json(mcode_agent_run *run, yyjson_val *root) {
         return;
     }
 
+    if (strcmp(method, "account/rateLimits/updated") == 0) {
+        yyjson_val *rl = yyjson_is_obj(params) ? yyjson_obj_get(params, "rateLimits") : NULL;
+        mcode_provider_quota q;
+        memset(&q, 0, sizeof q);
+        if (parse_codex_rate_snapshot(rl, &q)) {
+            emit_rate_limit_ev(run, &q);
+        }
+        return;
+    }
+
     if (strcmp(method, "thread/tokenUsage/updated") == 0) {
         yyjson_val *tu = yyjson_is_obj(params) ? yyjson_obj_get(params, "tokenUsage") : NULL;
         yyjson_val *tot = yyjson_is_obj(tu) ? yyjson_obj_get(tu, "total") : NULL;
+        yyjson_val *last = yyjson_is_obj(tu) ? yyjson_obj_get(tu, "last") : NULL;
         if (yyjson_is_obj(tot)) {
-            yyjson_val *in_v = yyjson_obj_get(tot, "inputTokens");
-            yyjson_val *out_v = yyjson_obj_get(tot, "outputTokens");
-            if (yyjson_is_num(in_v)) run->codex_turn_in_tokens = (int)yyjson_get_num(in_v);
-            if (yyjson_is_num(out_v)) run->codex_turn_out_tokens = (int)yyjson_get_num(out_v);
+            run->codex_turn_in_tokens = ji64(tot, "inputTokens");
+            run->codex_turn_out_tokens = ji64(tot, "outputTokens");
+            run->codex_turn_cached_tokens = ji64(tot, "cachedInputTokens");
+        }
+        if (yyjson_is_obj(last)) {
+            int64_t lt = ji64(last, "totalTokens");
+            if (lt <= 0) lt = ji64(last, "inputTokens") + ji64(last, "outputTokens");
+            if (lt > 0) run->codex_last_ctx_tokens = lt;
+        }
+        int64_t cw = ji64(tu, "modelContextWindow");
+        if (cw > 0) run->codex_ctx_window = cw;
+        if (run->codex_turn_in_tokens > 0 || run->codex_turn_out_tokens > 0 ||
+            run->codex_last_ctx_tokens > 0) {
+            run->codex_emitted_live_usage = true;
+            emit_usage_ev(run, run->codex_turn_in_tokens, run->codex_turn_out_tokens,
+                          run->codex_turn_cached_tokens, run->codex_last_ctx_tokens,
+                          run->codex_ctx_window, 0.0, true);
         }
         return;
     }
@@ -2154,14 +2330,12 @@ static void parse_agy_acp_json(mcode_agent_run *run, yyjson_val *root) {
             } else if (yyjson_is_obj(res_v)) {
                 yyjson_val *usage = yyjson_obj_get(res_v, "usage");
                 if (yyjson_is_obj(usage)) {
-                    agent_ev *uev = calloc(1, sizeof *uev);
-                    if (uev) {
-                        uev->kind = EV_USAGE;
-                        yyjson_val *in_v = yyjson_obj_get(usage, "inputTokens");
-                        yyjson_val *out_v = yyjson_obj_get(usage, "outputTokens");
-                        if (yyjson_is_num(in_v)) uev->int_a = (int)yyjson_get_num(in_v);
-                        if (yyjson_is_num(out_v)) uev->int_b = (int)yyjson_get_num(out_v);
-                        push_ev(run, uev);
+                    int64_t in_tok = ji64(usage, "inputTokens");
+                    int64_t out_tok = ji64(usage, "outputTokens");
+                    int64_t cached = ji64(usage, "cachedReadTokens");
+                    int64_t ctx_win = ji64(usage, "contextWindow");
+                    if (in_tok > 0 || out_tok > 0 || cached > 0) {
+                        emit_usage_ev(run, in_tok, out_tok, cached, 0, ctx_win, 0.0, false);
                     }
                 }
             }
@@ -2416,7 +2590,45 @@ static void on_proc_exit(int exit_code, bool killed, void *user) {
     pthread_mutex_unlock(&run->mu);
 }
 
-static void apply_event(mcode_thread *thread, mcode_turn *turn, const agent_ev *ev) {
+static void merge_provider_quota(mcode_provider_quota *dst, const mcode_provider_quota *src) {
+    if (!dst || !src) return;
+    if (src->auth_checked) {
+        dst->auth_checked = true;
+        dst->logged_in = src->logged_in;
+        if (src->auth_method[0]) {
+            snprintf(dst->auth_method, sizeof dst->auth_method, "%s", src->auth_method);
+        }
+    }
+    if (src->plan[0]) snprintf(dst->plan, sizeof dst->plan, "%s", src->plan);
+    if (src->primary.available) dst->primary = src->primary;
+    if (src->secondary.available) dst->secondary = src->secondary;
+    if (src->group_count > 0) {
+        int n = src->group_count;
+        if (n > MCODE_MAX_QUOTA_GROUPS) n = MCODE_MAX_QUOTA_GROUPS;
+        memcpy(dst->groups, src->groups, (size_t)n * sizeof dst->groups[0]);
+        dst->group_count = n;
+    }
+    if (src->has_credits || src->unlimited_credits || src->credits_balance[0]) {
+        dst->has_credits = src->has_credits;
+        dst->unlimited_credits = src->unlimited_credits;
+        if (src->credits_balance[0]) {
+            snprintf(dst->credits_balance, sizeof dst->credits_balance, "%s", src->credits_balance);
+        }
+    }
+    if (src->account_today_tokens > 0) dst->account_today_tokens = src->account_today_tokens;
+    if (src->account_lifetime_tokens > 0) dst->account_lifetime_tokens = src->account_lifetime_tokens;
+    if (src->account_cost_usd > 0.0) dst->account_cost_usd = src->account_cost_usd;
+    if (src->current_streak_days > 0) dst->current_streak_days = src->current_streak_days;
+    if (src->available || dst->primary.available || dst->secondary.available || dst->group_count > 0) {
+        dst->available = true;
+        dst->error[0] = '\0';
+        if (src->updated_mono > 0.0) dst->updated_mono = src->updated_mono;
+        if (src->updated_epoch > 0) dst->updated_epoch = src->updated_epoch;
+    }
+}
+
+static void apply_event(mcode_thread *thread, mcode_turn *turn,
+                        mcode_usage_tracker *usage, const agent_ev *ev) {
     if (!thread || !turn || !ev) return;
 
     switch (ev->kind) {
@@ -2541,9 +2753,23 @@ static void apply_event(mcode_thread *thread, mcode_turn *turn, const agent_ev *
         }
         break;
     case EV_USAGE:
-        turn->input_tokens += ev->int_a;
-        turn->output_tokens += ev->int_b;
+        if (ev->flag) {
+            if (ev->tok_in > 0) turn->input_tokens = ev->tok_in;
+            if (ev->tok_out > 0) turn->output_tokens = ev->tok_out;
+            if (ev->tok_cached > 0) turn->cached_tokens = ev->tok_cached;
+        } else {
+            turn->input_tokens += ev->tok_in;
+            turn->output_tokens += ev->tok_out;
+            turn->cached_tokens += ev->tok_cached;
+        }
+        if (ev->tok_ctx > 0) turn->context_tokens = ev->tok_ctx;
+        if (ev->tok_ctx_win > 0) turn->context_window = ev->tok_ctx_win;
         if (ev->dbl_a > 0.0) turn->cost_usd = ev->dbl_a;
+        break;
+    case EV_RATE_LIMIT:
+        if (usage && ev->quota && thread->agent >= 0 && thread->agent < APP_AGENT_COUNT) {
+            merge_provider_quota(&usage->quotas[thread->agent], ev->quota);
+        }
         break;
     case EV_ERROR: {
         if (ev->text && ev->text[0]) {
@@ -2677,6 +2903,7 @@ static void load_claude_default_models(mcode_model_catalog *cat) {
     for (size_t i = 0; i < sizeof k_claude / sizeof k_claude[0] && n < MCODE_MAX_MODELS_PER_AGENT; ++i) {
         mcode_model_option *opt = &cat->items[APP_AGENT_CLAUDE][n++];
         set_model_opt(opt, k_claude[i].id, k_claude[i].label, k_claude[i].detail);
+        opt->context_window = 200000;
         for (size_t j = 0; j < sizeof k_claude_efforts / sizeof k_claude_efforts[0]; ++j) {
             snprintf(opt->efforts[opt->effort_count++], sizeof opt->efforts[0], "%s", k_claude_efforts[j]);
         }
@@ -2696,6 +2923,7 @@ static void load_codex_fallback_models(mcode_model_catalog *cat) {
     for (size_t i = 0; i < sizeof k_codex / sizeof k_codex[0] && n < MCODE_MAX_MODELS_PER_AGENT; ++i) {
         mcode_model_option *opt = &cat->items[APP_AGENT_CODEX][n++];
         set_model_opt(opt, k_codex[i].id, k_codex[i].label, k_codex[i].detail);
+        opt->context_window = 272000;
         snprintf(opt->default_effort, sizeof opt->default_effort, "medium");
         for (size_t j = 0; j < sizeof k_codex_efforts / sizeof k_codex_efforts[0]; ++j) {
             snprintf(opt->efforts[opt->effort_count++], sizeof opt->efforts[0], "%s", k_codex_efforts[j]);
@@ -2760,6 +2988,9 @@ int mcode_agent_parse_codex_models_json(const char *json, size_t len,
             const char *desc = jstr(m, "description");
             mcode_model_option *opt = &out[count++];
             set_model_opt(opt, slug, (disp && disp[0]) ? disp : slug, desc ? desc : "");
+            int64_t cw = ji64(m, "context_window");
+            if (cw <= 0) cw = ji64(m, "max_context_window");
+            opt->context_window = cw;
             const char *def_eff = jstr(m, "default_reasoning_level");
             if (def_eff && def_eff[0]) {
                 snprintf(opt->default_effort, sizeof opt->default_effort, "%s", def_eff);
@@ -3288,6 +3519,795 @@ bool mcode_thread_is_fast_mode(const mcode_model_catalog *cat, const mcode_threa
     return false;
 }
 
+int64_t mcode_model_context_window(const mcode_model_catalog *cat, const mcode_thread *thread,
+                                   const app_settings *settings) {
+    if (!thread) return 0;
+    app_agent_kind ag = thread->agent;
+    if (ag < 0 || ag >= APP_AGENT_COUNT) return 0;
+    const char *model_id = mcode_agent_effective_model(thread, settings);
+    if (!model_id[0] && cat) model_id = cat->cli_default_model[ag];
+    const mcode_model_option *opt = mcode_model_find(cat, ag, model_id);
+    if (opt && opt->context_window > 0) return opt->context_window;
+    if (ag == APP_AGENT_CLAUDE) return 200000;
+    if (ag == APP_AGENT_CODEX) return 272000;
+    if (ag == APP_AGENT_AGY) {
+        if (model_id && strstr(model_id, "claude") != NULL) return 200000;
+        return 1000000;
+    }
+    return 0;
+}
+
+/* ---- Live Provider Usage & Quota Tracker ---- */
+
+bool mcode_agent_parse_codex_rate_limits_json(const char *json, size_t len,
+                                              mcode_provider_quota *out) {
+    if (!json || len == 0 || !out) return false;
+    yyjson_doc *doc = yyjson_read(json, len, 0);
+    if (!doc) return false;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *src = root;
+    if (yyjson_is_obj(root)) {
+        yyjson_val *res = yyjson_obj_get(root, "result");
+        if (yyjson_is_obj(res)) src = res;
+        yyjson_val *rl = yyjson_obj_get(src, "rateLimits");
+        if (yyjson_is_obj(rl)) {
+            src = rl;
+        } else {
+            yyjson_val *by_id = yyjson_obj_get(src, "rateLimitsByLimitId");
+            if (yyjson_is_obj(by_id)) {
+                yyjson_val *codex_rl = yyjson_obj_get(by_id, "codex");
+                if (yyjson_is_obj(codex_rl)) {
+                    src = codex_rl;
+                } else {
+                    size_t idx, max;
+                    yyjson_val *k, *v;
+                    yyjson_obj_foreach(by_id, idx, max, k, v) {
+                        (void)k;
+                        if (yyjson_is_obj(v)) { src = v; break; }
+                    }
+                }
+            }
+        }
+    }
+    bool ok = parse_codex_rate_snapshot(src, out);
+    yyjson_doc_free(doc);
+    return ok;
+}
+
+static bool parse_codex_account_usage_val(yyjson_val *src, const char *today_ymd,
+                                          mcode_provider_quota *out) {
+    if (!yyjson_is_obj(src) || !out) return false;
+    bool got = false;
+    yyjson_val *sum = yyjson_obj_get(src, "summary");
+    if (yyjson_is_obj(sum)) {
+        int64_t life = ji64(sum, "lifetimeTokens");
+        int streak = (int)ji64(sum, "currentStreakDays");
+        if (life > 0) {
+            out->account_lifetime_tokens = life;
+            got = true;
+        }
+        if (streak > 0) out->current_streak_days = streak;
+    }
+    yyjson_val *buckets = yyjson_obj_get(src, "dailyUsageBuckets");
+    if (yyjson_is_arr(buckets) && today_ymd && today_ymd[0]) {
+        size_t idx, max;
+        yyjson_val *b;
+        yyjson_arr_foreach(buckets, idx, max, b) {
+            const char *sd = jstr(b, "startDate");
+            if (sd && strncmp(sd, today_ymd, 10) == 0) {
+                int64_t toks = ji64(b, "tokens");
+                if (toks >= 0) {
+                    out->account_today_tokens = toks;
+                    got = true;
+                }
+                break;
+            }
+        }
+    }
+    return got;
+}
+
+bool mcode_agent_parse_codex_account_usage_json(const char *json, size_t len,
+                                                const char *today_ymd,
+                                                mcode_provider_quota *out) {
+    if (!json || len == 0 || !out) return false;
+    yyjson_doc *doc = yyjson_read(json, len, 0);
+    if (!doc) return false;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *src = root;
+    if (yyjson_is_obj(root)) {
+        yyjson_val *res = yyjson_obj_get(root, "result");
+        if (yyjson_is_obj(res)) src = res;
+    }
+    bool ok = parse_codex_account_usage_val(src, today_ymd, out);
+    yyjson_doc_free(doc);
+    return ok;
+}
+
+struct mcode_usage_fetch {
+    mcode_proc *proc;
+    pthread_mutex_t mu;
+    mcode_str out_line;
+    char today_ymd[16];
+    double started_mono;
+    bool sent_queries;
+    bool got_rate_limits;
+    bool got_account_usage;
+    bool timed_out;
+    bool finished;
+    mcode_provider_quota result;
+};
+
+static void usage_fetch_send_queries(mcode_usage_fetch *f) {
+    if (!f || !f->proc) return;
+    static const char k_queries[] =
+        "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\"}\n"
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"account/rateLimits/read\","
+        "\"params\":{\"excludeResetCreditDetails\":true}}\n"
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"account/usage/read\",\"params\":{}}\n";
+    mcode_proc_write(f->proc, k_queries, sizeof k_queries - 1);
+}
+
+static void usage_fetch_handle_line(mcode_usage_fetch *f, const char *line) {
+    if (!f || !line) return;
+    while (*line && isspace((unsigned char)*line)) ++line;
+    if (*line != '{') return;
+
+    yyjson_doc *doc = yyjson_read(line, strlen(line), 0);
+    if (!doc) return;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    if (!yyjson_is_obj(root)) {
+        yyjson_doc_free(doc);
+        return;
+    }
+
+    yyjson_val *id_v = yyjson_obj_get(root, "id");
+    if (yyjson_is_int(id_v)) {
+        int64_t rid = yyjson_get_sint(id_v);
+        yyjson_val *err_v = yyjson_obj_get(root, "error");
+        yyjson_val *res_v = yyjson_obj_get(root, "result");
+
+        bool should_send = false;
+        bool should_stop = false;
+
+        pthread_mutex_lock(&f->mu);
+        if (rid == 1) {
+            if (err_v) {
+                const char *emsg = jstr(err_v, "message");
+                snprintf(f->result.error, sizeof f->result.error, "%s",
+                         emsg ? emsg : "Codex initialize failed");
+                should_stop = true;
+            } else if (!f->sent_queries) {
+                f->sent_queries = true;
+                should_send = true;
+            }
+        } else if (rid == 2) {
+            f->got_rate_limits = true;
+            if (err_v) {
+                const char *emsg = jstr(err_v, "message");
+                if (emsg && emsg[0]) {
+                    snprintf(f->result.error, sizeof f->result.error, "%s", emsg);
+                }
+            } else if (yyjson_is_obj(res_v)) {
+                yyjson_val *rl = yyjson_obj_get(res_v, "rateLimits");
+                if (!yyjson_is_obj(rl)) {
+                    yyjson_val *by_id = yyjson_obj_get(res_v, "rateLimitsByLimitId");
+                    if (yyjson_is_obj(by_id)) rl = yyjson_obj_get(by_id, "codex");
+                }
+                parse_codex_rate_snapshot(rl, &f->result);
+            }
+            if (f->got_account_usage) should_stop = true;
+        } else if (rid == 3) {
+            f->got_account_usage = true;
+            if (!err_v && yyjson_is_obj(res_v)) {
+                parse_codex_account_usage_val(res_v, f->today_ymd, &f->result);
+            }
+            if (f->got_rate_limits) should_stop = true;
+        }
+        pthread_mutex_unlock(&f->mu);
+
+        if (should_send) {
+            usage_fetch_send_queries(f);
+        } else if (should_stop && f->proc) {
+            mcode_proc_close_stdin(f->proc);
+            mcode_proc_stop(f->proc);
+        }
+    }
+
+    yyjson_doc_free(doc);
+}
+
+static void on_usage_fetch_bytes(const char *data, size_t len, bool is_stderr, void *user) {
+    if (is_stderr) return;
+    mcode_usage_fetch *f = (mcode_usage_fetch *)user;
+    for (size_t i = 0; i < len; ++i) {
+        if (data[i] == '\n') {
+            usage_fetch_handle_line(f, mcode_str_cstr(&f->out_line));
+            mcode_str_clear(&f->out_line);
+        } else if (f->out_line.len < 256 * 1024) {
+            mcode_str_append(&f->out_line, &data[i], 1);
+        }
+    }
+}
+
+static void on_usage_fetch_exit(int exit_code, bool killed, void *user) {
+    (void)exit_code;
+    (void)killed;
+    mcode_usage_fetch *f = (mcode_usage_fetch *)user;
+    if (f->out_line.len > 0) {
+        usage_fetch_handle_line(f, mcode_str_cstr(&f->out_line));
+        mcode_str_clear(&f->out_line);
+    }
+    pthread_mutex_lock(&f->mu);
+    f->finished = true;
+    pthread_mutex_unlock(&f->mu);
+}
+
+static void usage_fetch_destroy(mcode_usage_fetch *f) {
+    if (!f) return;
+    if (f->proc) {
+        mcode_proc_destroy(f->proc);
+        f->proc = NULL;
+    }
+    mcode_str_free(&f->out_line);
+    pthread_mutex_destroy(&f->mu);
+    free(f);
+}
+
+static void format_local_today_ymd(char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    time_t now = time(NULL);
+    struct tm lt;
+#ifdef _WIN32
+    if (localtime_s(&lt, &now) != 0) return;
+#else
+    if (!localtime_r(&now, &lt)) return;
+#endif
+    snprintf(out, cap, "%04d-%02d-%02d", lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday);
+}
+
+static int64_t days_from_civil_utc(int64_t y, unsigned m, unsigned d) {
+    y -= (m <= 2) ? 1 : 0;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153 * (m + (m > 2 ? (unsigned)-3 : 9)) + 2) / 5 + d - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
+static int64_t parse_iso8601_utc_epoch(const char *s) {
+    if (!s || strlen(s) < 19) return 0;
+    int yr = 0, mo = 0, dy = 0, hr = 0, mn = 0, sc = 0;
+    if (sscanf(s, "%d-%d-%dT%d:%d:%d", &yr, &mo, &dy, &hr, &mn, &sc) != 6) return 0;
+    if (yr <= 1970 || mo < 1 || mo > 12 || dy < 1 || dy > 31) return 0;
+    if (hr < 0 || hr > 23 || mn < 0 || mn > 59 || sc < 0 || sc > 60) return 0;
+    int64_t days = days_from_civil_utc(yr, (unsigned)mo, (unsigned)dy);
+    return days * 86400LL + (int64_t)hr * 3600LL + (int64_t)mn * 60LL + (int64_t)sc;
+}
+
+bool mcode_agent_parse_agy_usage_json(const char *json, size_t len,
+                                      mcode_provider_quota *out) {
+    if (!json || len == 0 || !out) return false;
+    /* Find the JSON object in stdout (skipping any leading ANSI/spinner chatter). */
+    const char *start = memchr(json, '{', len);
+    if (!start) return false;
+    size_t rem_len = len - (size_t)(start - json);
+    yyjson_doc *doc = yyjson_read(start, rem_len, YYJSON_READ_STOP_WHEN_DONE);
+    if (!doc) return false;
+
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *cmd = yyjson_is_obj(root) ? yyjson_obj_get(root, "command") : NULL;
+    yyjson_val *data = yyjson_is_obj(cmd) ? yyjson_obj_get(cmd, "data") : NULL;
+    yyjson_val *groups = yyjson_is_obj(data) ? yyjson_obj_get(data, "groups") : NULL;
+
+    bool got_any = false;
+    if (yyjson_is_arr(groups)) {
+        out->group_count = 0;
+        size_t gi, gmax;
+        yyjson_val *gv;
+        yyjson_arr_foreach(groups, gi, gmax, gv) {
+            if (out->group_count >= MCODE_MAX_QUOTA_GROUPS || !yyjson_is_obj(gv)) break;
+            const char *gname = jstr(gv, "name");
+            yyjson_val *buckets = yyjson_obj_get(gv, "buckets");
+            if (!yyjson_is_arr(buckets)) continue;
+
+            mcode_quota_group grp;
+            memset(&grp, 0, sizeof grp);
+            snprintf(grp.name, sizeof grp.name, "%s", (gname && gname[0]) ? gname : "Models");
+
+            size_t bi, bmax;
+            yyjson_val *bv;
+            yyjson_arr_foreach(buckets, bi, bmax, bv) {
+                if (!yyjson_is_obj(bv)) continue;
+                yyjson_val *rem_v = yyjson_obj_get(bv, "remaining_fraction");
+                if (!yyjson_is_num(rem_v)) continue;
+                double rem = yyjson_get_num(rem_v);
+                if (rem < 0.0) rem = 0.0;
+                if (rem > 1.0) rem = 1.0;
+                int used_pct = clamp_percent((int)((1.0 - rem) * 100.0 + 0.5));
+                int64_t resets = parse_iso8601_utc_epoch(jstr(bv, "reset_time"));
+                const char *win = jstr(bv, "window");
+                const char *bid = jstr(bv, "id");
+                const char *bname = jstr(bv, "name");
+
+                bool is_weekly = (win && (strcmp(win, "weekly") == 0 || strcmp(win, "7d") == 0)) ||
+                                 (bid && strstr(bid, "weekly") != NULL) ||
+                                 (bname && strstr(bname, "Weekly") != NULL);
+                mcode_rate_window *dst_w = is_weekly ? &grp.secondary : &grp.primary;
+                dst_w->available = true;
+                dst_w->used_percent = used_pct;
+                dst_w->window_mins = is_weekly ? 10080 : 300;
+                dst_w->resets_at = resets;
+            }
+
+            if (grp.primary.available || grp.secondary.available) {
+                out->groups[out->group_count++] = grp;
+                got_any = true;
+            }
+        }
+    }
+
+    if (got_any) {
+        out->primary = out->groups[0].primary;
+        out->secondary = out->groups[0].secondary;
+        out->available = true;
+        out->auth_checked = true;
+        out->logged_in = true;
+        out->updated_mono = mcode_now_mono();
+        out->updated_epoch = mcode_now_epoch();
+        out->error[0] = '\0';
+    }
+    yyjson_doc_free(doc);
+    return got_any;
+}
+
+bool mcode_agent_parse_claude_auth_json(const char *json, size_t len,
+                                        mcode_provider_quota *out) {
+    if (!json || len == 0 || !out) return false;
+    const char *start = memchr(json, '{', len);
+    if (!start) return false;
+    size_t rem_len = len - (size_t)(start - json);
+    yyjson_doc *doc = yyjson_read(start, rem_len, YYJSON_READ_STOP_WHEN_DONE);
+    if (!doc) return false;
+
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    if (!yyjson_is_obj(root)) {
+        yyjson_doc_free(doc);
+        return false;
+    }
+
+    yyjson_val *li = yyjson_obj_get(root, "loggedIn");
+    if (yyjson_is_bool(li)) {
+        out->auth_checked = true;
+        out->logged_in = yyjson_get_bool(li);
+    }
+    const char *method = jstr(root, "authMethod");
+    if (method && method[0]) {
+        snprintf(out->auth_method, sizeof out->auth_method, "%s", method);
+    }
+    const char *plan = jstr(root, "subscriptionType");
+    if (!plan || !plan[0]) plan = jstr(root, "billingType");
+    if (!plan || !plan[0]) plan = jstr(root, "plan");
+    if (plan && plan[0]) {
+        snprintf(out->plan, sizeof out->plan, "%s", plan);
+    }
+    out->updated_mono = mcode_now_mono();
+    out->updated_epoch = mcode_now_epoch();
+    yyjson_doc_free(doc);
+    return out->auth_checked;
+}
+
+#ifndef _WIN32
+static void scan_claude_jsonl_file(const char *path, const char *today_ymd,
+                                   int64_t *today_tok, int64_t *life_tok, double *cost_usd) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    char *line = malloc(65536);
+    if (!line) { fclose(f); return; }
+    double max_session_cost = 0.0;
+    while (fgets(line, 65536, f)) {
+        bool has_usage = (strstr(line, "\"usage\"") != NULL);
+        bool has_cost = (!has_usage && strstr(line, "\"cost-state\"") != NULL);
+        if (!has_usage && !has_cost) continue;
+        size_t llen = strlen(line);
+        yyjson_doc *doc = yyjson_read(line, llen, 0);
+        if (!doc) continue;
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        if (yyjson_is_obj(root)) {
+            const char *type = jstr(root, "type");
+            if (has_cost && type && strcmp(type, "cost-state") == 0) {
+                yyjson_val *cv = yyjson_obj_get(root, "totalCostUSD");
+                if (yyjson_is_num(cv)) {
+                    double c = yyjson_get_num(cv);
+                    if (c > max_session_cost) max_session_cost = c;
+                }
+            } else if (has_usage) {
+                yyjson_val *msg = yyjson_obj_get(root, "message");
+                yyjson_val *u = yyjson_is_obj(msg) ? yyjson_obj_get(msg, "usage") : NULL;
+                if (yyjson_is_obj(u)) {
+                    int64_t t = ji64(u, "input_tokens")
+                              + ji64(u, "output_tokens")
+                              + ji64(u, "cache_read_input_tokens")
+                              + ji64(u, "cache_creation_input_tokens");
+                    if (t > 0) {
+                        *life_tok += t;
+                        const char *ts = jstr(root, "timestamp");
+                        if (ts && today_ymd && today_ymd[0] && strncmp(ts, today_ymd, 10) == 0) {
+                            *today_tok += t;
+                        }
+                    }
+                }
+            }
+        }
+        yyjson_doc_free(doc);
+    }
+    *cost_usd += max_session_cost;
+    free(line);
+    fclose(f);
+}
+
+static void scan_claude_local_usage(const char *today_ymd,
+                                    int64_t *out_today, int64_t *out_life, double *out_cost) {
+    *out_today = 0;
+    *out_life = 0;
+    *out_cost = 0.0;
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) return;
+    char root_dir[MCODE_PATH_MAX];
+    int rn = snprintf(root_dir, sizeof root_dir, "%s/.claude/projects", home);
+    if (rn <= 0 || (size_t)rn >= sizeof root_dir) return;
+
+    DIR *d = opendir(root_dir);
+    if (!d) return;
+    int scanned = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL && scanned < 256) {
+        if (ent->d_name[0] == '.') continue;
+        char sub[MCODE_PATH_MAX];
+        int sn = snprintf(sub, sizeof sub, "%s/%s", root_dir, ent->d_name);
+        if (sn <= 0 || (size_t)sn >= sizeof sub) continue;
+        DIR *sd = opendir(sub);
+        if (!sd) continue;
+        struct dirent *fent;
+        while ((fent = readdir(sd)) != NULL && scanned < 256) {
+            size_t flen = strlen(fent->d_name);
+            if (flen < 7 || strcmp(fent->d_name + flen - 6, ".jsonl") != 0) continue;
+            char fp[MCODE_PATH_MAX];
+            int fn = snprintf(fp, sizeof fp, "%s/%s", sub, fent->d_name);
+            if (fn <= 0 || (size_t)fn >= sizeof fp) continue;
+            scan_claude_jsonl_file(fp, today_ymd, out_today, out_life, out_cost);
+            ++scanned;
+        }
+        closedir(sd);
+    }
+    closedir(d);
+}
+#else
+static void scan_claude_local_usage(const char *today_ymd,
+                                    int64_t *out_today, int64_t *out_life, double *out_cost) {
+    (void)today_ymd;
+    *out_today = 0;
+    *out_life = 0;
+    *out_cost = 0.0;
+}
+#endif
+
+struct mcode_simple_fetch {
+    mcode_proc *proc;
+    pthread_mutex_t mu;
+    mcode_str stdout_buf;
+    mcode_str stderr_buf;
+    double started_mono;
+    double timeout_sec;
+    bool timed_out;
+    bool finished;
+    int exit_code;
+};
+
+static void on_simple_fetch_bytes(const char *data, size_t len, bool is_stderr, void *user) {
+    mcode_simple_fetch *f = (mcode_simple_fetch *)user;
+    pthread_mutex_lock(&f->mu);
+    mcode_str *dst = is_stderr ? &f->stderr_buf : &f->stdout_buf;
+    if (dst->len < 256 * 1024) {
+        mcode_str_append(dst, data, len);
+    }
+    pthread_mutex_unlock(&f->mu);
+}
+
+static void on_simple_fetch_exit(int exit_code, bool killed, void *user) {
+    (void)killed;
+    mcode_simple_fetch *f = (mcode_simple_fetch *)user;
+    pthread_mutex_lock(&f->mu);
+    f->exit_code = exit_code;
+    f->finished = true;
+    pthread_mutex_unlock(&f->mu);
+}
+
+static mcode_simple_fetch *simple_fetch_spawn(const char *const *argv, double timeout_sec) {
+    mcode_simple_fetch *f = calloc(1, sizeof *f);
+    if (!f) return NULL;
+    pthread_mutex_init(&f->mu, NULL);
+    mcode_str_init(&f->stdout_buf);
+    mcode_str_init(&f->stderr_buf);
+    f->started_mono = mcode_now_mono();
+    f->timeout_sec = timeout_sec > 0.0 ? timeout_sec : 12.0;
+    f->proc = mcode_proc_spawn(&(mcode_proc_desc){
+        .argv = argv,
+        .cwd = NULL,
+        .merge_stderr = false,
+        .open_stdin = false,
+        .on_bytes = on_simple_fetch_bytes,
+        .on_exit = on_simple_fetch_exit,
+        .user = f,
+    });
+    if (!f->proc) {
+        mcode_str_free(&f->stdout_buf);
+        mcode_str_free(&f->stderr_buf);
+        pthread_mutex_destroy(&f->mu);
+        free(f);
+        return NULL;
+    }
+    return f;
+}
+
+static bool simple_fetch_poll(mcode_simple_fetch *f) {
+    if (!f) return false;
+    pthread_mutex_lock(&f->mu);
+    bool finished = f->finished;
+    pthread_mutex_unlock(&f->mu);
+    if (!finished && !f->timed_out && (mcode_now_mono() - f->started_mono) > f->timeout_sec) {
+        f->timed_out = true;
+        if (f->proc) mcode_proc_stop(f->proc);
+    }
+    return finished;
+}
+
+static void simple_fetch_destroy(mcode_simple_fetch *f) {
+    if (!f) return;
+    if (f->proc) {
+        mcode_proc_destroy(f->proc);
+        f->proc = NULL;
+    }
+    mcode_str_free(&f->stdout_buf);
+    mcode_str_free(&f->stderr_buf);
+    pthread_mutex_destroy(&f->mu);
+    free(f);
+}
+
+void mcode_usage_tracker_init(mcode_usage_tracker *tracker) {
+    if (!tracker) return;
+    memset(tracker, 0, sizeof *tracker);
+}
+
+static void start_codex_usage_fetch(mcode_usage_tracker *tracker, const mcode_cli_status *clis) {
+    if (!clis->available[APP_AGENT_CODEX] || !clis->resolved_path[APP_AGENT_CODEX][0]) return;
+    if (tracker->codex_fetch) return;
+
+    mcode_usage_fetch *f = calloc(1, sizeof *f);
+    if (!f) return;
+    pthread_mutex_init(&f->mu, NULL);
+    mcode_str_init(&f->out_line);
+    f->started_mono = mcode_now_mono();
+    format_local_today_ymd(f->today_ymd, sizeof f->today_ymd);
+
+    const char *argv[] = {
+        clis->resolved_path[APP_AGENT_CODEX], "app-server", "--listen", "stdio://", NULL
+    };
+    f->proc = mcode_proc_spawn(&(mcode_proc_desc){
+        .argv = argv,
+        .cwd = NULL,
+        .merge_stderr = false,
+        .open_stdin = true,
+        .on_bytes = on_usage_fetch_bytes,
+        .on_exit = on_usage_fetch_exit,
+        .user = f,
+    });
+    if (!f->proc) {
+        usage_fetch_destroy(f);
+        return;
+    }
+
+    static const char k_init[] =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+        "\"params\":{\"clientInfo\":{\"name\":\"mcode\",\"version\":\"0.1.0\"}}}\n";
+    mcode_proc_write(f->proc, k_init, sizeof k_init - 1);
+
+    tracker->codex_fetch = f;
+    tracker->quotas[APP_AGENT_CODEX].loading = true;
+}
+
+static void start_agy_usage_fetch(mcode_usage_tracker *tracker, const mcode_cli_status *clis,
+                                  bool agy_busy) {
+    if (!clis->available[APP_AGENT_AGY] || !clis->resolved_path[APP_AGENT_AGY][0]) return;
+    if (tracker->agy_fetch) return;
+    if (agy_busy) {
+        tracker->agy_refresh_pending = true;
+        return;
+    }
+    tracker->agy_refresh_pending = false;
+    const char *argv[] = {
+        clis->resolved_path[APP_AGENT_AGY], "-p", "/usage",
+        "--output-format", "json", "--print-timeout", "15s", NULL
+    };
+    mcode_simple_fetch *f = simple_fetch_spawn(argv, 18.0);
+    if (!f) return;
+    tracker->agy_fetch = f;
+    tracker->quotas[APP_AGENT_AGY].loading = true;
+}
+
+static void start_claude_usage_fetch(mcode_usage_tracker *tracker, const mcode_cli_status *clis) {
+    if (!clis->available[APP_AGENT_CLAUDE] || !clis->resolved_path[APP_AGENT_CLAUDE][0]) return;
+    if (tracker->claude_fetch) return;
+    const char *argv[] = {
+        clis->resolved_path[APP_AGENT_CLAUDE], "auth", "status", NULL
+    };
+    mcode_simple_fetch *f = simple_fetch_spawn(argv, 8.0);
+    if (!f) return;
+    tracker->claude_fetch = f;
+    tracker->quotas[APP_AGENT_CLAUDE].loading = true;
+}
+
+void mcode_usage_tracker_refresh_agent(mcode_usage_tracker *tracker, const mcode_cli_status *clis,
+                                       app_agent_kind agent, bool agy_busy) {
+    if (!tracker || !clis) return;
+    switch (agent) {
+    case APP_AGENT_CLAUDE: start_claude_usage_fetch(tracker, clis); break;
+    case APP_AGENT_CODEX:  start_codex_usage_fetch(tracker, clis); break;
+    case APP_AGENT_AGY:    start_agy_usage_fetch(tracker, clis, agy_busy); break;
+    default: break;
+    }
+}
+
+void mcode_usage_tracker_refresh(mcode_usage_tracker *tracker, const mcode_cli_status *clis,
+                                 bool agy_busy) {
+    if (!tracker || !clis) return;
+    start_codex_usage_fetch(tracker, clis);
+    start_agy_usage_fetch(tracker, clis, agy_busy);
+    start_claude_usage_fetch(tracker, clis);
+}
+
+bool mcode_usage_tracker_is_loading(const mcode_usage_tracker *tracker) {
+    if (!tracker) return false;
+    return tracker->codex_fetch != NULL ||
+           tracker->agy_fetch != NULL ||
+           tracker->claude_fetch != NULL;
+}
+
+bool mcode_usage_tracker_poll(mcode_usage_tracker *tracker, const mcode_cli_status *clis,
+                              bool agy_busy) {
+    if (!tracker) return false;
+    bool updated = false;
+
+    /* Launch deferred Antigravity usage refresh once no `agy` turn/title is running. */
+    if (tracker->agy_refresh_pending && !agy_busy && !tracker->agy_fetch && clis) {
+        start_agy_usage_fetch(tracker, clis, false);
+    }
+
+    /* 1. Codex app-server RPC fetch */
+    if (tracker->codex_fetch) {
+        mcode_usage_fetch *f = tracker->codex_fetch;
+        pthread_mutex_lock(&f->mu);
+        bool finished = f->finished;
+        pthread_mutex_unlock(&f->mu);
+
+        if (!finished) {
+            if (!f->timed_out && (mcode_now_mono() - f->started_mono) > 10.0) {
+                f->timed_out = true;
+                if (f->proc) {
+                    mcode_proc_close_stdin(f->proc);
+                    mcode_proc_stop(f->proc);
+                }
+            }
+        } else {
+            mcode_provider_quota *dst = &tracker->quotas[APP_AGENT_CODEX];
+            dst->loading = false;
+            if (f->result.available || f->result.account_lifetime_tokens > 0 ||
+                f->result.account_today_tokens > 0) {
+                f->result.auth_checked = true;
+                f->result.logged_in = true;
+                merge_provider_quota(dst, &f->result);
+                dst->updated_mono = mcode_now_mono();
+                dst->updated_epoch = mcode_now_epoch();
+                updated = true;
+            } else if (f->result.error[0] && !dst->available) {
+                snprintf(dst->error, sizeof dst->error, "%s", f->result.error);
+                updated = true;
+            } else if (f->timed_out && !dst->available) {
+                snprintf(dst->error, sizeof dst->error, "Timed out checking Codex limits");
+                updated = true;
+            }
+            usage_fetch_destroy(f);
+            tracker->codex_fetch = NULL;
+        }
+    }
+
+    /* 2. Antigravity `agy -p /usage --output-format json` fetch */
+    if (tracker->agy_fetch && simple_fetch_poll(tracker->agy_fetch)) {
+        mcode_simple_fetch *f = tracker->agy_fetch;
+        mcode_provider_quota *dst = &tracker->quotas[APP_AGENT_AGY];
+        dst->loading = false;
+
+        mcode_provider_quota parsed;
+        memset(&parsed, 0, sizeof parsed);
+        if (f->stdout_buf.len > 0 &&
+            mcode_agent_parse_agy_usage_json(mcode_str_cstr(&f->stdout_buf),
+                                             f->stdout_buf.len, &parsed)) {
+            merge_provider_quota(dst, &parsed);
+            updated = true;
+        } else if (!dst->available) {
+            if (f->timed_out) {
+                snprintf(dst->error, sizeof dst->error, "Timed out checking Antigravity limits");
+            } else {
+                snprintf(dst->error, sizeof dst->error, "Antigravity limits unavailable");
+            }
+            updated = true;
+        }
+        simple_fetch_destroy(f);
+        tracker->agy_fetch = NULL;
+    }
+
+    /* 3. Claude `claude auth status` + local session token scan */
+    if (tracker->claude_fetch && simple_fetch_poll(tracker->claude_fetch)) {
+        mcode_simple_fetch *f = tracker->claude_fetch;
+        mcode_provider_quota *dst = &tracker->quotas[APP_AGENT_CLAUDE];
+        dst->loading = false;
+
+        mcode_provider_quota parsed;
+        memset(&parsed, 0, sizeof parsed);
+        if (f->stdout_buf.len > 0 &&
+            mcode_agent_parse_claude_auth_json(mcode_str_cstr(&f->stdout_buf),
+                                               f->stdout_buf.len, &parsed)) {
+            merge_provider_quota(dst, &parsed);
+            dst->updated_mono = mcode_now_mono();
+            dst->updated_epoch = mcode_now_epoch();
+            dst->error[0] = '\0';
+            updated = true;
+        } else if (f->timed_out && !dst->auth_checked) {
+            snprintf(dst->error, sizeof dst->error, "Timed out checking Claude status");
+            updated = true;
+        }
+
+        char today_ymd[16] = "";
+        format_local_today_ymd(today_ymd, sizeof today_ymd);
+        int64_t today_tok = 0, life_tok = 0;
+        double local_cost = 0.0;
+        scan_claude_local_usage(today_ymd, &today_tok, &life_tok, &local_cost);
+        if (today_tok != dst->account_today_tokens || life_tok != dst->account_lifetime_tokens ||
+            local_cost > dst->account_cost_usd) {
+            dst->account_today_tokens = today_tok;
+            dst->account_lifetime_tokens = life_tok;
+            if (local_cost > 0.0) dst->account_cost_usd = local_cost;
+            updated = true;
+        }
+
+        simple_fetch_destroy(f);
+        tracker->claude_fetch = NULL;
+    }
+
+    return updated;
+}
+
+void mcode_usage_tracker_free(mcode_usage_tracker *tracker) {
+    if (!tracker) return;
+    if (tracker->codex_fetch) {
+        usage_fetch_destroy(tracker->codex_fetch);
+        tracker->codex_fetch = NULL;
+    }
+    if (tracker->agy_fetch) {
+        simple_fetch_destroy(tracker->agy_fetch);
+        tracker->agy_fetch = NULL;
+    }
+    if (tracker->claude_fetch) {
+        simple_fetch_destroy(tracker->claude_fetch);
+        tracker->claude_fetch = NULL;
+    }
+    tracker->agy_refresh_pending = false;
+    for (int i = 0; i < APP_AGENT_COUNT; ++i) {
+        tracker->quotas[i].loading = false;
+    }
+}
+
 const char *mcode_agent_label(app_agent_kind kind) {
     switch (kind) {
     case APP_AGENT_CLAUDE: return "Claude Code";
@@ -3543,7 +4563,8 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
     return run;
 }
 
-bool mcode_agent_poll(mcode_agent_run *run, mcode_thread *thread, bool *out_finished) {
+bool mcode_agent_poll(mcode_agent_run *run, mcode_thread *thread,
+                      mcode_usage_tracker *usage, bool *out_finished) {
     if (out_finished) *out_finished = false;
     if (!run || !thread || thread->turn_count == 0) return false;
 
@@ -3558,7 +4579,7 @@ bool mcode_agent_poll(mcode_agent_run *run, mcode_thread *thread, bool *out_fini
     mcode_turn *turn = &thread->turns[thread->turn_count - 1];
     while (list) {
         agent_ev *next = list->next;
-        apply_event(thread, turn, list);
+        apply_event(thread, turn, usage, list);
         ev_free(list);
         list = next;
         changed = true;
@@ -4257,7 +5278,7 @@ void mcode_agent_parse_line_for_test(app_agent_kind agent, mcode_thread *thread,
     agent_ev *cur = run.head;
     while (cur) {
         agent_ev *next = cur->next;
-        apply_event(thread, turn, cur);
+        apply_event(thread, turn, NULL, cur);
         ev_free(cur);
         cur = next;
     }

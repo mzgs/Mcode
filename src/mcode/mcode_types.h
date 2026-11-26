@@ -83,14 +83,57 @@ typedef struct {
     bool running;
     bool failed;
     int vote;
-    int input_tokens;
-    int output_tokens;
+    int64_t input_tokens;
+    int64_t output_tokens;
+    int64_t cached_tokens;
+    int64_t context_tokens;
+    int64_t context_window;
     double cost_usd;
 
     mcode_block *blocks;
     int block_count;
     int block_cap;
 } mcode_turn;
+
+enum {
+    MCODE_MAX_QUOTA_GROUPS = 4,
+};
+
+typedef struct {
+    bool available;
+    int used_percent;          /* 0..100 */
+    int64_t window_mins;       /* e.g. 300 (5h), 10080 (7d) */
+    int64_t resets_at;         /* Unix epoch seconds, 0 if unknown */
+} mcode_rate_window;
+
+typedef struct {
+    char name[64];             /* e.g. "Gemini Models", "Claude and GPT models" */
+    mcode_rate_window primary;   /* rolling short window (e.g. 5h) */
+    mcode_rate_window secondary; /* rolling weekly window (e.g. 7d) */
+} mcode_quota_group;
+
+typedef struct {
+    bool available;
+    bool loading;
+    bool auth_checked;
+    bool logged_in;
+    char auth_method[32];      /* e.g. "claude.ai", "api_key", "none" */
+    char plan[48];             /* e.g. "plus", "pro", "team", "enterprise" */
+    mcode_rate_window primary;   /* rolling short window (e.g. 5h) */
+    mcode_rate_window secondary; /* rolling weekly window (e.g. 7d) */
+    mcode_quota_group groups[MCODE_MAX_QUOTA_GROUPS];
+    int group_count;
+    bool has_credits;
+    bool unlimited_credits;
+    char credits_balance[32];
+    int64_t account_today_tokens;
+    int64_t account_lifetime_tokens;
+    double account_cost_usd;
+    int current_streak_days;
+    double updated_mono;
+    int64_t updated_epoch;
+    char error[160];
+} mcode_provider_quota;
 
 typedef struct {
     char path[512];

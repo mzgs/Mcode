@@ -150,6 +150,7 @@ add_library(app_mcode STATIC
     src/mcode/mcode_ui_chat.c
     src/mcode/mcode_ui_diff.c
     src/mcode/mcode_ui_terminal.c
+    src/mcode/mcode_ui_usage.c
     src/mcode/mcode_ui_dialogs.c)
 target_include_directories(app_mcode PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src/mcode")
 target_link_libraries(app_mcode PUBLIC app_chrome cui::vterm PRIVATE app_common yyjson Threads::Threads)

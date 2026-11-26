@@ -942,6 +942,13 @@ void mcode_app_init(mcode_app *app, app_chrome *chrome) {
     app->cli_checked_at = mcode_now_mono();
     mcode_model_catalog_init(&app->models);
     mcode_model_catalog_refresh(&app->models, &app->cli_status);
+    mcode_usage_tracker_init(&app->usage);
+    app->usage_tab = 0;
+    app->usage_scope = 2; /* All */
+    if (!(chrome && chrome->env_screenshot_mode)) {
+        mcode_usage_tracker_refresh(&app->usage, &app->cli_status, false);
+        app->usage_checked_at = mcode_now_mono();
+    }
     if (app->store.project_count == 0) {
         mcode_ui_refresh_discovered_repos(app);
     }
@@ -949,6 +956,7 @@ void mcode_app_init(mcode_app *app, app_chrome *chrome) {
 
 void mcode_app_shutdown(mcode_app *app) {
     if (!app) return;
+    mcode_usage_tracker_free(&app->usage);
     mcode_model_catalog_free(&app->models);
     if (app->clone_proc) {
         mcode_proc_destroy(app->clone_proc);
@@ -1013,7 +1021,7 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
         }
         if (!t->active_run) continue;
         bool finished = false;
-        (void)mcode_agent_poll(t->active_run, t, &finished);
+        (void)mcode_agent_poll(t->active_run, t, &app->usage, &finished);
         if (finished) {
             mcode_agent_destroy(t->active_run);
             t->active_run = NULL;
@@ -1021,6 +1029,10 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
                 mcode_ui_refresh_workspace_git(app);
             } else {
                 mcode_ui_refresh_thread_diff(t);
+            }
+            if (!(app->chrome && app->chrome->env_screenshot_mode)) {
+                mcode_usage_tracker_refresh_agent(&app->usage, &app->cli_status, t->agent, false);
+                app->usage_checked_at = mcode_now_mono();
             }
             mcode_ui_mark_dirty(app);
             any_finished = true;
@@ -1096,13 +1108,15 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
     }
 
     bool catalog_updated = mcode_model_catalog_poll(&app->models);
+    bool usage_updated = mcode_usage_tracker_poll(&app->usage, &app->cli_status, agy_busy);
     if (term_dirty) {
         cui_request_redraw(ui);
     } else if (running > 0 || clone_active || term_visible_running) {
         cui_request_wakeup(ui, 0.033f);
-    } else if (title_running > 0 || app->models.loading_agy) {
+    } else if (title_running > 0 || app->models.loading_agy ||
+               mcode_usage_tracker_is_loading(&app->usage)) {
         cui_request_wakeup(ui, 0.1f);
-    } else if (any_finished || catalog_updated) {
+    } else if (any_finished || catalog_updated || usage_updated) {
         cui_request_redraw(ui);
     }
 
@@ -1121,17 +1135,41 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
                                                app->preview_rel_path);
                 }
             }
+            if ((now - app->usage_checked_at) >= 60.0) {
+                mcode_usage_tracker_refresh(&app->usage, &app->cli_status, agy_busy);
+                app->usage_checked_at = now;
+            }
         }
     }
 
     /* Refresh CLI availability periodically when settings dialog closes or every 30s */
     if (now - app->cli_checked_at > 30.0) {
+        bool had_claude = app->cli_status.available[APP_AGENT_CLAUDE];
+        bool had_codex = app->cli_status.available[APP_AGENT_CODEX];
         bool had_agy = app->cli_status.available[APP_AGENT_AGY];
         mcode_agent_detect_clis(app_chrome_settings(app->chrome), &app->cli_status);
         app->cli_checked_at = now;
         if (app->cli_status.available[APP_AGENT_AGY] && (!had_agy || !app->models.loaded_agy)) {
             mcode_model_catalog_refresh(&app->models, &app->cli_status);
         }
+        if (!(app->chrome && app->chrome->env_screenshot_mode)) {
+            if (app->cli_status.available[APP_AGENT_CLAUDE] && !had_claude) {
+                mcode_usage_tracker_refresh_agent(&app->usage, &app->cli_status, APP_AGENT_CLAUDE, agy_busy);
+            }
+            if (app->cli_status.available[APP_AGENT_CODEX] && !had_codex) {
+                mcode_usage_tracker_refresh_agent(&app->usage, &app->cli_status, APP_AGENT_CODEX, agy_busy);
+            }
+            if (app->cli_status.available[APP_AGENT_AGY] && !had_agy) {
+                mcode_usage_tracker_refresh_agent(&app->usage, &app->cli_status, APP_AGENT_AGY, agy_busy);
+            }
+        }
+    }
+
+    /* Refresh provider usage quotas periodically (every 5 minutes) */
+    if (!(app->chrome && app->chrome->env_screenshot_mode) &&
+        (now - app->usage_checked_at) >= 300.0) {
+        mcode_usage_tracker_refresh(&app->usage, &app->cli_status, agy_busy);
+        app->usage_checked_at = now;
     }
 
     /* Debounced atomic save of workspace state */
@@ -1145,28 +1183,7 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
 
 static void draw_status_bar(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int running_count) {
     cui_status_bar(ui, "mcode-status") {
-        if (thread) {
-            if (thread->branch[0]) {
-                char br[160];
-                snprintf(br, sizeof br, "%s###sb-branch", thread->branch);
-                if (cui_status_bar_item(ui, br, .icon = CUI_ICON_GIT_BRANCH,
-                                        .tooltip = "Repository branch")) {
-                    mcode_ui_refresh_thread_diff(thread);
-                }
-            }
-            if (thread->workdir[0]) {
-                char wd[MCODE_PATH_MAX + 16];
-                snprintf(wd, sizeof wd, "%s###sb-dir", thread->workdir);
-                if (cui_status_bar_item(ui, wd, .icon = CUI_ICON_FOLDER,
-                                        .tooltip = "Open folder in Finder")) {
-                    if (!cui_app_open_url(thread->workdir)) {
-                        app_chrome_notify(app->chrome, ui, "Could not open folder.", CUI_TONE_DANGER);
-                    }
-                }
-            }
-        } else {
-            cui_status_bar_text(ui, "No active thread", .icon = CUI_ICON_INBOX);
-        }
+        mcode_ui_draw_status_usage(app, ui, thread);
 
         cui_status_bar_spacer(ui);
 
@@ -1174,21 +1191,6 @@ static void draw_status_bar(mcode_app *app, cui_ctx *ui, mcode_thread *thread, i
             char run_buf[48];
             snprintf(run_buf, sizeof run_buf, "%d running###sb-run", running_count);
             cui_status_bar_text(ui, run_buf, .icon = CUI_ICON_ACTIVITY, .tone = CUI_TONE_INFO);
-        }
-
-        /* CLI readiness indicators */
-        for (int i = 0; i < APP_AGENT_COUNT; ++i) {
-            char lbl[48];
-            snprintf(lbl, sizeof lbl, "%s###cli-%d", mcode_agent_short_label((app_agent_kind)i), i);
-            cui_tone tone = app->cli_status.available[i] ? CUI_TONE_SUCCESS : CUI_TONE_NEUTRAL;
-            const char *icon = app->cli_status.available[i] ? CUI_ICON_CIRCLE_CHECK : CUI_ICON_CIRCLE_X;
-            if (cui_status_bar_item(ui, lbl, .icon = icon, .tone = tone,
-                                    .tooltip = app->cli_status.available[i]
-                                        ? app->cli_status.resolved_path[i]
-                                        : "Not detected (configure in Settings)")) {
-                app->chrome->settings_open = true;
-                app->chrome->settings_section = SETTINGS_SECTION_GENERAL;
-            }
         }
     }
 }
@@ -1918,9 +1920,37 @@ static void on_palette_run_quick_action(cui_ctx *ui, void *user) {
     mcode_ui_run_terminal_cmd(pt->app, ui, p->actions[pt->index].command, cwd);
 }
 
+static void on_palette_refresh_usage(cui_ctx *ui, void *user) {
+    mcode_app *app = (mcode_app *)user;
+    if (!app) return;
+    bool agy_busy = false;
+    for (int i = 0; i < app->store.thread_count; ++i) {
+        const mcode_thread *t = &app->store.threads[i];
+        if (t->agent == APP_AGENT_AGY && (t->active_run || t->title_run)) {
+            agy_busy = true;
+            break;
+        }
+    }
+    mcode_usage_tracker_refresh(&app->usage, &app->cli_status, agy_busy);
+    app->usage_checked_at = mcode_now_mono();
+    if (ui) app_chrome_notify(app->chrome, ui, "Refreshing usage limits...", CUI_TONE_INFO);
+}
+
 void mcode_app_palette_provider(app_palette_builder *builder, void *user) {
     mcode_app *app = (mcode_app *)user;
     if (!app) return;
+
+    if (app->cli_status.available[APP_AGENT_CLAUDE] ||
+        app->cli_status.available[APP_AGENT_CODEX] ||
+        app->cli_status.available[APP_AGENT_AGY]) {
+        app_palette_add(builder, &(app_palette_command){
+            .title = "Refresh Usage & Rate Limits",
+            .icon = CUI_ICON_CHART_BAR,
+            .group = "Usage",
+            .on_trigger = on_palette_refresh_usage,
+            .user = app,
+        });
+    }
 
     app_palette_add(builder, &(app_palette_command){
         .title = "Create New Project...",

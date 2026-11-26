@@ -45,6 +45,10 @@ typedef struct {
     mcode_cli_status cli_status;
     double cli_checked_at;
     mcode_model_catalog models;
+    mcode_usage_tracker usage;
+    double usage_checked_at;
+    int usage_tab;   /* 0 = Limits, 1 = Activity */
+    int usage_scope; /* 0 = Today, 1 = 7d, 2 = All */
 
     /* Model picker popover state */
     char model_search[128];

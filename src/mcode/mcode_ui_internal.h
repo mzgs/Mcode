@@ -55,6 +55,9 @@ void mcode_ui_draw_workspace_main(mcode_app *app, cui_ctx *ui, mcode_thread *thr
 void mcode_ui_draw_diff(mcode_app *app, cui_ctx *ui, mcode_thread *thread);
 void mcode_ui_draw_file_context_menu(mcode_app *app, cui_ctx *ui);
 void mcode_ui_draw_terminal(mcode_app *app, cui_ctx *ui, mcode_thread *thread);
+void mcode_ui_draw_status_usage(mcode_app *app, cui_ctx *ui, mcode_thread *thread);
+void mcode_ui_draw_composer_usage_ring(mcode_app *app, cui_ctx *ui, const mcode_thread *thread,
+                                       cui_placement hover_placement);
 void mcode_ui_draw_dialogs(mcode_app *app, cui_ctx *ui);
 
 #endif

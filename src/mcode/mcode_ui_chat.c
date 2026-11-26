@@ -856,8 +856,10 @@ static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int tur
                     pos += snprintf(meta + pos, sizeof meta - (size_t)pos, "Worked for %s", dur);
                 }
                 if (turn->input_tokens > 0 || turn->output_tokens > 0) {
-                    pos += snprintf(meta + pos, sizeof meta - (size_t)pos, "%s%d in / %d out",
-                                    pos > 0 ? " · " : "", turn->input_tokens, turn->output_tokens);
+                    pos += snprintf(meta + pos, sizeof meta - (size_t)pos, "%s%lld in / %lld out",
+                                    pos > 0 ? " · " : "",
+                                    (long long)turn->input_tokens,
+                                    (long long)turn->output_tokens);
                     if (turn->cost_usd > 0.0 && (size_t)pos < sizeof meta) {
                         snprintf(meta + pos, sizeof meta - (size_t)pos, " · $%.4f", turn->cost_usd);
                     }
@@ -1680,6 +1682,10 @@ static void draw_thread_composer(mcode_app *app, cui_ctx *ui, mcode_thread *thre
                 .gap = 4, .align = CUI_ALIGN_CENTER, .clip = true) {
             draw_thread_model_selector(app, ui, thread, busy, pop_place);
             draw_thread_permission_selector(app, ui, thread, busy, pop_place);
+            cui_spacer(ui);
+            mcode_ui_draw_composer_usage_ring(
+                app, ui, thread,
+                centered ? CUI_PLACE_BOTTOM_END : CUI_PLACE_TOP_END);
         }
     }
 

@@ -27,9 +27,20 @@ typedef struct {
     int effort_count;
     bool supports_fast;
     char fast_desc[96];
+    int64_t context_window;
 } mcode_model_option;
 
 typedef struct mcode_model_fetch mcode_model_fetch;
+typedef struct mcode_usage_fetch mcode_usage_fetch;
+typedef struct mcode_simple_fetch mcode_simple_fetch;
+
+typedef struct {
+    mcode_provider_quota quotas[APP_AGENT_COUNT];
+    mcode_usage_fetch *codex_fetch;
+    mcode_simple_fetch *agy_fetch;
+    mcode_simple_fetch *claude_fetch;
+    bool agy_refresh_pending;
+} mcode_usage_tracker;
 
 typedef struct {
     mcode_model_option items[APP_AGENT_COUNT][MCODE_MAX_MODELS_PER_AGENT];
@@ -77,8 +88,33 @@ bool mcode_model_supports_fast(const mcode_model_catalog *cat, const mcode_threa
                                const app_settings *settings, const char **out_desc);
 /* Resolved fast-mode state for `thread` (explicit override, else CLI default). */
 bool mcode_thread_is_fast_mode(const mcode_model_catalog *cat, const mcode_thread *thread);
+/* Effective model context window in tokens (0 if unknown). */
+int64_t mcode_model_context_window(const mcode_model_catalog *cat, const mcode_thread *thread,
+                                   const app_settings *settings);
+
+/* Live provider quota / account usage tracker (asynchronous Codex app-server RPC,
+ * Antigravity `agy -p /usage --output-format json`, Claude `claude auth status` +
+ * local session logs, plus real-time rate-limit events from active streams). */
+void mcode_usage_tracker_init(mcode_usage_tracker *tracker);
+void mcode_usage_tracker_refresh(mcode_usage_tracker *tracker, const mcode_cli_status *clis,
+                                 bool agy_busy);
+void mcode_usage_tracker_refresh_agent(mcode_usage_tracker *tracker, const mcode_cli_status *clis,
+                                       app_agent_kind agent, bool agy_busy);
+bool mcode_usage_tracker_is_loading(const mcode_usage_tracker *tracker);
+bool mcode_usage_tracker_poll(mcode_usage_tracker *tracker, const mcode_cli_status *clis,
+                              bool agy_busy);
+void mcode_usage_tracker_free(mcode_usage_tracker *tracker);
 
 /* Pure parsers exposed for unit tests. */
+bool mcode_agent_parse_codex_rate_limits_json(const char *json, size_t len,
+                                              mcode_provider_quota *out);
+bool mcode_agent_parse_codex_account_usage_json(const char *json, size_t len,
+                                                const char *today_ymd,
+                                                mcode_provider_quota *out);
+bool mcode_agent_parse_agy_usage_json(const char *json, size_t len,
+                                      mcode_provider_quota *out);
+bool mcode_agent_parse_claude_auth_json(const char *json, size_t len,
+                                        mcode_provider_quota *out);
 int mcode_agent_parse_codex_models_json(const char *json, size_t len,
                                         mcode_model_option *out, int max_out);
 int mcode_agent_parse_agy_models_text(const char *text,
@@ -103,9 +139,11 @@ mcode_agent_run *mcode_agent_start(mcode_thread *thread, const app_settings *set
 
 /* Poll queued streaming events from `run` into `thread` on the UI thread.
  * Returns true if any new state arrived (or the run completed).
+ * If `usage` is non-NULL, live provider rate-limit events are merged into it.
  * When *out_finished is set to true, caller should call mcode_agent_destroy(run)
  * and clear thread->active_run. */
-bool mcode_agent_poll(mcode_agent_run *run, mcode_thread *thread, bool *out_finished);
+bool mcode_agent_poll(mcode_agent_run *run, mcode_thread *thread,
+                      mcode_usage_tracker *usage, bool *out_finished);
 
 /* Request stopping an active agent run. */
 void mcode_agent_stop(mcode_agent_run *run);
