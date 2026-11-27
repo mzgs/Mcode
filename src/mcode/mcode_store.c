@@ -9,6 +9,7 @@
 #include <yyjson.h>
 
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -435,6 +436,18 @@ bool mcode_store_load(mcode_store *store, const char *path) {
             t->created_at = (int64_t)jnum_or(tv, "created_at", 0);
             t->updated_at = (int64_t)jnum_or(tv, "updated_at", 0);
             t->selected_diff_file = -1;
+            yyjson_val *sy_val = yyjson_obj_get(tv, "scroll_y");
+            if (yyjson_is_num(sy_val)) {
+                double sy = yyjson_get_num(sy_val);
+                if (isfinite(sy) && sy >= 0.0) {
+                    t->scroll_y = (float)sy;
+                    t->has_scroll_y = true;
+                }
+            }
+            t->scroll_at_bottom = jbool_or(tv, "scroll_at_bottom", false);
+            if (t->scroll_at_bottom) {
+                t->has_scroll_y = true;
+            }
 
             yyjson_val *turns = yyjson_obj_get(tv, "turns");
             if (yyjson_is_arr(turns)) {
@@ -612,6 +625,12 @@ bool mcode_store_save(const mcode_store *store, const char *path) {
         yyjson_mut_obj_add_int(doc, to, "state", (int)t->state);
         yyjson_mut_obj_add_sint(doc, to, "created_at", t->created_at);
         yyjson_mut_obj_add_sint(doc, to, "updated_at", t->updated_at);
+        if (t->has_scroll_y && isfinite(t->scroll_y) && t->scroll_y >= 0.0f) {
+            yyjson_mut_obj_add_real(doc, to, "scroll_y", (double)t->scroll_y);
+            if (t->scroll_at_bottom) {
+                yyjson_mut_obj_add_bool(doc, to, "scroll_at_bottom", true);
+            }
+        }
 
         yyjson_mut_val *turns = yyjson_mut_arr(doc);
         for (int ti = 0; ti < t->turn_count; ++ti) {

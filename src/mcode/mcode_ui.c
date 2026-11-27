@@ -2453,6 +2453,7 @@ void mcode_app_frame(mcode_app *app, cui_ctx *ui) {
     if (!app || !ui) return;
     int running_count = 0;
     poll_background_work(app, ui, &running_count);
+    mcode_ui_keep_thread_scrolls_alive(app, ui);
 
     mcode_thread *thread = mcode_store_selected_thread(&app->store);
 

@@ -1,5 +1,6 @@
 #include "mcode_ui_internal.h"
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -705,7 +706,8 @@ static void draw_user_message(cui_ctx *ui, const char *thread_id, const char *te
     cui_pop_id(ui);
 }
 
-static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int turn_idx) {
+static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int turn_idx,
+                      float fallback_md_w) {
     mcode_turn *turn = &thread->turns[turn_idx];
     bool is_last_turn = (turn_idx == thread->turn_count - 1);
     cui_push_id_int(ui, turn_idx);
@@ -764,9 +766,18 @@ static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int tur
                 if (txt[0]) {
                     last_text = txt;
                     bool streaming = turn->running && (bi == turn->block_count - 1);
+                    cui_id md_id = cui_make_id(ui, bid);
+                    bool has_md_rect = cui_get_rect(ui, md_id).w > 0.0f;
+                    cui_size md_width = (!has_md_rect && fallback_md_w > 0.0f)
+                        ? CUI_PX(fallback_md_w)
+                        : CUI_FILL;
                     cui_markdown_result mr = cui_markdown(ui, bid, txt,
                                                           .length = (int)b->text.len,
+                                                          .width = md_width,
                                                           .streaming = streaming);
+                    if (!has_md_rect && fallback_md_w > 0.0f) {
+                        cui_request_redraw(ui);
+                    }
                     if (mr.link && mr.link[0]) {
                         open_markdown_link(app, ui, thread, mr.link);
                     }
@@ -2140,14 +2151,35 @@ static void draw_thread_composer(mcode_app *app, cui_ctx *ui, mcode_thread *thre
     }
 }
 
+#define MCODE_CHAT_SCROLL_PAD 16.0f
+#define MCODE_CHAT_COL_MAX_W  860.0f
+
+void mcode_ui_keep_thread_scrolls_alive(mcode_app *app, cui_ctx *ui) {
+    if (!app || !ui) return;
+    for (int i = 0; i < app->store.thread_count; ++i) {
+        const mcode_thread *t = &app->store.threads[i];
+        if (!t->scroll_ui_ready || !t->id[0]) continue;
+        cui_push_id(ui, "thread-transcript");
+        cui_push_id(ui, t->id);
+        cui_id scroll_id = cui_make_id(ui, "chat-transcript");
+        cui_id content_id = cui_make_id(ui, "chat-transcript-content");
+        (void)cui_state(ui, scroll_id, 0);
+        (void)cui_state(ui, content_id, 0);
+        cui_pop_id(ui);
+        cui_pop_id(ui);
+    }
+}
+
 void mcode_ui_draw_chat(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
     if (!thread) {
+        app->last_chat_scroll_thread_id[0] = '\0';
         draw_empty_workspace(app, ui);
         return;
     }
 
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0) {
         if (thread->turn_count == 0) {
+            app->last_chat_scroll_thread_id[0] = '\0';
             const char *proj_name = thread_project_display_name(app, thread);
             char hero_title[MCODE_NAME_MAX + 64];
             if (proj_name && proj_name[0]) {
@@ -2175,22 +2207,165 @@ void mcode_ui_draw_chat(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
                 }
             }
         } else {
+            cui_push_id(ui, "thread-transcript");
+            cui_push_id(ui, thread->id);
+
+            cui_id scroll_id = cui_make_id(ui, "chat-transcript");
+            cui_id content_id = cui_make_id(ui, "chat-transcript-content");
+            cui_rect view_r = cui_get_rect(ui, scroll_id);
+            cui_rect content_r = cui_get_rect(ui, content_id);
+            bool has_layout = (view_r.h > 0.0f && content_r.h > 0.0f);
+
+            uint64_t cur_frame = cui_frame_count(ui);
+            bool reentering = (strcmp(app->last_chat_scroll_thread_id, thread->id) != 0 ||
+                               app->last_chat_scroll_frame + 1 != cur_frame);
+            if (view_r.w > 2.0f * MCODE_CHAT_SCROLL_PAD) {
+                if (app->last_chat_view_w > 0.0f &&
+                    fabsf(view_r.w - app->last_chat_view_w) > 1.0f) {
+                    cui_request_redraw(ui);
+                }
+                app->last_chat_view_w = view_r.w;
+            }
+            float ref_view_w = (view_r.w > 2.0f * MCODE_CHAT_SCROLL_PAD)
+                ? view_r.w
+                : app->last_chat_view_w;
+            float fallback_md_w = 0.0f;
+            if (ref_view_w > 2.0f * MCODE_CHAT_SCROLL_PAD) {
+                fallback_md_w = ref_view_w - 2.0f * MCODE_CHAT_SCROLL_PAD;
+                if (fallback_md_w > MCODE_CHAT_COL_MAX_W) fallback_md_w = MCODE_CHAT_COL_MAX_W;
+                if (fallback_md_w < 120.0f) fallback_md_w = 0.0f;
+            }
+
+            /* Detect manual wheel or scrollbar interaction before cui_scroll consumes input */
+            cui_vec2 mp = cui_mouse_pos(ui);
+            cui_vec2 wheel = cui_scroll_delta(ui);
+            bool mouse_in_view = has_layout &&
+                mp.x >= view_r.x && mp.x <= view_r.x + view_r.w &&
+                mp.y >= view_r.y && mp.y <= view_r.y + view_r.h;
+            bool mouse_on_bar = mouse_in_view &&
+                mp.x >= view_r.x + view_r.w - 14.0f &&
+                (cui_mouse_clicked(ui, CUI_MOUSE_LEFT) || cui_mouse_down(ui, CUI_MOUSE_LEFT));
+            bool user_scrolled = !reentering &&
+                ((mouse_in_view && wheel.y != 0.0f) || mouse_on_bar);
+            if (user_scrolled) {
+                thread->scroll_restore_pending = false;
+                thread->scroll_restore_frames = 0;
+                thread->scroll_restore_settled = 0;
+            }
+
+            /* Restore persisted scroll state on first render of a thread (e.g. after app launch),
+             * or re-pin to bottom if the viewport resized while viewing a file or another thread. */
+            if (!user_scrolled && thread->scroll_to_bottom_frames == 0 && thread->has_scroll_y) {
+                bool need_init_restore = (!thread->scroll_ui_ready || !has_layout) &&
+                    (thread->scroll_at_bottom || thread->scroll_y > 0.5f);
+                bool need_bottom_resync = reentering && thread->scroll_at_bottom;
+                if (need_init_restore || need_bottom_resync) {
+                    thread->scroll_restore_pending = true;
+                    thread->scroll_restore_frames = 180;
+                    thread->scroll_restore_settled = 0;
+                }
+            }
+
             /* Scrollable transcript */
             cui_scroll(ui, .id = "chat-transcript", .width = CUI_FILL, .height = CUI_FILL,
-                       .pad = 16, .gap = 16, .fade_edges = true) {
-                cui_row(ui, .width = CUI_FILL, .justify = CUI_JUSTIFY_CENTER) {
-                    cui_column(ui, .width = CUI_FILL, .max_width = 860, .gap = 18) {
+                       .pad = MCODE_CHAT_SCROLL_PAD, .gap = 16, .fade_edges = true) {
+                cui_row(ui, .id = "chat-transcript-content", .width = CUI_FILL,
+                        .justify = CUI_JUSTIFY_CENTER) {
+                    cui_column(ui, .width = CUI_FILL, .max_width = MCODE_CHAT_COL_MAX_W, .gap = 18) {
                         for (int i = 0; i < thread->turn_count; ++i) {
-                            draw_turn(app, ui, thread, i);
+                            draw_turn(app, ui, thread, i, fallback_md_w);
                         }
                     }
                 }
             }
+            thread->scroll_ui_ready = true;
+
             if (thread->scroll_to_bottom_frames > 0) {
+                thread->scroll_restore_pending = false;
+                thread->scroll_restore_frames = 0;
+                thread->scroll_restore_settled = 0;
+                thread->has_scroll_y = true;
+                thread->scroll_at_bottom = true;
                 cui_scroll_to(ui, "chat-transcript", 1e9f);
                 thread->scroll_to_bottom_frames--;
-                if (thread->scroll_to_bottom_frames > 0) cui_request_redraw(ui);
+                if (thread->scroll_to_bottom_frames > 0) {
+                    cui_request_redraw(ui);
+                } else {
+                    thread->scroll_restore_pending = true;
+                    thread->scroll_restore_frames = 180;
+                    thread->scroll_restore_settled = 0;
+                    cui_request_redraw(ui);
+                }
+            } else if (thread->scroll_restore_pending) {
+                float target = thread->scroll_at_bottom ? 1e9f : thread->scroll_y;
+                if (target < 0.0f) target = 0.0f;
+                cui_scroll_to(ui, "chat-transcript", target);
+                if (has_layout) {
+                    float measured_y = (view_r.y + MCODE_CHAT_SCROLL_PAD) - content_r.y;
+                    if (measured_y < 0.0f) measured_y = 0.0f;
+                    float max_y = (content_r.h + 2.0f * MCODE_CHAT_SCROLL_PAD) - view_r.h;
+                    if (max_y < 0.0f) max_y = 0.0f;
+                    float clamped_target = thread->scroll_at_bottom
+                        ? max_y
+                        : (target > max_y ? max_y : target);
+                    thread->scroll_restore_settled++;
+                    if (thread->scroll_restore_settled >= 2 &&
+                        fabsf(measured_y - clamped_target) <= 1.5f) {
+                        bool at_bottom = (max_y > 0.5f && clamped_target >= max_y - 2.0f);
+                        bool changed = (fabsf(clamped_target - thread->scroll_y) >= 1.0f ||
+                                        at_bottom != thread->scroll_at_bottom);
+                        thread->scroll_y = clamped_target;
+                        thread->scroll_at_bottom = at_bottom;
+                        thread->has_scroll_y = true;
+                        thread->scroll_restore_pending = false;
+                        thread->scroll_restore_frames = 0;
+                        thread->scroll_restore_settled = 0;
+                        if (changed && !thread->is_draft) {
+                            mcode_ui_mark_dirty(app);
+                        }
+                    } else if (--thread->scroll_restore_frames <= 0) {
+                        thread->scroll_restore_pending = false;
+                        thread->scroll_restore_frames = 0;
+                        thread->scroll_restore_settled = 0;
+                    } else {
+                        cui_request_redraw(ui);
+                    }
+                } else {
+                    thread->scroll_restore_settled = 0;
+                    if (--thread->scroll_restore_frames <= 0) {
+                        thread->scroll_restore_pending = false;
+                        thread->scroll_restore_frames = 0;
+                    } else {
+                        cui_request_redraw(ui);
+                    }
+                }
+            } else if (has_layout) {
+                float measured_y = (view_r.y + MCODE_CHAT_SCROLL_PAD) - content_r.y;
+                if (measured_y < 0.0f) measured_y = 0.0f;
+                float max_y = (content_r.h + 2.0f * MCODE_CHAT_SCROLL_PAD) - view_r.h;
+                if (max_y < 0.0f) max_y = 0.0f;
+                if (measured_y > max_y) measured_y = max_y;
+                bool at_bottom = (max_y > 0.5f && measured_y >= max_y - 2.0f);
+                if (user_scrolled && wheel.y > 0.0f) {
+                    at_bottom = false;
+                }
+                bool changed = (!thread->has_scroll_y ||
+                                fabsf(measured_y - thread->scroll_y) >= 1.0f ||
+                                at_bottom != thread->scroll_at_bottom);
+                thread->scroll_y = measured_y;
+                thread->scroll_at_bottom = at_bottom;
+                thread->has_scroll_y = true;
+                if (changed && !thread->is_draft) {
+                    mcode_ui_mark_dirty(app);
+                }
             }
+
+            snprintf(app->last_chat_scroll_thread_id, sizeof app->last_chat_scroll_thread_id,
+                     "%s", thread->id);
+            app->last_chat_scroll_frame = cur_frame;
+
+            cui_pop_id(ui);
+            cui_pop_id(ui);
 
             /* Composer dock */
             cui_row(ui, .width = CUI_FILL, .justify = CUI_JUSTIFY_CENTER, .pad_x = 16, .pad_y = 12) {

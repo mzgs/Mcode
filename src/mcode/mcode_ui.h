@@ -79,6 +79,11 @@ typedef struct {
     int nav_count;
     int nav_index;
 
+    /* Active chat transcript scroll tracking (prevents GC/switch resets) */
+    char last_chat_scroll_thread_id[MCODE_ID_MAX];
+    uint64_t last_chat_scroll_frame;
+    float last_chat_view_w;
+
     /* Integrated titlebar double-click tracking */
     double titlebar_last_click_at;
 

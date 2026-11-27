@@ -258,7 +258,18 @@ typedef struct {
     int diff_change_idx;
 
     char composer_draft[MCODE_COMPOSER_MAX];
+
+    /* Persisted transcript scroll state */
+    float scroll_y;
+    bool has_scroll_y;
+    bool scroll_at_bottom;
+
+    /* Live transcript scroll control (not persisted) */
     int scroll_to_bottom_frames;
+    bool scroll_ui_ready;
+    bool scroll_restore_pending;
+    int scroll_restore_frames;
+    int scroll_restore_settled;
 } mcode_thread;
 
 /* Monotonic clock in seconds. */

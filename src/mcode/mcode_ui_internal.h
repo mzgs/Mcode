@@ -84,6 +84,7 @@ void mcode_ui_draw_provider_icon(mcode_app *app, cui_ctx *ui, app_agent_kind age
 
 /* Panel renderers */
 void mcode_ui_draw_sidebar(mcode_app *app, cui_ctx *ui);
+void mcode_ui_keep_thread_scrolls_alive(mcode_app *app, cui_ctx *ui);
 void mcode_ui_draw_chat(mcode_app *app, cui_ctx *ui, mcode_thread *thread);
 void mcode_ui_draw_workspace_main(mcode_app *app, cui_ctx *ui, mcode_thread *thread);
 void mcode_ui_draw_diff(mcode_app *app, cui_ctx *ui, mcode_thread *thread);
