@@ -1096,15 +1096,8 @@ static void draw_source_control_lists(mcode_app *app, cui_ctx *ui,
                                              "Changes", unstaged_count,
                                              &app->store.changes_expanded, false, true);
                 }
-                if (app->store.changes_expanded) {
-                    if (unstaged_count > 0) {
-                        (void)draw_change_file_rows(app, ui, workdir, false);
-                    } else if (staged_count == 0) {
-                        cui_column(ui, .width = CUI_FILL, .pad_x = 12, .pad_y = 8) {
-                            cui_text(ui, "Working tree clean", .size = 13.0f,
-                                     .color = CUI_COLOR_TEXT_MUTED);
-                        }
-                    }
+                if (app->store.changes_expanded && unstaged_count > 0) {
+                    (void)draw_change_file_rows(app, ui, workdir, false);
                 }
             }
         }
