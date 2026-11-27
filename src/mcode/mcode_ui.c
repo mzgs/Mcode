@@ -218,6 +218,9 @@ void mcode_ui_refresh_workspace_git(mcode_app *app) {
 
     if (!root || !root[0]) {
         app->git_workdir[0] = '\0';
+        if (app->commit_gen_run && app->commit_gen_target == MCODE_COMMIT_GEN_SIDEBAR) {
+            mcode_ui_cancel_commit_msg_gen(app);
+        }
         free(app->git_files);
         app->git_files = NULL;
         app->git_file_count = 0;
@@ -227,6 +230,11 @@ void mcode_ui_refresh_workspace_git(mcode_app *app) {
         mcode_ui_load_workspace_diff(app);
         mcode_file_tree_clear(&app->file_tree);
         return;
+    }
+
+    if (app->commit_gen_run && app->commit_gen_target == MCODE_COMMIT_GEN_SIDEBAR &&
+        strcmp(app->commit_gen_workdir, root) != 0) {
+        mcode_ui_cancel_commit_msg_gen(app);
     }
 
     snprintf(app->git_workdir, sizeof app->git_workdir, "%s", root);
@@ -1129,6 +1137,9 @@ void mcode_app_shutdown(mcode_app *app) {
     if (app->clone_proc) {
         mcode_proc_stop(app->clone_proc);
     }
+    if (app->commit_gen_run) {
+        mcode_agent_commit_msg_kill(app->commit_gen_run);
+    }
     for (int i = 0; i < app->store.thread_count; ++i) {
         if (app->store.threads[i].title_run) {
             mcode_agent_title_kill(app->store.threads[i].title_run);
@@ -1148,6 +1159,12 @@ void mcode_app_shutdown(mcode_app *app) {
     }
 
     /* Reap disposable read-only probes (already SIGKILLed above). */
+    if (app->commit_gen_run) {
+        mcode_agent_commit_msg_destroy(app->commit_gen_run);
+        app->commit_gen_run = NULL;
+        app->commit_gen_target = MCODE_COMMIT_GEN_NONE;
+        app->commit_gen_workdir[0] = '\0';
+    }
     mcode_usage_tracker_free(&app->usage);
     mcode_model_catalog_free(&app->models);
     mcode_cli_updates_free(&app->cli_updates);
@@ -1185,6 +1202,126 @@ void mcode_app_shutdown(mcode_app *app) {
     app->preview_text = NULL;
     app->preview_buf_cap = 0;
     pthread_mutex_destroy(&app->clone_mu);
+}
+
+void mcode_ui_cancel_commit_msg_gen(mcode_app *app) {
+    if (!app) return;
+    if (app->commit_gen_run) {
+        mcode_agent_commit_msg_stop(app->commit_gen_run);
+        mcode_agent_commit_msg_destroy(app->commit_gen_run);
+        app->commit_gen_run = NULL;
+    }
+    app->commit_gen_target = MCODE_COMMIT_GEN_NONE;
+    app->commit_gen_workdir[0] = '\0';
+    app->commit_gen_focus_target = MCODE_COMMIT_GEN_NONE;
+}
+
+bool mcode_ui_is_generating_commit_msg(const mcode_app *app, mcode_commit_gen_target target) {
+    if (!app || !app->commit_gen_run) return false;
+    if (target == MCODE_COMMIT_GEN_NONE) return true;
+    return app->commit_gen_target == target;
+}
+
+static bool any_agy_run_active(const mcode_app *app) {
+    if (!app) return false;
+    if (app->commit_gen_run && mcode_agent_commit_msg_agent(app->commit_gen_run) == APP_AGENT_AGY) {
+        return true;
+    }
+    for (int i = 0; i < app->store.thread_count; ++i) {
+        const mcode_thread *t = &app->store.threads[i];
+        if (t->agent == APP_AGENT_AGY && (t->active_run || t->title_run)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void mcode_ui_start_commit_msg_gen(mcode_app *app, cui_ctx *ui, const char *workdir,
+                                   bool staged_only, mcode_commit_gen_target target) {
+    if (!app || !workdir || !workdir[0]) return;
+    if (app->commit_gen_run) {
+        mcode_ui_cancel_commit_msg_gen(app);
+    }
+
+    char *ctx = NULL;
+    if (!mcode_git_collect_commit_context(workdir, staged_only, 8192, &ctx) || !ctx) {
+        free(ctx);
+        if (ui) {
+            app_chrome_notify(app->chrome, ui,
+                              staged_only ? "No staged changes to summarize."
+                                          : "No changes to summarize.",
+                              CUI_TONE_INFO);
+        }
+        return;
+    }
+
+    const app_settings *settings = app_chrome_settings(app->chrome);
+    const mcode_thread *sel = mcode_store_selected_thread(&app->store);
+    bool agy_busy = any_agy_run_active(app);
+
+    app_agent_kind order[APP_AGENT_COUNT];
+    int order_count = 0;
+    app_agent_kind preferred = sel ? sel->agent
+                             : (settings ? settings->mcode.default_agent : APP_AGENT_CLAUDE);
+    if (preferred < 0 || preferred >= APP_AGENT_COUNT) preferred = APP_AGENT_CLAUDE;
+    order[order_count++] = preferred;
+    for (int i = 0; i < APP_AGENT_COUNT; ++i) {
+        if ((app_agent_kind)i != preferred) {
+            order[order_count++] = (app_agent_kind)i;
+        }
+    }
+
+    app_agent_kind chosen = APP_AGENT_COUNT;
+    for (int pass = 0; pass < 2 && chosen == APP_AGENT_COUNT; ++pass) {
+        if (pass == 1) {
+            mcode_agent_detect_clis(settings, &app->cli_status);
+            app->cli_checked_at = mcode_now_mono();
+        }
+        for (int i = 0; i < order_count; ++i) {
+            app_agent_kind cand = order[i];
+            if (!app->cli_status.available[cand]) continue;
+            if (cand == APP_AGENT_AGY && agy_busy) continue;
+            chosen = cand;
+            break;
+        }
+    }
+
+    if (chosen == APP_AGENT_COUNT) {
+        free(ctx);
+        if (ui) {
+            if (app->cli_status.available[APP_AGENT_AGY] && agy_busy) {
+                app_chrome_notify(app->chrome, ui,
+                                  "Antigravity CLI is busy — try again when the active turn finishes.",
+                                  CUI_TONE_WARNING);
+            } else {
+                app_chrome_notify(app->chrome, ui,
+                                  "No AI CLI found (Claude, Codex, or Antigravity) to generate a commit message.",
+                                  CUI_TONE_WARNING);
+            }
+        }
+        return;
+    }
+
+    const char *model = (sel && sel->agent == chosen)
+        ? mcode_agent_effective_model(sel, settings)
+        : mcode_agent_default_model(settings, chosen);
+
+    mcode_commit_msg_run *run = mcode_agent_start_commit_msg(chosen, model, workdir, settings, ctx);
+    free(ctx);
+    if (!run) {
+        if (ui) {
+            app_chrome_notify(app->chrome, ui,
+                              "Could not start commit message generation.",
+                              CUI_TONE_DANGER);
+        }
+        return;
+    }
+
+    app->commit_gen_run = run;
+    app->commit_gen_target = target;
+    snprintf(app->commit_gen_workdir, sizeof app->commit_gen_workdir, "%s", workdir);
+    app->commit_gen_focus_target = MCODE_COMMIT_GEN_NONE;
+    if (ui) cui_request_redraw(ui);
 }
 
 static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_count) {
@@ -1279,15 +1416,47 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
         }
     }
 
-    /* Launch at most one deferred Antigravity title request once no `agy` turn/title is active. */
-    bool agy_busy = false;
-    for (int i = 0; i < app->store.thread_count; ++i) {
-        const mcode_thread *t = &app->store.threads[i];
-        if (t->agent == APP_AGENT_AGY && (t->active_run || t->title_run)) {
-            agy_busy = true;
-            break;
+    /* Poll async commit message generation */
+    bool commit_gen_running = false;
+    if (app->commit_gen_run) {
+        char generated[512] = "";
+        bool ok = false;
+        if (mcode_agent_poll_commit_msg(app->commit_gen_run, generated, sizeof generated, &ok)) {
+            mcode_commit_gen_target target = app->commit_gen_target;
+            char gen_wd[MCODE_PATH_MAX];
+            snprintf(gen_wd, sizeof gen_wd, "%s", app->commit_gen_workdir);
+
+            mcode_agent_commit_msg_destroy(app->commit_gen_run);
+            app->commit_gen_run = NULL;
+            app->commit_gen_target = MCODE_COMMIT_GEN_NONE;
+            app->commit_gen_workdir[0] = '\0';
+            any_finished = true;
+
+            if (ok && generated[0]) {
+                if (target == MCODE_COMMIT_GEN_SIDEBAR &&
+                    strcmp(app->git_workdir, gen_wd) == 0) {
+                    snprintf(app->sidebar_commit_msg, sizeof app->sidebar_commit_msg,
+                             "%s", generated);
+                    app->commit_gen_focus_target = MCODE_COMMIT_GEN_SIDEBAR;
+                } else if (target == MCODE_COMMIT_GEN_DIALOG && app->git_dialog_open) {
+                    mcode_thread *sel = mcode_store_selected_thread(&app->store);
+                    if (sel && strcmp(sel->workdir, gen_wd) == 0) {
+                        snprintf(app->commit_msg, sizeof app->commit_msg, "%s", generated);
+                        app->commit_gen_focus_target = MCODE_COMMIT_GEN_DIALOG;
+                    }
+                }
+            } else if (ui) {
+                app_chrome_notify(app->chrome, ui,
+                                  "Could not generate commit message.",
+                                  CUI_TONE_WARNING);
+            }
+        } else {
+            commit_gen_running = true;
         }
     }
+
+    /* Launch at most one deferred Antigravity title request once no `agy` turn/title is active. */
+    bool agy_busy = any_agy_run_active(app);
     if (!agy_busy) {
         const app_settings *settings = app_chrome_settings(app->chrome);
         for (int i = 0; i < app->store.thread_count; ++i) {
@@ -1415,7 +1584,7 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
 
     if (term_dirty) {
         cui_request_redraw(ui);
-    } else if (running > 0 || clone_active || term_visible_running) {
+    } else if (running > 0 || clone_active || commit_gen_running || term_visible_running) {
         cui_request_wakeup(ui, 0.033f);
     } else if (title_running > 0 || app->models.loading_agy ||
                mcode_usage_tracker_is_loading(&app->usage) ||

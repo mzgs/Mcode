@@ -6334,10 +6334,10 @@ static void extract_content_text_blocks(yyjson_val *msg, mcode_str *dst) {
     }
 }
 
-bool mcode_agent_parse_title_response(app_agent_kind agent, const char *raw, size_t len,
-                                      char *out, size_t cap) {
-    if (!out || cap < 2) return false;
-    out[0] = '\0';
+static bool extract_one_shot_response_text(app_agent_kind agent, const char *raw, size_t len,
+                                           mcode_str *out_text) {
+    if (!out_text) return false;
+    mcode_str_clear(out_text);
     if (!raw || len == 0) return false;
 
     mcode_str extracted;
@@ -6493,15 +6493,257 @@ bool mcode_agent_parse_title_response(app_agent_kind agent, const char *raw, siz
     bool ok = false;
     if (saw_json) {
         if (extracted.len > 0 && !saw_error) {
-            ok = mcode_agent_sanitize_title(mcode_str_cstr(&extracted), out, cap);
+            mcode_str_set(out_text, mcode_str_cstr(&extracted));
+            ok = true;
         }
     } else if (plain.len > 0) {
-        ok = mcode_agent_sanitize_title(mcode_str_cstr(&plain), out, cap);
+        mcode_str_set(out_text, mcode_str_cstr(&plain));
+        ok = true;
     }
 
     mcode_str_free(&extracted);
     mcode_str_free(&plain);
     return ok;
+}
+
+bool mcode_agent_parse_title_response(app_agent_kind agent, const char *raw, size_t len,
+                                      char *out, size_t cap) {
+    if (!out || cap < 2) return false;
+    out[0] = '\0';
+    mcode_str text;
+    mcode_str_init(&text);
+    bool ok = extract_one_shot_response_text(agent, raw, len, &text) &&
+              mcode_agent_sanitize_title(mcode_str_cstr(&text), out, cap);
+    mcode_str_free(&text);
+    return ok;
+}
+
+bool mcode_agent_sanitize_commit_msg(const char *raw, char *out, size_t cap) {
+    if (!out || cap < 2) return false;
+    out[0] = '\0';
+    if (!raw || !raw[0]) return false;
+
+    static const char *const k_labels[] = {
+        "suggested commit message:",
+        "git commit message:",
+        "commit message:",
+        "message:",
+        "subject:",
+    };
+
+    char clean[512];
+    clean[0] = '\0';
+    const char *p = raw;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        size_t line_len = nl ? (size_t)(nl - p) : strlen(p);
+        while (line_len > 0 && p[line_len - 1] == '\r') --line_len;
+
+        const char *seg = p;
+        size_t seg_len = line_len;
+        for (size_t i = 0; i < line_len; ++i) {
+            if (p[i] == '\r') {
+                seg = p + i + 1;
+                seg_len = line_len - (i + 1);
+            }
+        }
+
+        char tmp[512];
+        strip_ansi_into(seg, seg_len, tmp, sizeof tmp);
+        char *s = tmp;
+        while (*s && isspace((unsigned char)*s)) ++s;
+        size_t sl = strlen(s);
+        while (sl > 0 && isspace((unsigned char)s[sl - 1])) s[--sl] = '\0';
+
+        /* Skip empty lines and markdown code-fence delimiters (``` or ~~~). */
+        if (!*s || strncmp(s, "```", 3) == 0 || strncmp(s, "~~~", 3) == 0) {
+            if (!nl) break;
+            p = nl + 1;
+            continue;
+        }
+
+        /* Skip standalone label lines like "Commit message:" with text on next line. */
+        bool label_only = false;
+        for (size_t i = 0; i < sizeof k_labels / sizeof k_labels[0]; ++i) {
+            size_t llen = strlen(k_labels[i]);
+            if (sl == llen && starts_with_icase(s, k_labels[i])) {
+                label_only = true;
+                break;
+            }
+        }
+        if (label_only) {
+            if (!nl) break;
+            p = nl + 1;
+            continue;
+        }
+
+        snprintf(clean, sizeof clean, "%s", s);
+        break;
+    }
+    if (!clean[0]) return false;
+
+    char *s = clean;
+    size_t slen = strlen(s);
+    while (slen > 0 && isspace((unsigned char)s[slen - 1])) s[--slen] = '\0';
+
+    bool stripped = true;
+    while (stripped && slen > 0) {
+        stripped = false;
+        while (slen > 0 && isspace((unsigned char)*s)) { ++s; --slen; stripped = true; }
+        if (slen > 0 && *s == '#') {
+            while (slen > 0 && *s == '#') { ++s; --slen; }
+            while (slen > 0 && isspace((unsigned char)*s)) { ++s; --slen; }
+            stripped = true;
+        } else if (slen >= 2 && (*s == '-' || *s == '*') && isspace((unsigned char)s[1])) {
+            s += 2;
+            slen -= 2;
+            stripped = true;
+        }
+        for (size_t i = 0; i < sizeof k_labels / sizeof k_labels[0]; ++i) {
+            size_t llen = strlen(k_labels[i]);
+            if (slen > llen && starts_with_icase(s, k_labels[i])) {
+                s += llen;
+                slen -= llen;
+                stripped = true;
+                break;
+            }
+        }
+        while (slen > 0 && isspace((unsigned char)s[slen - 1])) { s[--slen] = '\0'; stripped = true; }
+
+        if (slen >= 4 && s[0] == '*' && s[1] == '*' && s[slen - 2] == '*' && s[slen - 1] == '*') {
+            s += 2;
+            slen -= 4;
+            s[slen] = '\0';
+            stripped = true;
+        } else if (slen >= 2 &&
+                   ((s[0] == '"' && s[slen - 1] == '"') ||
+                    (s[0] == '\'' && s[slen - 1] == '\'') ||
+                    (s[0] == '`' && s[slen - 1] == '`') ||
+                    (s[0] == '*' && s[slen - 1] == '*') ||
+                    (s[0] == '_' && s[slen - 1] == '_'))) {
+            ++s;
+            slen -= 2;
+            s[slen] = '\0';
+            stripped = true;
+        }
+    }
+
+    /* Collapse internal whitespace and clamp to a clean single-line commit subject. */
+    size_t max_len = cap - 1;
+    if (max_len > 140) max_len = 140;
+    size_t w = 0;
+    bool prev_space = false;
+    for (size_t i = 0; i < slen && w < max_len; ++i) {
+        unsigned char ch = (unsigned char)s[i];
+        if (isspace(ch)) {
+            if (w == 0 || prev_space) continue;
+            out[w++] = ' ';
+            prev_space = true;
+        } else if (ch < 0x20 || ch == 0x7f) {
+            continue;
+        } else {
+            out[w++] = (char)ch;
+            prev_space = false;
+        }
+    }
+    if (w == max_len && w > 0) {
+        size_t tail = w;
+        while (tail > 0 && ((unsigned char)out[tail - 1] & 0xC0) == 0x80) --tail;
+        if (tail > 0) {
+            unsigned char lead = (unsigned char)out[tail - 1];
+            size_t need = 1;
+            if ((lead & 0xE0) == 0xC0) need = 2;
+            else if ((lead & 0xF0) == 0xE0) need = 3;
+            else if ((lead & 0xF8) == 0xF0) need = 4;
+            if (w - (tail - 1) < need) w = tail - 1;
+        }
+    }
+
+    /* Strip trailing period / whitespace (git commit subject convention). */
+    while (w > 0 && (isspace((unsigned char)out[w - 1]) ||
+                     out[w - 1] == '.' || out[w - 1] == ';' || out[w - 1] == ',')) {
+        --w;
+    }
+    out[w] = '\0';
+    return w >= 3;
+}
+
+bool mcode_agent_parse_commit_msg_response(app_agent_kind agent, const char *raw, size_t len,
+                                           char *out, size_t cap) {
+    if (!out || cap < 2) return false;
+    out[0] = '\0';
+    mcode_str text;
+    mcode_str_init(&text);
+    bool ok = extract_one_shot_response_text(agent, raw, len, &text) &&
+              mcode_agent_sanitize_commit_msg(mcode_str_cstr(&text), out, cap);
+    mcode_str_free(&text);
+    return ok;
+}
+
+static mcode_proc *spawn_one_shot_prompt(app_agent_kind agent, const char *bin,
+                                         const char *model, const char *workdir,
+                                         const char *prompt, const char *agy_timeout_s,
+                                         mcode_proc_bytes_fn on_bytes,
+                                         mcode_proc_exit_fn on_exit, void *user) {
+    const char *argv[24];
+    int n = 0;
+
+    if (agent == APP_AGENT_CLAUDE) {
+        argv[n++] = bin;
+        argv[n++] = "-p";
+        argv[n++] = prompt;
+        argv[n++] = "--output-format";
+        argv[n++] = "json";
+        argv[n++] = "--no-session-persistence";
+        argv[n++] = "--tools";
+        argv[n++] = "";
+        if (model && model[0]) {
+            argv[n++] = "--model";
+            argv[n++] = model;
+        }
+    } else if (agent == APP_AGENT_CODEX) {
+        argv[n++] = bin;
+        argv[n++] = "exec";
+        argv[n++] = "--json";
+        argv[n++] = "--ephemeral";
+        argv[n++] = "--skip-git-repo-check";
+        argv[n++] = "-s";
+        argv[n++] = "read-only";
+        argv[n++] = "-c";
+        argv[n++] = "model_reasoning_effort=\"low\"";
+        if (workdir && workdir[0]) {
+            argv[n++] = "--cd";
+            argv[n++] = workdir;
+        }
+        if (model && model[0]) {
+            argv[n++] = "-m";
+            argv[n++] = model;
+        }
+        argv[n++] = prompt;
+    } else { /* APP_AGENT_AGY */
+        argv[n++] = bin;
+        argv[n++] = "-p";
+        argv[n++] = prompt;
+        argv[n++] = "--output-format";
+        argv[n++] = "stream-json";
+        argv[n++] = "--disable-slash-commands";
+        argv[n++] = "--print-timeout";
+        argv[n++] = (agy_timeout_s && agy_timeout_s[0]) ? agy_timeout_s : "30s";
+        if (model && model[0]) {
+            argv[n++] = "--model";
+            argv[n++] = model;
+        }
+    }
+    argv[n] = NULL;
+
+    return mcode_proc_spawn(&(mcode_proc_desc){
+        .argv = argv,
+        .cwd = (workdir && workdir[0]) ? workdir : NULL,
+        .merge_stderr = false,
+        .on_bytes = on_bytes,
+        .on_exit = on_exit,
+        .user = user,
+    });
 }
 
 static void on_title_bytes(const char *data, size_t len, bool is_stderr, void *user) {
@@ -6549,56 +6791,6 @@ mcode_title_run *mcode_agent_start_title(const mcode_thread *thread,
 
     const char *bin = status.resolved_path[thread->agent];
     const char *model = mcode_agent_effective_model(thread, settings);
-    const char *argv[24];
-    int n = 0;
-
-    if (thread->agent == APP_AGENT_CLAUDE) {
-        argv[n++] = bin;
-        argv[n++] = "-p";
-        argv[n++] = mcode_str_cstr(&title_prompt);
-        argv[n++] = "--output-format";
-        argv[n++] = "json";
-        argv[n++] = "--no-session-persistence";
-        argv[n++] = "--tools";
-        argv[n++] = "";
-        if (model[0]) {
-            argv[n++] = "--model";
-            argv[n++] = model;
-        }
-    } else if (thread->agent == APP_AGENT_CODEX) {
-        argv[n++] = bin;
-        argv[n++] = "exec";
-        argv[n++] = "--json";
-        argv[n++] = "--ephemeral";
-        argv[n++] = "--skip-git-repo-check";
-        argv[n++] = "-s";
-        argv[n++] = "read-only";
-        argv[n++] = "-c";
-        argv[n++] = "model_reasoning_effort=\"low\"";
-        if (thread->workdir[0]) {
-            argv[n++] = "--cd";
-            argv[n++] = thread->workdir;
-        }
-        if (model[0]) {
-            argv[n++] = "-m";
-            argv[n++] = model;
-        }
-        argv[n++] = mcode_str_cstr(&title_prompt);
-    } else { /* APP_AGENT_AGY */
-        argv[n++] = bin;
-        argv[n++] = "-p";
-        argv[n++] = mcode_str_cstr(&title_prompt);
-        argv[n++] = "--output-format";
-        argv[n++] = "stream-json";
-        argv[n++] = "--disable-slash-commands";
-        argv[n++] = "--print-timeout";
-        argv[n++] = "30s";
-        if (model[0]) {
-            argv[n++] = "--model";
-            argv[n++] = model;
-        }
-    }
-    argv[n] = NULL;
 
     mcode_title_run *run = calloc(1, sizeof *run);
     if (!run) {
@@ -6610,14 +6802,9 @@ mcode_title_run *mcode_agent_start_title(const mcode_thread *thread,
     mcode_str_init(&run->stdout_buf);
     pthread_mutex_init(&run->mu, NULL);
 
-    run->proc = mcode_proc_spawn(&(mcode_proc_desc){
-        .argv = argv,
-        .cwd = thread->workdir[0] ? thread->workdir : NULL,
-        .merge_stderr = false,
-        .on_bytes = on_title_bytes,
-        .on_exit = on_title_exit,
-        .user = run,
-    });
+    run->proc = spawn_one_shot_prompt(thread->agent, bin, model, thread->workdir,
+                                      mcode_str_cstr(&title_prompt), "30s",
+                                      on_title_bytes, on_title_exit, run);
     mcode_str_free(&title_prompt);
 
     if (!run->proc) {
@@ -6682,6 +6869,154 @@ void mcode_agent_title_destroy(mcode_title_run *run) {
     mcode_str_free(&run->stdout_buf);
     pthread_mutex_destroy(&run->mu);
     free(run);
+}
+
+/* ---- Asynchronous commit message generation ---- */
+
+struct mcode_commit_msg_run {
+    app_agent_kind agent;
+    mcode_proc *proc;
+    pthread_mutex_t mu;
+    mcode_str stdout_buf;
+    double started_mono;
+    bool timed_out;
+    bool finished;
+    bool killed;
+    int exit_code;
+};
+
+static void on_commit_msg_bytes(const char *data, size_t len, bool is_stderr, void *user) {
+    if (is_stderr) return;
+    mcode_commit_msg_run *run = (mcode_commit_msg_run *)user;
+    pthread_mutex_lock(&run->mu);
+    if (run->stdout_buf.len < 64 * 1024) {
+        mcode_str_append(&run->stdout_buf, data, len);
+    }
+    pthread_mutex_unlock(&run->mu);
+}
+
+static void on_commit_msg_exit(int exit_code, bool killed, void *user) {
+    mcode_commit_msg_run *run = (mcode_commit_msg_run *)user;
+    pthread_mutex_lock(&run->mu);
+    run->exit_code = exit_code;
+    run->killed = killed;
+    run->finished = true;
+    pthread_mutex_unlock(&run->mu);
+}
+
+mcode_commit_msg_run *mcode_agent_start_commit_msg(app_agent_kind agent,
+                                                   const char *model,
+                                                   const char *workdir,
+                                                   const app_settings *settings,
+                                                   const char *diff_context) {
+    if (!diff_context || !diff_context[0]) return NULL;
+    if (agent < 0 || agent >= APP_AGENT_COUNT) agent = APP_AGENT_CLAUDE;
+
+    mcode_cli_status status;
+    mcode_agent_detect_clis(settings, &status);
+    if (!status.available[agent]) return NULL;
+
+    size_t dlen = strlen(diff_context);
+    if (dlen > 8192) {
+        dlen = 8192;
+        while (dlen > 0 && ((unsigned char)diff_context[dlen] & 0xC0) == 0x80) --dlen;
+    }
+
+    mcode_str prompt;
+    mcode_str_init(&prompt);
+    mcode_str_append_cstr(&prompt,
+        "Write a concise single-line git commit message summarizing the changes below. "
+        "Match the repository's recent commit style if shown (such as conventional commits); "
+        "otherwise use imperative mood (about 50 to 72 characters). "
+        "Reply with ONLY the commit message line: no quotes, no code fences, no markdown, "
+        "no prefixes like \"Commit message:\", no trailing period, and no explanation.\n\n");
+    mcode_str_append(&prompt, diff_context, dlen);
+
+    const char *bin = status.resolved_path[agent];
+    const char *eff_model = (model && model[0]) ? model : mcode_agent_default_model(settings, agent);
+
+    mcode_commit_msg_run *run = calloc(1, sizeof *run);
+    if (!run) {
+        mcode_str_free(&prompt);
+        return NULL;
+    }
+    run->agent = agent;
+    run->started_mono = mcode_now_mono();
+    mcode_str_init(&run->stdout_buf);
+    pthread_mutex_init(&run->mu, NULL);
+
+    run->proc = spawn_one_shot_prompt(agent, bin, eff_model, workdir,
+                                      mcode_str_cstr(&prompt), "45s",
+                                      on_commit_msg_bytes, on_commit_msg_exit, run);
+    mcode_str_free(&prompt);
+
+    if (!run->proc) {
+        mcode_str_free(&run->stdout_buf);
+        pthread_mutex_destroy(&run->mu);
+        free(run);
+        return NULL;
+    }
+
+    app_log_info("Requested commit message from %s", mcode_agent_label(agent));
+    return run;
+}
+
+bool mcode_agent_poll_commit_msg(mcode_commit_msg_run *run, char *out_msg, size_t cap,
+                                 bool *out_ok) {
+    if (out_msg && cap > 0) out_msg[0] = '\0';
+    if (out_ok) *out_ok = false;
+    if (!run) return true;
+
+    pthread_mutex_lock(&run->mu);
+    bool finished = run->finished;
+    pthread_mutex_unlock(&run->mu);
+
+    if (!finished) {
+        if (!run->timed_out && (mcode_now_mono() - run->started_mono) > 60.0) {
+            run->timed_out = true;
+            if (run->proc) mcode_proc_stop(run->proc);
+        }
+        return false;
+    }
+
+    bool ok = false;
+    if (!run->killed && run->exit_code == 0 && run->stdout_buf.len > 0) {
+        ok = mcode_agent_parse_commit_msg_response(run->agent,
+                                                   mcode_str_cstr(&run->stdout_buf),
+                                                   run->stdout_buf.len,
+                                                   out_msg, cap);
+    }
+    if (!ok && !run->killed) {
+        app_log_warn("Commit message generation via %s did not produce a message (exit=%d)",
+                     mcode_agent_label(run->agent), run->exit_code);
+    }
+    if (out_ok) *out_ok = ok;
+    return true;
+}
+
+void mcode_agent_commit_msg_stop(mcode_commit_msg_run *run) {
+    if (!run || !run->proc) return;
+    mcode_proc_stop(run->proc);
+}
+
+void mcode_agent_commit_msg_kill(mcode_commit_msg_run *run) {
+    if (!run || !run->proc) return;
+    mcode_proc_kill(run->proc);
+}
+
+void mcode_agent_commit_msg_destroy(mcode_commit_msg_run *run) {
+    if (!run) return;
+    if (run->proc) {
+        mcode_proc_destroy(run->proc);
+        run->proc = NULL;
+    }
+    mcode_str_free(&run->stdout_buf);
+    pthread_mutex_destroy(&run->mu);
+    free(run);
+}
+
+app_agent_kind mcode_agent_commit_msg_agent(const mcode_commit_msg_run *run) {
+    return run ? run->agent : APP_AGENT_CLAUDE;
 }
 
 void mcode_agent_parse_line_for_test(app_agent_kind agent, mcode_thread *thread,

@@ -970,3 +970,274 @@ bool mcode_git_create_pr(const char *workdir, const char *title, const char *bod
     }
     return true;
 }
+
+static size_t utf8_safe_prefix_len(const char *s, size_t len) {
+    while (len > 0 && ((unsigned char)s[len] & 0xC0) == 0x80) {
+        --len;
+    }
+    return len;
+}
+
+static void append_capped_section(mcode_str *dst, const char *header,
+                                  const char *body, size_t max_body,
+                                  size_t total_cap) {
+    if (!dst || !body || !body[0] || dst->len >= total_cap) return;
+    size_t hlen = header ? strlen(header) : 0;
+    if (dst->len + hlen + 16 >= total_cap) return;
+
+    if (header && hlen > 0) {
+        mcode_str_append(dst, header, hlen);
+    }
+
+    size_t avail = total_cap - dst->len;
+    size_t blen = strlen(body);
+    size_t take = blen;
+    bool truncated = false;
+    if (max_body > 0 && take > max_body) {
+        take = max_body;
+        truncated = true;
+    }
+    if (take > avail) {
+        take = avail;
+        truncated = true;
+    }
+    if (truncated) {
+        static const char k_trunc[] = "\n...[truncated]\n";
+        size_t tlen = sizeof(k_trunc) - 1;
+        if (take > tlen) {
+            take = utf8_safe_prefix_len(body, take - tlen);
+            mcode_str_append(dst, body, take);
+            mcode_str_append(dst, k_trunc, tlen);
+            return;
+        }
+        take = utf8_safe_prefix_len(body, take);
+    }
+    mcode_str_append(dst, body, take);
+    if (dst->len > 0 && dst->data[dst->len - 1] != '\n' && dst->len + 1 < total_cap) {
+        mcode_str_append(dst, "\n", 1);
+    }
+}
+
+bool mcode_git_collect_commit_context(const char *workdir, bool staged_only,
+                                      size_t max_bytes, char **out_context) {
+    if (out_context) *out_context = NULL;
+    if (!workdir || !workdir[0] || !out_context) return false;
+    if (max_bytes < 512) max_bytes = 8192;
+
+    mcode_str ctx;
+    mcode_str_init(&ctx);
+    bool has_changes = false;
+
+    int rc = -1;
+    char *out = NULL;
+
+    /* 1. Recent commit subjects for style consistency (optional, ignored on unborn HEAD). */
+    const char *argv_log[] = { "git", "log", "-n", "5", "--oneline", NULL };
+    if (mcode_proc_run_capture(argv_log, workdir, false, &rc, &out, NULL) &&
+        rc == 0 && out && out[0]) {
+        trim_trailing(out);
+        if (out[0]) {
+            append_capped_section(&ctx, "Recent commits:\n", out, 480, max_bytes);
+        }
+    }
+    free(out);
+    out = NULL;
+
+    /* 2. Changed file status and diff stat. */
+    if (staged_only) {
+        const char *argv_ns[] = { "git", "diff", "--cached", "--name-status", NULL };
+        if (mcode_proc_run_capture(argv_ns, workdir, false, &rc, &out, NULL) &&
+            rc == 0 && out && out[0]) {
+            trim_trailing(out);
+            if (out[0]) {
+                has_changes = true;
+                append_capped_section(&ctx, "\nStaged files:\n", out, 1200, max_bytes);
+            }
+        }
+        free(out);
+        out = NULL;
+
+        const char *argv_stat[] = { "git", "diff", "--cached", "--stat", NULL };
+        if (mcode_proc_run_capture(argv_stat, workdir, false, &rc, &out, NULL) &&
+            rc == 0 && out && out[0]) {
+            trim_trailing(out);
+            if (out[0]) {
+                has_changes = true;
+                append_capped_section(&ctx, "\nDiff stat:\n", out, 1200, max_bytes);
+            }
+        }
+        free(out);
+        out = NULL;
+    } else {
+        const char *argv_st[] = { "git", "status", "--short", NULL };
+        if (mcode_proc_run_capture(argv_st, workdir, false, &rc, &out, NULL) &&
+            rc == 0 && out && out[0]) {
+            trim_trailing(out);
+            if (out[0]) {
+                has_changes = true;
+                append_capped_section(&ctx, "\nChanged files:\n", out, 1200, max_bytes);
+            }
+        }
+        free(out);
+        out = NULL;
+
+        const char *argv_stat_head[] = { "git", "diff", "HEAD", "--stat", NULL };
+        if (mcode_proc_run_capture(argv_stat_head, workdir, false, &rc, &out, NULL) &&
+            rc == 0) {
+            if (out && out[0]) {
+                trim_trailing(out);
+                if (out[0]) {
+                    has_changes = true;
+                    append_capped_section(&ctx, "\nDiff stat:\n", out, 1200, max_bytes);
+                }
+            }
+            free(out);
+            out = NULL;
+        } else {
+            free(out);
+            out = NULL;
+            /* Unborn HEAD fallback */
+            const char *argv_stat_c[] = { "git", "diff", "--cached", "--stat", NULL };
+            if (mcode_proc_run_capture(argv_stat_c, workdir, false, &rc, &out, NULL) &&
+                rc == 0 && out && out[0]) {
+                trim_trailing(out);
+                if (out[0]) {
+                    has_changes = true;
+                    append_capped_section(&ctx, "\nStaged diff stat:\n", out, 800, max_bytes);
+                }
+            }
+            free(out);
+            out = NULL;
+
+            const char *argv_stat_u[] = { "git", "diff", "--stat", NULL };
+            if (mcode_proc_run_capture(argv_stat_u, workdir, false, &rc, &out, NULL) &&
+                rc == 0 && out && out[0]) {
+                trim_trailing(out);
+                if (out[0]) {
+                    has_changes = true;
+                    append_capped_section(&ctx, "\nUnstaged diff stat:\n", out, 800, max_bytes);
+                }
+            }
+            free(out);
+            out = NULL;
+        }
+    }
+
+    /* 3. Patch hunks (unified=2 for compact, informative context). */
+    size_t diff_budget = (ctx.len < max_bytes) ? (max_bytes - ctx.len) : 0;
+    if (!staged_only && diff_budget > 1536) {
+        diff_budget -= 1024; /* Leave space for new/untracked file previews */
+    }
+    if (diff_budget > 64) {
+        if (staged_only) {
+            const char *argv_diff[] = {
+                "git", "diff", "--cached", "--no-color", "--no-ext-diff", "--unified=2", NULL
+            };
+            if (mcode_proc_run_capture(argv_diff, workdir, false, &rc, &out, NULL) &&
+                rc == 0 && out && out[0]) {
+                trim_trailing(out);
+                if (out[0]) {
+                    has_changes = true;
+                    append_capped_section(&ctx, "\nDiff:\n", out, diff_budget, max_bytes);
+                }
+            }
+            free(out);
+            out = NULL;
+        } else {
+            const char *argv_diff_head[] = {
+                "git", "diff", "HEAD", "--no-color", "--no-ext-diff", "--unified=2", NULL
+            };
+            if (mcode_proc_run_capture(argv_diff_head, workdir, false, &rc, &out, NULL) &&
+                rc == 0) {
+                if (out && out[0]) {
+                    trim_trailing(out);
+                    if (out[0]) {
+                        has_changes = true;
+                        append_capped_section(&ctx, "\nDiff:\n", out, diff_budget, max_bytes);
+                    }
+                }
+                free(out);
+                out = NULL;
+            } else {
+                free(out);
+                out = NULL;
+                const char *argv_diff_c[] = {
+                    "git", "diff", "--cached", "--no-color", "--no-ext-diff", "--unified=2", NULL
+                };
+                if (mcode_proc_run_capture(argv_diff_c, workdir, false, &rc, &out, NULL) &&
+                    rc == 0 && out && out[0]) {
+                    trim_trailing(out);
+                    if (out[0]) {
+                        has_changes = true;
+                        append_capped_section(&ctx, "\nDiff:\n", out, diff_budget, max_bytes);
+                    }
+                }
+                free(out);
+                out = NULL;
+
+                const char *argv_diff_u[] = {
+                    "git", "diff", "--no-color", "--no-ext-diff", "--unified=2", NULL
+                };
+                if (mcode_proc_run_capture(argv_diff_u, workdir, false, &rc, &out, NULL) &&
+                    rc == 0 && out && out[0]) {
+                    trim_trailing(out);
+                    if (out[0]) {
+                        has_changes = true;
+                        append_capped_section(&ctx, "\nUnstaged diff:\n", out, diff_budget, max_bytes);
+                    }
+                }
+                free(out);
+                out = NULL;
+            }
+        }
+    }
+
+    /* 4. Untracked file snippets when committing all changes. */
+    if (!staged_only && ctx.len + 128 < max_bytes) {
+        const char *argv_untracked[] = {
+            "git", "ls-files", "--others", "--exclude-standard", NULL
+        };
+        if (mcode_proc_run_capture(argv_untracked, workdir, false, &rc, &out, NULL) &&
+            rc == 0 && out && out[0]) {
+            char *p = out;
+            int shown = 0;
+            while (*p && shown < 5 && ctx.len + 128 < max_bytes) {
+                char *nl = strchr(p, '\n');
+                size_t llen = nl ? (size_t)(nl - p) : strlen(p);
+                while (llen > 0 && p[llen - 1] == '\r') --llen;
+                if (llen > 0 && llen < 512) {
+                    char rel[512];
+                    memcpy(rel, p, llen);
+                    rel[llen] = '\0';
+                    has_changes = true;
+
+                    char full[MCODE_PATH_MAX + 512];
+                    snprintf(full, sizeof full, "%s/%s", workdir, rel);
+                    char *snippet = read_file_capped(full, 1024);
+                    if (snippet && snippet[0] && strcmp(snippet, "[binary file]\n") != 0) {
+                        char hdr[544];
+                        snprintf(hdr, sizeof hdr, "\nNew file %s:\n", rel);
+                        append_capped_section(&ctx, hdr, snippet, 900, max_bytes);
+                        ++shown;
+                    }
+                    free(snippet);
+                }
+                if (!nl) break;
+                p = nl + 1;
+            }
+        }
+        free(out);
+        out = NULL;
+    }
+
+    if (!has_changes || ctx.len == 0) {
+        mcode_str_free(&ctx);
+        return false;
+    }
+
+    char *res = strdup(mcode_str_cstr(&ctx));
+    mcode_str_free(&ctx);
+    if (!res) return false;
+    *out_context = res;
+    return true;
+}

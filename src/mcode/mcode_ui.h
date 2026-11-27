@@ -36,6 +36,12 @@ typedef enum {
     MCODE_FILE_CTX_FILES_HDR,
 } mcode_file_ctx_kind;
 
+typedef enum {
+    MCODE_COMMIT_GEN_NONE = 0,
+    MCODE_COMMIT_GEN_SIDEBAR,
+    MCODE_COMMIT_GEN_DIALOG,
+} mcode_commit_gen_target;
+
 typedef struct {
     app_chrome *chrome;
     mcode_store store;
@@ -141,6 +147,10 @@ typedef struct {
     uint64_t last_focus_generation;
     double last_focus_refresh_at;
     char sidebar_commit_msg[512];
+    mcode_commit_msg_run *commit_gen_run;
+    mcode_commit_gen_target commit_gen_target;
+    char commit_gen_workdir[MCODE_PATH_MAX];
+    mcode_commit_gen_target commit_gen_focus_target;
     bool inspector_open;
     mcode_inspector_mode inspector_mode;
     bool inspector_showing_chat;

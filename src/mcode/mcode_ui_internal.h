@@ -30,6 +30,18 @@ void mcode_ui_open_file_preview(mcode_app *app, cui_ctx *ui, const char *root_pa
                                 const char *rel_path);
 void mcode_ui_close_inspector(mcode_app *app);
 
+/* Commit message auto-generation & shared input with trailing sparkle button */
+void mcode_ui_start_commit_msg_gen(mcode_app *app, cui_ctx *ui, const char *workdir,
+                                   bool staged_only, mcode_commit_gen_target target);
+void mcode_ui_cancel_commit_msg_gen(mcode_app *app);
+bool mcode_ui_is_generating_commit_msg(const mcode_app *app, mcode_commit_gen_target target);
+int mcode_ui_draw_commit_msg_input(mcode_app *app, cui_ctx *ui, const char *id,
+                                   char *buf, size_t cap, const char *placeholder,
+                                   cui_control_size size, float font_size,
+                                   cui_color bg, cui_color border_color, float radius,
+                                   const char *workdir, bool staged_only, bool has_changes,
+                                   mcode_commit_gen_target target);
+
 /* Project lifecycle & dialogs */
 void mcode_ui_promote_project(mcode_app *app, const char *project_id);
 void mcode_ui_open_project_dialog(mcode_app *app, mcode_project_dialog_mode mode);

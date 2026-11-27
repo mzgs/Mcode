@@ -58,6 +58,13 @@ bool mcode_git_commit_all(const char *workdir, const char *message,
 bool mcode_git_commit_staged(const char *workdir, const char *message,
                              char *err, size_t err_cap);
 
+/* Collect a bounded summary of pending changes (recent commits, changed files,
+ * diff stats, patch hunks, and untracked file snippets) for commit message
+ * generation. If `staged_only` is true, inspects staged changes only.
+ * Caller owns *out_context (freed with free()). */
+bool mcode_git_collect_commit_context(const char *workdir, bool staged_only,
+                                      size_t max_bytes, char **out_context);
+
 /* Stage / unstage individual files or all files. */
 bool mcode_git_stage_file(const char *workdir, const char *rel_path,
                           char *err, size_t err_cap);

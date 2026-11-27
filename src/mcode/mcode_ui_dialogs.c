@@ -494,10 +494,15 @@ static void draw_git_dialog(mcode_app *app, cui_ctx *ui) {
             cui_secondary(ui, summary);
 
             if (t->diff_file_count > 0 || !app->git_dialog_is_pr) {
-                cui_input(ui, "git-commit-msg", app->commit_msg, sizeof app->commit_msg,
-                          .label = "Commit message",
-                          .placeholder = "Describe your changes...",
-                          .width = CUI_FILL);
+                cui_column(ui, .width = CUI_FILL, .gap = 6) {
+                    cui_label(ui, "Commit message");
+                    mcode_ui_draw_commit_msg_input(
+                        app, ui, "git-commit-msg", app->commit_msg, sizeof app->commit_msg,
+                        "Describe your changes...", CUI_SIZE_MD, 0.0f,
+                        (cui_color){ 0 }, (cui_color){ 0 }, 0.0f,
+                        t->workdir, false, t->diff_file_count > 0,
+                        MCODE_COMMIT_GEN_DIALOG);
+                }
             }
 
             if (app->git_dialog_is_pr) {
@@ -572,6 +577,11 @@ static void draw_git_dialog(mcode_app *app, cui_ctx *ui) {
                 }
             }
         }
+    }
+
+    if (!app->git_dialog_open &&
+        app->commit_gen_run && app->commit_gen_target == MCODE_COMMIT_GEN_DIALOG) {
+        mcode_ui_cancel_commit_msg_gen(app);
     }
 }
 

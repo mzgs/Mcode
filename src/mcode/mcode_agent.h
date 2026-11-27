@@ -7,6 +7,7 @@
 
 typedef struct mcode_agent_run mcode_agent_run;
 typedef struct mcode_title_run mcode_title_run;
+typedef struct mcode_commit_msg_run mcode_commit_msg_run;
 
 typedef struct {
     bool available[APP_AGENT_COUNT];
@@ -224,6 +225,25 @@ void mcode_agent_title_destroy(mcode_title_run *run);
 bool mcode_agent_sanitize_title(const char *raw, char *out, size_t cap);
 bool mcode_agent_parse_title_response(app_agent_kind agent, const char *raw, size_t len,
                                       char *out, size_t cap);
+
+/* Asynchronous one-shot commit message generation from a git diff/status context. */
+mcode_commit_msg_run *mcode_agent_start_commit_msg(app_agent_kind agent,
+                                                   const char *model,
+                                                   const char *workdir,
+                                                   const app_settings *settings,
+                                                   const char *diff_context);
+bool mcode_agent_poll_commit_msg(mcode_commit_msg_run *run, char *out_msg, size_t cap,
+                                 bool *out_ok);
+void mcode_agent_commit_msg_stop(mcode_commit_msg_run *run);
+void mcode_agent_commit_msg_kill(mcode_commit_msg_run *run);
+void mcode_agent_commit_msg_destroy(mcode_commit_msg_run *run);
+app_agent_kind mcode_agent_commit_msg_agent(const mcode_commit_msg_run *run);
+
+/* Pure helpers exposed for unit tests:
+ * Extract and sanitize a single-line commit message from provider CLI output. */
+bool mcode_agent_sanitize_commit_msg(const char *raw, char *out, size_t cap);
+bool mcode_agent_parse_commit_msg_response(app_agent_kind agent, const char *raw, size_t len,
+                                           char *out, size_t cap);
 
 /* Classify whether a non-zero command exit represents a benign read-only probe
  * (e.g., rg/grep no matches, ls/stat on missing optional files, git status outside a repo).

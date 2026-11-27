@@ -361,6 +361,9 @@ static void perform_sidebar_commit(mcode_app *app, cui_ctx *ui, const char *work
         ok = mcode_git_push(workdir, err, sizeof err);
     }
     if (ok) {
+        if (app->commit_gen_run && app->commit_gen_target == MCODE_COMMIT_GEN_SIDEBAR) {
+            mcode_ui_cancel_commit_msg_gen(app);
+        }
         app->sidebar_commit_msg[0] = '\0';
         promote_project_for_workdir(app, workdir);
         mcode_ui_refresh_workspace_git(app);
@@ -418,6 +421,108 @@ static void draw_right_sidebar_top_header(mcode_app *app, cui_ctx *ui) {
     }
 }
 
+int mcode_ui_draw_commit_msg_input(mcode_app *app, cui_ctx *ui, const char *id,
+                                   char *buf, size_t cap, const char *placeholder,
+                                   cui_control_size size, float font_size,
+                                   cui_color bg, cui_color border_color, float radius,
+                                   const char *workdir, bool staged_only, bool has_changes,
+                                   mcode_commit_gen_target target) {
+    bool dark = (cui_get_theme_mode(ui) == CUI_THEME_DARK);
+    bool generating = mcode_ui_is_generating_commit_msg(app, target);
+    bool can_generate = has_changes && workdir && workdir[0];
+    bool btn_disabled = !generating && !can_generate;
+    float btn_sz = (size == CUI_SIZE_SM) ? 24.0f : 26.0f;
+    float icon_sz = (size == CUI_SIZE_SM) ? 13.5f : 14.5f;
+    float right_inset = (size == CUI_SIZE_SM) ? 4.0f : 5.0f;
+    bool hover_blocked = (target == MCODE_COMMIT_GEN_SIDEBAR &&
+                          (app->git_dialog_open || app->project_dialog_open ||
+                           app->rename_project_open || app->new_thread_open ||
+                           app->actions_dialog_open || app->file_ctx_open ||
+                           (app->chrome && (app->chrome->settings_open ||
+                                            app->chrome->palette_open))));
+
+    int flags = 0;
+    cui_id input_cid = 0;
+
+    cui_push_id(ui, id);
+    cui_id gen_id = cui_make_id(ui, "autogen");
+    bool gen_hov = !btn_disabled && !hover_blocked &&
+                   rect_contains(cui_get_rect(ui, gen_id), cui_mouse_pos(ui));
+
+    cui_box(ui, .dir = CUI_STACK, .width = CUI_FILL,
+            .align = CUI_ALIGN_END, .justify = CUI_JUSTIFY_CENTER) {
+        flags = cui_input(ui, "field", buf, cap,
+                          .placeholder = placeholder,
+                          .size = size,
+                          .font_size = font_size,
+                          .width = CUI_FILL,
+                          .suffix = "     ",
+                          .bg = bg,
+                          .border_color = border_color,
+                          .radius = radius);
+        input_cid = cui_last_id(ui);
+
+        cui_box(ui, .pad_right = right_inset,
+                .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER) {
+            cui_color fg = cui_color_of(ui, CUI_COLOR_FOREGROUND);
+            cui_color hover_bg = cui_alpha(fg, dark ? 0.12f : 0.08f);
+            cui_color icon_col = btn_disabled
+                ? cui_alpha(fg, dark ? 0.28f : 0.30f)
+                : (gen_hov
+                       ? (cui_get_accent(ui) == CUI_ACCENT_NEUTRAL
+                              ? CUI_COLOR_FOREGROUND
+                              : CUI_COLOR_ACCENT)
+                       : CUI_COLOR_TEXT_SECONDARY);
+
+            cui_push_disabled(ui, btn_disabled);
+            bool clicked = cui_card_begin(ui, &(cui_card_opts){
+                .id = "autogen",
+                .width = CUI_PX(btn_sz),
+                .height = CUI_PX(btn_sz),
+                .pad = 1,
+                .hoverable = true,
+                .border = -1.0f,
+                .radius = 4.5f,
+                .bg = gen_hov ? hover_bg : CUI_RGBA(0x00000001u),
+            });
+            cui_box(ui, .width = CUI_FILL, .height = CUI_FILL,
+                    .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER) {
+                if (generating) {
+                    cui_spinner(ui, icon_sz - 1.5f);
+                } else {
+                    cui_icon(ui, CUI_ICON_SPARKLES, icon_sz, icon_col);
+                }
+            }
+            cui_card_end(ui);
+            cui_pop_disabled(ui);
+
+            cui_tooltip(ui, generating
+                            ? "Generating commit message... (Click to cancel)"
+                            : (can_generate
+                                   ? "Generate Commit Message"
+                                   : "No changes to generate commit message"));
+
+            if (clicked) {
+                if (generating) {
+                    mcode_ui_cancel_commit_msg_gen(app);
+                } else if (can_generate) {
+                    mcode_ui_start_commit_msg_gen(app, ui, workdir, staged_only, target);
+                }
+            }
+        }
+    }
+
+    if (app->commit_gen_focus_target == target && input_cid != 0) {
+        if (!cui_wants_keyboard(ui)) {
+            cui_set_focus(ui, input_cid);
+        }
+        app->commit_gen_focus_target = MCODE_COMMIT_GEN_NONE;
+    }
+
+    cui_pop_id(ui);
+    return flags;
+}
+
 static void draw_source_control_commit_box(mcode_app *app, cui_ctx *ui,
                                            mcode_thread *thread, mcode_project *proj,
                                            const char *workdir) {
@@ -428,6 +533,7 @@ static void draw_source_control_commit_box(mcode_app *app, cui_ctx *ui,
     int staged_count = 0, unstaged_count = 0;
     count_git_groups(app, &staged_count, &unstaged_count);
     int change_count = app->git_file_count;
+    bool has_changes = (change_count > 0);
 
     static char placeholder[160];
 #ifdef __APPLE__
@@ -441,17 +547,12 @@ static void draw_source_control_commit_box(mcode_app *app, cui_ctx *ui,
         cui_color input_bg = mcode_ui_chrome_input_bg(ui);
         cui_color input_bdr = cui_color_of(ui, CUI_COLOR_BORDER);
 
-        int flags = cui_input(ui, "sc-commit-msg", app->sidebar_commit_msg,
-                              sizeof app->sidebar_commit_msg,
-                              .placeholder = placeholder,
-                              .size = CUI_SIZE_SM,
-                              .font_size = 13.0f,
-                              .width = CUI_FILL,
-                              .bg = input_bg,
-                              .border_color = input_bdr,
-                              .radius = 6.0f);
+        int flags = mcode_ui_draw_commit_msg_input(
+            app, ui, "sc-commit-msg",
+            app->sidebar_commit_msg, sizeof app->sidebar_commit_msg,
+            placeholder, CUI_SIZE_SM, 13.0f, input_bg, input_bdr, 6.0f,
+            workdir, staged_count > 0, has_changes, MCODE_COMMIT_GEN_SIDEBAR);
 
-        bool has_changes = (change_count > 0);
         bool can_commit = (app->sidebar_commit_msg[0] != '\0' && has_changes);
         if (can_commit && ((flags & CUI_SUBMITTED) ||
                            ((flags & CUI_FOCUSED) &&
