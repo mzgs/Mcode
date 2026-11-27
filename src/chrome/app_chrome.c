@@ -358,12 +358,30 @@ void chrome_apply_appearance(app_chrome *chrome, cui_ctx *ui) {
     if (!chrome->env_accent_override) {
         cui_set_accent(ui, chrome->settings.appearance.accent);
     }
+    cui_theme *theme = cui_theme_get(ui);
     if (cui_get_theme_mode(ui) == CUI_THEME_DARK) {
-        cui_theme_get(ui)->colors[CUI_TOKEN_BACKGROUND] = CUI_RGBA(0x000000ffu);
+        /* Deep cool-graphite surface ladder: avoids pure #000000 halation while
+         * keeping chrome rails (#0f1014), workspace (#141519), and cards distinct. */
+        theme->colors[CUI_TOKEN_BACKGROUND]     = CUI_RGBA(0x141519ffu);
+        theme->colors[CUI_TOKEN_SURFACE]        = CUI_RGBA(0x1a1c22ffu);
+        theme->colors[CUI_TOKEN_SURFACE_RAISED] = CUI_RGBA(0x20222affu);
+        theme->colors[CUI_TOKEN_SURFACE_MUTED]  = CUI_RGBA(0x252831ffu);
+        theme->colors[CUI_TOKEN_BORDER]         = CUI_RGBA(0x292c36ffu);
+        theme->colors[CUI_TOKEN_BORDER_SUBTLE]  = CUI_RGBA(0x20222bffu);
+        theme->colors[CUI_TOKEN_BORDER_STRONG]  = CUI_RGBA(0x484c5cffu);
+    } else {
+        /* Crisp white workspace framed by soft cool-tinted sidebars and hairlines. */
+        theme->colors[CUI_TOKEN_BACKGROUND]     = CUI_RGBA(0xffffffffu);
+        theme->colors[CUI_TOKEN_SURFACE]        = CUI_RGBA(0xffffffffu);
+        theme->colors[CUI_TOKEN_SURFACE_RAISED] = CUI_RGBA(0xffffffffu);
+        theme->colors[CUI_TOKEN_SURFACE_MUTED]  = CUI_RGBA(0xf5f6f8ffu);
+        theme->colors[CUI_TOKEN_BORDER]         = CUI_RGBA(0xe3e6ecffu);
+        theme->colors[CUI_TOKEN_BORDER_SUBTLE]  = CUI_RGBA(0xedf0f4ffu);
+        theme->colors[CUI_TOKEN_BORDER_STRONG]  = CUI_RGBA(0xb7bcc8ffu);
     }
     float scale = chrome->settings.appearance.font_scale;
     if (scale < FONT_SCALE_MIN || scale > FONT_SCALE_MAX || !isfinite(scale)) scale = 1.0f;
-    cui_theme_get(ui)->font_scale = scale;
+    theme->font_scale = scale;
 
     if (chrome->appearance_force_motion || (first && chrome->settings.appearance.reduced_motion)) {
         cui_set_reduced_motion(ui, chrome->settings.appearance.reduced_motion);

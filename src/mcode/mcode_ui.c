@@ -1504,18 +1504,20 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
 }
 
 static void draw_status_bar(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int running_count) {
-    cui_status_bar(ui, "mcode-status") {
-        mcode_ui_draw_status_usage(app, ui, thread);
+    cui_box(ui, .width = CUI_FILL, .bg = mcode_ui_chrome_bg(ui)) {
+        cui_status_bar(ui, "mcode-status") {
+            mcode_ui_draw_status_usage(app, ui, thread);
 
-        cui_status_bar_spacer(ui);
+            cui_status_bar_spacer(ui);
 
-        if (running_count > 0) {
-            char run_buf[48];
-            snprintf(run_buf, sizeof run_buf, "%d running###sb-run", running_count);
-            cui_status_bar_text(ui, run_buf, .icon = CUI_ICON_ACTIVITY, .tone = CUI_TONE_INFO);
+            if (running_count > 0) {
+                char run_buf[48];
+                snprintf(run_buf, sizeof run_buf, "%d running###sb-run", running_count);
+                cui_status_bar_text(ui, run_buf, .icon = CUI_ICON_ACTIVITY, .tone = CUI_TONE_INFO);
+            }
+
+            mcode_ui_draw_status_cli_updates(app, ui);
         }
-
-        mcode_ui_draw_status_cli_updates(app, ui);
     }
 }
 
@@ -2059,9 +2061,7 @@ void mcode_app_frame(mcode_app *app, cui_ctx *ui) {
     cui_box(ui, .id = "mcode-root-stack", .dir = CUI_STACK, .width = CUI_FILL, .height = CUI_FILL) {
         cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0) {
             cui_box(ui, .width = CUI_FILL, .height = CUI_FILL) {
-                cui_color sidebar_bg = (cui_get_theme_mode(ui) == CUI_THEME_DARK)
-                    ? CUI_RGBA(0x000000ffu)
-                    : CUI_COLOR_SURFACE_MUTED;
+                cui_color sidebar_bg = mcode_ui_chrome_bg(ui);
                 if (app->store.show_sidebar) {
                     cui_split(ui, "mcode-main-split", &app->store.sidebar_ratio,
                               .min_first = 248, .min_second = 420,

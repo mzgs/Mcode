@@ -3,6 +3,20 @@
 
 #include "mcode_ui.h"
 
+/* Shared recessed chrome background for sidebars, status bar, and toolbars. */
+static inline cui_color mcode_ui_chrome_bg(cui_ctx *ui) {
+    return (cui_get_theme_mode(ui) == CUI_THEME_DARK)
+        ? CUI_RGBA(0x0f1014ffu)
+        : cui_color_of(ui, CUI_COLOR_SURFACE_MUTED);
+}
+
+/* Shared input/control surface fill sitting on recessed chrome rails. */
+static inline cui_color mcode_ui_chrome_input_bg(cui_ctx *ui) {
+    return (cui_get_theme_mode(ui) == CUI_THEME_DARK)
+        ? CUI_RGBA(0x16181effu)
+        : cui_color_of(ui, CUI_COLOR_SURFACE);
+}
+
 void mcode_ui_mark_dirty(mcode_app *app);
 void mcode_ui_focus_composer(mcode_app *app, cui_ctx *ui);
 void mcode_ui_select_thread(mcode_app *app, const char *thread_id);

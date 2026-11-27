@@ -72,9 +72,10 @@ void mcode_ui_draw_terminal(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
     int exit_code = app->term ? cui_vterm_exit_code(app->term) : 0;
     const char *osc_title = app->term ? cui_vterm_title(app->term) : NULL;
 
-    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0) {
+    cui_color bar_bg = mcode_ui_chrome_bg(ui);
+    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .bg = bar_bg, .gap = 0) {
         /* Terminal toolbar */
-        cui_row(ui, .width = CUI_FILL, .pad_x = 12, .pad_y = 5, .gap = 6,
+        cui_row(ui, .width = CUI_FILL, .bg = bar_bg, .pad_x = 12, .pad_y = 5, .gap = 6,
                 .align = CUI_ALIGN_CENTER, .wrap = true) {
             cui_icon(ui, CUI_ICON_SQUARE_TERMINAL, 14, CUI_COLOR_TEXT_SECONDARY);
 
@@ -207,6 +208,10 @@ void mcode_ui_draw_terminal(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
 
         /* Better-C-UI cui::vterm interactive terminal widget */
         if (app->term) {
+            bool dark = (cui_get_theme_mode(ui) == CUI_THEME_DARK);
+            cui_vterm_theme term_theme;
+            memset(&term_theme, 0, sizeof term_theme);
+            term_theme.bg = dark ? CUI_RGBA(0x111217ffu) : CUI_RGBA(0xffffffffu);
             cui_vterm_result tr = cui_vterm(ui, "mcode-term", app->term,
                                             .width = CUI_FILL,
                                             .height = CUI_FILL,
@@ -218,7 +223,8 @@ void mcode_ui_draw_terminal(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
                                             .visual_bell = true,
                                             .allow_osc52 = true,
                                             .on_key = on_term_key,
-                                            .user = app);
+                                            .user = app,
+                                            .theme = &term_theme);
             if (app->term_want_focus) {
                 cui_set_focus(ui, cui_last_id(ui));
                 app->term_want_focus = false;

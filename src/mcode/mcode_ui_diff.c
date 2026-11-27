@@ -14,9 +14,7 @@ static bool rect_contains(cui_rect r, cui_vec2 p) {
 }
 
 static cui_color right_sidebar_bg(cui_ctx *ui) {
-    return (cui_get_theme_mode(ui) == CUI_THEME_DARK)
-        ? CUI_RGBA(0x000000ffu)
-        : cui_color_of(ui, CUI_COLOR_SURFACE_MUTED);
+    return mcode_ui_chrome_bg(ui);
 }
 
 static cui_color right_hover_bg(cui_ctx *ui, float strength) {
@@ -440,8 +438,8 @@ static void draw_source_control_commit_box(mcode_app *app, cui_ctx *ui,
 
     cui_column(ui, .width = CUI_FILL, .pad_left = 10, .pad_right = 10,
                .pad_top = 2, .pad_bottom = 6, .gap = 7) {
-        cui_color input_bg = dark ? CUI_RGBA(0x0e0e11ffu) : cui_color_of(ui, CUI_COLOR_SURFACE);
-        cui_color input_bdr = dark ? CUI_RGBA(0x24242cffu) : cui_color_of(ui, CUI_COLOR_BORDER);
+        cui_color input_bg = mcode_ui_chrome_input_bg(ui);
+        cui_color input_bdr = cui_color_of(ui, CUI_COLOR_BORDER);
 
         int flags = cui_input(ui, "sc-commit-msg", app->sidebar_commit_msg,
                               sizeof app->sidebar_commit_msg,
@@ -677,7 +675,7 @@ static bool draw_change_file_rows(mcode_app *app, cui_ctx *ui, const char *workd
         bool any_hov = row_hov || btn_hov;
 
         cui_color row_bg = selected
-            ? (dark ? CUI_RGBA(0x1b2434ffu) : CUI_RGBA(0xe2ecfcffu))
+            ? (dark ? CUI_RGBA(0x1d2638ffu) : CUI_RGBA(0xe2ecfcffu))
             : (any_hov ? right_hover_bg(ui, dark ? 0.065f : 0.045f)
                        : CUI_RGBA(0x00000001u));
 
@@ -975,7 +973,7 @@ static void draw_file_tree_nodes(mcode_app *app, cui_ctx *ui,
         bool hov = rect_contains(cui_get_rect(ui, row_id), cui_mouse_pos(ui));
 
         cui_color row_bg = selected
-            ? (dark ? CUI_RGBA(0x1b2434ffu) : CUI_RGBA(0xe2ecfcffu))
+            ? (dark ? CUI_RGBA(0x1d2638ffu) : CUI_RGBA(0xe2ecfcffu))
             : (hov ? right_hover_bg(ui, dark ? 0.065f : 0.045f)
                    : CUI_RGBA(0x00000001u));
 
@@ -1484,9 +1482,9 @@ void mcode_ui_draw_workspace_main(mcode_app *app, cui_ctx *ui, mcode_thread *thr
                 .hoverable = true,
                 .radius = 6.0f,
                 .border = chat_active ? 1.0f : -1.0f,
-                .border_color = dark ? CUI_RGBA(0x2c2c34ffu) : cui_alpha(fg, 0.12f),
+                .border_color = dark ? cui_color_of(ui, CUI_COLOR_BORDER) : cui_alpha(fg, 0.12f),
                 .bg = chat_active
-                    ? (dark ? CUI_RGBA(0x18181dffu) : CUI_RGBA(0xffffffffu))
+                    ? cui_color_of(ui, CUI_COLOR_SURFACE)
                     : (ctab_hov ? cui_alpha(fg, 0.06f) : CUI_RGBA(0x00000001u)),
             });
             cui_icon(ui, CUI_ICON_MESSAGE_SQUARE, 12.5f,
@@ -1508,9 +1506,9 @@ void mcode_ui_draw_workspace_main(mcode_app *app, cui_ctx *ui, mcode_thread *thr
             bool file_active = !app->inspector_showing_chat;
             cui_row(ui, .gap = 0, .radius = 6.0f, .align = CUI_ALIGN_CENTER,
                     .border = file_active ? 1.0f : 0.0f,
-                    .border_color = dark ? CUI_RGBA(0x2c2c34ffu) : cui_alpha(fg, 0.12f),
+                    .border_color = dark ? cui_color_of(ui, CUI_COLOR_BORDER) : cui_alpha(fg, 0.12f),
                     .bg = file_active
-                        ? (dark ? CUI_RGBA(0x18181dffu) : CUI_RGBA(0xffffffffu))
+                        ? cui_color_of(ui, CUI_COLOR_SURFACE)
                         : (ftab_hov ? cui_alpha(fg, 0.06f) : CUI_RGBA(0x00000001u))) {
                 bool ftab_clicked = cui_card_begin(ui, &(cui_card_opts){
                     .id = "ws-tab-file",

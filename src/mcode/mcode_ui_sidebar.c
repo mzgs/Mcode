@@ -31,9 +31,7 @@ static bool thread_matches_query(mcode_app *app, const mcode_thread *t, const mc
 }
 
 static cui_color sidebar_surface_bg(cui_ctx *ui) {
-    return (cui_get_theme_mode(ui) == CUI_THEME_DARK)
-        ? CUI_RGBA(0x000000ffu)
-        : cui_color_of(ui, CUI_COLOR_SURFACE_MUTED);
+    return mcode_ui_chrome_bg(ui);
 }
 
 static cui_color sidebar_hover_bg(cui_ctx *ui, float strength) {
@@ -116,9 +114,9 @@ static bool draw_thread_row(mcode_app *app, cui_ctx *ui, int idx, bool show_proj
         row_opts.border = 1.0f;
         row_opts.border_color = cui_alpha(warn, is_selected ? 0.45f : 0.28f);
     } else if (is_selected) {
-        row_opts.bg = dark ? CUI_RGBA(0x18181cffu) : CUI_RGBA(0xffffffffu);
+        row_opts.bg = cui_color_of(ui, CUI_COLOR_SURFACE);
         row_opts.border = 1.0f;
-        row_opts.border_color = dark ? CUI_RGBA(0x28282effu) : cui_alpha(fg, 0.10f);
+        row_opts.border_color = dark ? cui_color_of(ui, CUI_COLOR_BORDER) : cui_alpha(fg, 0.10f);
     } else if (hov) {
         row_opts.bg = sidebar_hover_bg(ui, dark ? 0.06f : 0.045f);
     }
@@ -509,13 +507,12 @@ static void paint_folder_plus_btn(cui_ctx *ui, cui_rect r, void *user) {
     const folder_plus_paint *p = (const folder_plus_paint *)user;
     bool dark = (cui_get_theme_mode(ui) == CUI_THEME_DARK);
     cui_color fg = cui_color_of(ui, CUI_COLOR_FOREGROUND);
-    cui_color base_bg = dark ? CUI_RGBA(0x0e0e11ffu) : cui_color_of(ui, CUI_COLOR_SURFACE);
+    cui_color base_bg = mcode_ui_chrome_input_bg(ui);
     cui_color bg = p->pressed ? cui_mix(base_bg, fg, dark ? 0.14f : 0.08f)
                  : p->hovered ? cui_mix(base_bg, fg, dark ? 0.08f : 0.04f)
                               : base_bg;
-    cui_color bdr = dark ? (p->hovered ? CUI_RGBA(0x2e2e36ffu) : CUI_RGBA(0x202026ffu))
-                         : (p->hovered ? cui_color_of(ui, CUI_COLOR_BORDER_STRONG)
-                                       : cui_color_of(ui, CUI_COLOR_BORDER));
+    cui_color bdr = p->hovered ? cui_color_of(ui, CUI_COLOR_BORDER_STRONG)
+                               : cui_color_of(ui, CUI_COLOR_BORDER);
     cui_draw_rect_border(ui, r, CUI_CORNERS(8.0f), bg, bdr, 1.0f);
 
     cui_color ic = p->hovered ? fg : cui_color_of(ui, CUI_COLOR_TEXT_SECONDARY);
@@ -539,10 +536,8 @@ void mcode_ui_draw_sidebar(mcode_app *app, cui_ctx *ui) {
 
         /* Unified filter input + add-project button */
         cui_row(ui, .width = CUI_FILL, .pad_x = 10, .gap = 6, .align = CUI_ALIGN_CENTER) {
-            cui_color search_bg = dark ? CUI_RGBA(0x0e0e11ffu)
-                                       : cui_color_of(ui, CUI_COLOR_SURFACE);
-            cui_color search_bdr = dark ? CUI_RGBA(0x202026ffu)
-                                        : cui_color_of(ui, CUI_COLOR_BORDER);
+            cui_color search_bg = mcode_ui_chrome_input_bg(ui);
+            cui_color search_bdr = cui_color_of(ui, CUI_COLOR_BORDER);
             cui_search(ui, "thread-search", app->thread_search, sizeof app->thread_search,
                        .placeholder = "Filter threads...",
                        .size = CUI_SIZE_SM,
