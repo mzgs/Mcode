@@ -208,10 +208,17 @@ void mcode_ui_draw_terminal(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
 
         /* Better-C-UI cui::vterm interactive terminal widget */
         if (app->term) {
-            bool dark = (cui_get_theme_mode(ui) == CUI_THEME_DARK);
+            const app_theme_spec *ts = app_theme_current(ui);
             cui_vterm_theme term_theme;
             memset(&term_theme, 0, sizeof term_theme);
-            term_theme.bg = dark ? CUI_RGBA(0x111217ffu) : CUI_RGBA(0xffffffffu);
+            term_theme.bg = ts->term_bg;
+            term_theme.fg = ts->term_fg;
+            term_theme.cursor = ts->term_cursor;
+            term_theme.cursor_text = ts->term_bg;
+            term_theme.selection = ts->term_selection;
+            for (int i = 0; i < 16; ++i) {
+                term_theme.palette[i] = CUI_RGB(ts->term_ansi[i]);
+            }
             cui_vterm_result tr = cui_vterm(ui, "mcode-term", app->term,
                                             .width = CUI_FILL,
                                             .height = CUI_FILL,

@@ -298,6 +298,15 @@ static const char *const theme_names[APP_THEME_COUNT] = {
     "system",
     "light",
     "dark",
+    "tokyo_night",
+    "catppuccin_mocha",
+    "dracula",
+    "nord",
+    "gruvbox_dark",
+    "one_dark",
+    "solarized_dark",
+    "catppuccin_latte",
+    "solarized_light",
 };
 
 static const char *const agent_names[APP_AGENT_COUNT] = {
@@ -364,11 +373,32 @@ static bool parse_busy_submit_mode(yyjson_val *value, app_busy_submit_mode *out)
     return false;
 }
 
+static bool theme_key_matches(const char *a, const char *b) {
+    while (*a && *b) {
+        int ca = tolower((unsigned char)*a);
+        int cb = tolower((unsigned char)*b);
+        if (ca == '-' || ca == ' ') ca = '_';
+        if (cb == '-' || cb == ' ') cb = '_';
+        if (ca != cb) return false;
+        ++a;
+        ++b;
+    }
+    return *a == *b;
+}
+
 static bool parse_theme_mode(yyjson_val *value, app_theme_mode *out) {
     const char *text = json_cstr(value, NULL);
     if (!text) return false;
+    if (theme_key_matches(text, "dark_default")) {
+        *out = APP_THEME_DARK;
+        return true;
+    }
+    if (theme_key_matches(text, "light_default")) {
+        *out = APP_THEME_LIGHT;
+        return true;
+    }
     for (int i = 0; i < APP_THEME_COUNT; ++i) {
-        if (str_eq_ignore_case(text, theme_names[i])) {
+        if (theme_key_matches(text, theme_names[i])) {
             *out = (app_theme_mode)i;
             return true;
         }

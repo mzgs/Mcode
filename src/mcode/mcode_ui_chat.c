@@ -666,11 +666,11 @@ static void draw_user_message(cui_ctx *ui, const char *thread_id, const char *te
     cui_push_id(ui, "user-msg");
 
     bool dark = (cui_get_theme_mode(ui) == CUI_THEME_DARK);
-    cui_accent accent = cui_get_accent(ui);
+    bool has_accent = app_theme_has_accent(ui);
     cui_color surface = cui_color_of(ui, CUI_COLOR_SURFACE);
     cui_color bg;
     cui_color border_col;
-    if (accent == CUI_ACCENT_NEUTRAL) {
+    if (!has_accent) {
         cui_color fg = cui_color_of(ui, CUI_COLOR_FOREGROUND);
         bg = cui_mix(surface, fg, dark ? 0.08f : 0.055f);
         border_col = steered
@@ -687,9 +687,9 @@ static void draw_user_message(cui_ctx *ui, const char *thread_id, const char *te
                    .bg = bg, .border = 1.0f, .border_color = border_col,
                    .radius_tl = 18, .radius_tr = 18, .radius_br = 6, .radius_bl = 18) {
             if (steered) {
-                cui_color tag_col = (accent == CUI_ACCENT_NEUTRAL)
-                    ? cui_color_of(ui, CUI_COLOR_INFO)
-                    : cui_color_of(ui, CUI_COLOR_ACCENT);
+                cui_color tag_col = has_accent
+                    ? cui_color_of(ui, CUI_COLOR_ACCENT)
+                    : cui_color_of(ui, CUI_COLOR_INFO);
                 cui_row(ui, .gap = 4, .align = CUI_ALIGN_CENTER) {
                     cui_icon(ui, CUI_ICON_ARROW_RIGHT, 11, tag_col);
                     cui_text(ui, "Steered", .font = CUI_FONT_MEDIUM, .size = 11.0f,
@@ -1705,9 +1705,9 @@ static bool draw_composer_action_pill(cui_ctx *ui, const char *id, const char *i
                mp.y >= r.y && mp.y <= r.y + r.h;
 
     bool dark = (cui_get_theme_mode(ui) == CUI_THEME_DARK);
+    bool has_accent = app_theme_has_accent(ui);
     cui_color fg = cui_color_of(ui, CUI_COLOR_FOREGROUND);
-    cui_color acc = (cui_get_accent(ui) == CUI_ACCENT_NEUTRAL)
-        ? fg : cui_color_of(ui, CUI_COLOR_ACCENT);
+    cui_color acc = has_accent ? cui_color_of(ui, CUI_COLOR_ACCENT) : fg;
 
     cui_color bg;
     cui_color bdr;
@@ -1719,7 +1719,7 @@ static bool draw_composer_action_pill(cui_ctx *ui, const char *id, const char *i
     } else if (primary) {
         bg = cui_alpha(acc, hov ? (dark ? 0.28f : 0.18f) : (dark ? 0.18f : 0.12f));
         bdr = cui_alpha(acc, dark ? 0.42f : 0.30f);
-        txt_col = (cui_get_accent(ui) == CUI_ACCENT_NEUTRAL) ? CUI_COLOR_FOREGROUND : CUI_COLOR_ACCENT;
+        txt_col = has_accent ? CUI_COLOR_ACCENT : CUI_COLOR_FOREGROUND;
     } else {
         bg = hov ? cui_alpha(fg, dark ? 0.11f : 0.08f) : cui_alpha(fg, dark ? 0.05f : 0.035f);
         bdr = cui_alpha(fg, hov ? (dark ? 0.22f : 0.18f) : (dark ? 0.13f : 0.12f));

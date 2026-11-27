@@ -127,6 +127,7 @@ endif()
 
 add_library(app_chrome STATIC
     src/chrome/app_chrome.c
+    src/chrome/app_theme.c
     src/chrome/settings_dialog.c
     src/chrome/command_palette.c
     src/chrome/updater.c)

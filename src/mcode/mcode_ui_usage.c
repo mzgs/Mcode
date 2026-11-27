@@ -1092,7 +1092,7 @@ static void paint_composer_usage_ring(cui_ctx *ui, cui_rect r, void *user) {
             fill_col = cui_color_of(ui, CUI_COLOR_DANGER);
         } else if (p->pct >= 70) {
             fill_col = cui_color_of(ui, CUI_COLOR_WARNING);
-        } else if (cui_get_accent(ui) != CUI_ACCENT_NEUTRAL) {
+        } else if (app_theme_has_accent(ui)) {
             fill_col = cui_color_of(ui, CUI_COLOR_ACCENT);
         } else {
             fill_col = cui_alpha(fg, p->hovered ? 0.92f : 0.72f);

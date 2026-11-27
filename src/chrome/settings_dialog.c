@@ -172,28 +172,194 @@ static bool draw_general_section(app_chrome *chrome, cui_ctx *ui, bool compact) 
     return changed;
 }
 
+static void draw_theme_preview(cui_ctx *ui, app_theme_mode mode) {
+    if (mode == APP_THEME_SYSTEM) {
+        const app_theme_spec *light = app_theme_spec_get(APP_THEME_LIGHT);
+        const app_theme_spec *dark = app_theme_spec_get(APP_THEME_DARK);
+        cui_row(ui, .width = CUI_FILL, .height = CUI_PX(52), .radius = 6,
+                .pad = 1, .border = 1.0f, .border_color = CUI_COLOR_BORDER,
+                .clip = true, .gap = 0, .align = CUI_ALIGN_STRETCH) {
+            /* Light half */
+            cui_column(ui, .width = CUI_PCT(50), .height = CUI_FILL,
+                       .bg = light->background, .radius_tl = 5, .radius_bl = 5, .gap = 0) {
+                cui_row(ui, .width = CUI_FILL, .height = CUI_PX(12),
+                        .bg = light->chrome_bg, .radius_tl = 5, .pad_x = 5, .gap = 3,
+                        .align = CUI_ALIGN_CENTER) {
+                    cui_box(ui, .width = CUI_PX(3.5f), .height = CUI_PX(3.5f), .radius = 2,
+                            .bg = cui_alpha(light->text_muted, 0.55f)) {}
+                    cui_box(ui, .width = CUI_PX(3.5f), .height = CUI_PX(3.5f), .radius = 2,
+                            .bg = cui_alpha(light->text_muted, 0.40f)) {}
+                }
+                cui_box(ui, .width = CUI_FILL, .height = CUI_PX(1), .bg = light->border) {}
+                cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
+                           .pad = 5, .gap = 4, .justify = CUI_JUSTIFY_CENTER) {
+                    cui_box(ui, .width = CUI_PCT(82), .height = CUI_PX(3.5f), .radius = 2,
+                            .bg = cui_alpha(light->foreground, 0.78f)) {}
+                    cui_box(ui, .width = CUI_PCT(58), .height = CUI_PX(3.5f), .radius = 2,
+                            .bg = cui_alpha(light->text_secondary, 0.55f)) {}
+                    cui_box(ui, .width = CUI_PX(18), .height = CUI_PX(6), .radius = 3.0f,
+                            .bg = light->info) {}
+                }
+            }
+            cui_box(ui, .width = CUI_PX(1), .height = CUI_FILL, .bg = CUI_COLOR_BORDER_STRONG) {}
+            /* Dark half */
+            cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
+                       .bg = dark->background, .radius_tr = 5, .radius_br = 5, .gap = 0) {
+                cui_row(ui, .width = CUI_FILL, .height = CUI_PX(12),
+                        .bg = dark->chrome_bg, .radius_tr = 5, .pad_x = 5, .gap = 3,
+                        .align = CUI_ALIGN_CENTER) {
+                    cui_box(ui, .width = CUI_PX(3.5f), .height = CUI_PX(3.5f), .radius = 2,
+                            .bg = cui_alpha(dark->text_muted, 0.55f)) {}
+                    cui_box(ui, .width = CUI_PX(3.5f), .height = CUI_PX(3.5f), .radius = 2,
+                            .bg = cui_alpha(dark->text_muted, 0.40f)) {}
+                }
+                cui_box(ui, .width = CUI_FILL, .height = CUI_PX(1), .bg = dark->border) {}
+                cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
+                           .pad = 5, .gap = 4, .justify = CUI_JUSTIFY_CENTER) {
+                    cui_box(ui, .width = CUI_PCT(82), .height = CUI_PX(3.5f), .radius = 2,
+                            .bg = cui_alpha(dark->foreground, 0.78f)) {}
+                    cui_box(ui, .width = CUI_PCT(58), .height = CUI_PX(3.5f), .radius = 2,
+                            .bg = cui_alpha(dark->text_secondary, 0.55f)) {}
+                    cui_box(ui, .width = CUI_PX(18), .height = CUI_PX(6), .radius = 3.0f,
+                            .bg = dark->info) {}
+                }
+            }
+        }
+        return;
+    }
+
+    const app_theme_spec *s = app_theme_spec_get(mode);
+    cui_color pill_col = s->has_accent
+        ? s->accent
+        : (s->is_dark ? CUI_RGB(0x3a63b8) : CUI_RGB(0x2563eb));
+    cui_color bubble_bg = s->has_accent
+        ? cui_mix(s->surface, s->accent, s->is_dark ? 0.20f : 0.12f)
+        : s->surface_muted;
+
+    cui_row(ui, .width = CUI_FILL, .height = CUI_PX(52), .radius = 6,
+            .pad = 1, .bg = s->background, .border = 1.0f, .border_color = s->border,
+            .clip = true, .gap = 0, .align = CUI_ALIGN_STRETCH) {
+        /* Mini sidebar rail */
+        cui_column(ui, .width = CUI_PCT(29), .height = CUI_FILL,
+                   .bg = s->chrome_bg, .radius_tl = 5, .radius_bl = 5,
+                   .pad = 5, .gap = 3.5f) {
+            cui_row(ui, .gap = 2.5f, .align = CUI_ALIGN_CENTER) {
+                cui_box(ui, .width = CUI_PX(3.5f), .height = CUI_PX(3.5f), .radius = 2,
+                        .bg = cui_alpha(s->danger, 0.85f)) {}
+                cui_box(ui, .width = CUI_PX(3.5f), .height = CUI_PX(3.5f), .radius = 2,
+                        .bg = cui_alpha(s->warning, 0.85f)) {}
+                cui_box(ui, .width = CUI_PX(3.5f), .height = CUI_PX(3.5f), .radius = 2,
+                        .bg = cui_alpha(s->success, 0.85f)) {}
+            }
+            cui_box(ui, .width = CUI_FILL, .height = CUI_PX(7), .radius = 2.5f,
+                    .bg = s->surface, .border = 0.75f, .border_color = s->border) {}
+            cui_box(ui, .width = CUI_PCT(80), .height = CUI_PX(3), .radius = 1.5f,
+                    .bg = cui_alpha(s->text_muted, 0.55f)) {}
+            cui_box(ui, .width = CUI_PCT(62), .height = CUI_PX(3), .radius = 1.5f,
+                    .bg = cui_alpha(s->text_muted, 0.35f)) {}
+        }
+        cui_box(ui, .width = CUI_PX(1), .height = CUI_FILL, .bg = s->border) {}
+        /* Mini workspace */
+        cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
+                   .bg = s->background, .radius_tr = 5, .radius_br = 5,
+                   .pad = 5.5f, .gap = 4, .justify = CUI_JUSTIFY_BETWEEN) {
+            cui_row(ui, .width = CUI_FILL, .justify = CUI_JUSTIFY_END) {
+                cui_box(ui, .width = CUI_PCT(54), .height = CUI_PX(8), .radius = 3.5f,
+                        .bg = bubble_bg, .border = 0.75f, .border_color = s->border) {}
+            }
+            cui_column(ui, .width = CUI_FILL, .gap = 3) {
+                cui_box(ui, .width = CUI_PCT(86), .height = CUI_PX(3.5f), .radius = 2,
+                        .bg = cui_alpha(s->foreground, 0.82f)) {}
+                cui_box(ui, .width = CUI_PCT(62), .height = CUI_PX(3.5f), .radius = 2,
+                        .bg = cui_alpha(s->text_secondary, 0.55f)) {}
+            }
+            cui_row(ui, .width = CUI_FILL, .align = CUI_ALIGN_CENTER, .gap = 3.5f) {
+                cui_box(ui, .width = CUI_PX(4.5f), .height = CUI_PX(4.5f), .radius = 2.25f,
+                        .bg = s->info) {}
+                cui_box(ui, .width = CUI_PX(4.5f), .height = CUI_PX(4.5f), .radius = 2.25f,
+                        .bg = s->success) {}
+                cui_box(ui, .width = CUI_PX(4.5f), .height = CUI_PX(4.5f), .radius = 2.25f,
+                        .bg = s->tone_violet) {}
+                cui_spacer(ui);
+                cui_box(ui, .width = CUI_PX(18), .height = CUI_PX(6.5f), .radius = 3.25f,
+                        .bg = pill_col) {}
+            }
+        }
+    }
+}
+
 static bool draw_appearance_section(app_chrome *chrome, cui_ctx *ui, bool compact) {
-    static const char *const theme_labels[APP_THEME_COUNT] = { "System", "Light", "Dark" };
     static const char *const accent_labels[CUI_ACCENT_COUNT] = {
-        "Neutral", "Violet", "Blue", "Green", "Amber", "Orange", "Coral", "Rose"
+        "Theme default", "Violet", "Blue", "Green", "Amber", "Orange", "Coral", "Rose"
     };
     bool changed = false;
 
-    setting_row_begin(ui, "Theme", compact, true);
-    int mode = (int)chrome->settings.appearance.theme_mode;
-    bool theme_changed = compact
-        ? cui_select(ui, "theme-mode", theme_labels, APP_THEME_COUNT, &mode,
-                     .icons = chrome_theme_icons, .width = CUI_FILL)
-        : cui_segmented(ui, "theme-mode", theme_labels, APP_THEME_COUNT, &mode,
-                        .icons = chrome_theme_icons);
-    if (theme_changed) {
-        chrome->settings.appearance.theme_mode = (app_theme_mode)mode;
-        chrome->env_theme_override = false;
-        chrome->has_cached_system_dark = false;
-        chrome_apply_appearance(chrome, ui);
-        changed = true;
+    app_theme_mode active_mode = chrome->settings.appearance.theme_mode;
+    app_theme_mode resolved_mode = chrome_resolve_theme(chrome, ui);
+    const app_theme_spec *resolved_spec = app_theme_spec_get(resolved_mode);
+
+    cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
+        cui_text(ui, "Theme", .font = CUI_FONT_MEDIUM);
+        cui_spacer(ui);
+        if (active_mode == APP_THEME_SYSTEM) {
+            char sub[64];
+            snprintf(sub, sizeof sub, "Following system · %s", resolved_spec->label);
+            cui_muted(ui, sub);
+        } else {
+            cui_muted(ui, resolved_spec->is_dark ? "Dark theme" : "Light theme");
+        }
     }
-    cui_box_end(ui);
+
+    int theme_count = 0;
+    const app_theme_mode *order = app_theme_display_order(&theme_count);
+    cui_box(ui, .dir = CUI_GRID, .columns = compact ? 2 : 3,
+            .min_column_width = 148, .gap = 8, .width = CUI_FILL) {
+        for (int i = 0; i < theme_count; ++i) {
+            app_theme_mode mode = order[i];
+            const app_theme_spec *spec = app_theme_spec_get(mode);
+            bool selected = (active_mode == mode);
+
+            cui_push_id(ui, spec->id);
+            bool clicked = cui_card_begin(ui, &(cui_card_opts){
+                .id = "theme-card",
+                .dir = CUI_COLUMN,
+                .width = CUI_FILL,
+                .pad = 7,
+                .gap = 6,
+                .hoverable = true,
+                .selected = selected,
+                .radius = 10,
+                .border = selected ? 1.5f : 1.0f,
+            });
+            draw_theme_preview(ui, mode);
+            cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
+                cui_text(ui, spec->label,
+                         .font = selected ? CUI_FONT_MEDIUM : CUI_FONT_BODY,
+                         .size = 12.5f,
+                         .color = selected ? CUI_COLOR_FOREGROUND : CUI_COLOR_TEXT_SECONDARY,
+                         .width = CUI_FILL,
+                         .nowrap = true);
+                if (selected) {
+                    cui_icon(ui, CUI_ICON_CHECK, 13.0f, CUI_COLOR_ACCENT);
+                } else {
+                    cui_icon(ui, spec->icon, 11.5f, CUI_COLOR_TEXT_MUTED);
+                }
+            }
+            cui_card_end(ui);
+            cui_pop_id(ui);
+
+            if (clicked && !selected) {
+                chrome->settings.appearance.theme_mode = mode;
+                chrome->env_theme_override = false;
+                chrome->has_cached_system_dark = false;
+                chrome_apply_appearance(chrome, ui);
+                cui_request_redraw(ui);
+                changed = true;
+            }
+        }
+    }
+
+    cui_separator(ui);
 
     setting_row_begin(ui, "Accent color", compact, true);
     int accent = (int)chrome->settings.appearance.accent;

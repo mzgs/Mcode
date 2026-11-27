@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include "app_config.h"
 #include "app_log.h"
+#include "app_theme.h"
 #include "settings.h"
 
 enum {

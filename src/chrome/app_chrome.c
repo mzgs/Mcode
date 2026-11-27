@@ -11,10 +11,6 @@
 #include "app_menu.h"
 #endif
 
-const char *const chrome_theme_icons[APP_THEME_COUNT] = {
-    CUI_ICON_MONITOR, CUI_ICON_SUN, CUI_ICON_MOON
-};
-
 const char *const chrome_section_labels[SETTINGS_SECTION_COUNT] = {
     "General", "Appearance", "Keybindings", "About"
 };
@@ -84,10 +80,9 @@ bool app_contains_ignore_case(const char *text, const char *query) {
     return !*query;
 }
 
-static cui_theme_mode resolve_theme_mode(app_chrome *chrome, cui_ctx *ui,
-                                         app_theme_mode mode, cui_theme_mode fallback) {
-    if (mode == APP_THEME_LIGHT) return CUI_THEME_LIGHT;
-    if (mode == APP_THEME_DARK) return CUI_THEME_DARK;
+static app_theme_mode resolve_concrete_theme(app_chrome *chrome, cui_ctx *ui,
+                                             app_theme_mode mode, cui_theme_mode fallback) {
+    if (mode > APP_THEME_SYSTEM && mode < APP_THEME_COUNT) return mode;
     int dark = -1;
     if (chrome && ui) {
         double now = cui_time(ui);
@@ -101,8 +96,23 @@ static cui_theme_mode resolve_theme_mode(app_chrome *chrome, cui_ctx *ui,
     } else {
         dark = app_system_dark();
     }
-    if (dark >= 0) return dark ? CUI_THEME_DARK : CUI_THEME_LIGHT;
-    return fallback;
+    if (dark >= 0) return dark ? APP_THEME_DARK : APP_THEME_LIGHT;
+    return fallback == CUI_THEME_DARK ? APP_THEME_DARK : APP_THEME_LIGHT;
+}
+
+app_theme_mode chrome_resolve_theme(app_chrome *chrome, cui_ctx *ui) {
+    if (chrome && chrome->env_theme_override) {
+        return (ui && cui_get_theme_mode(ui) == CUI_THEME_DARK)
+            ? APP_THEME_DARK : APP_THEME_LIGHT;
+    }
+    app_theme_mode mode = chrome ? chrome->settings.appearance.theme_mode : APP_THEME_SYSTEM;
+    return resolve_concrete_theme(chrome, ui, mode, CUI_THEME_LIGHT);
+}
+
+static cui_theme_mode resolve_theme_mode(app_chrome *chrome, cui_ctx *ui,
+                                         app_theme_mode mode, cui_theme_mode fallback) {
+    app_theme_mode resolved = resolve_concrete_theme(chrome, ui, mode, fallback);
+    return app_theme_spec_get(resolved)->is_dark ? CUI_THEME_DARK : CUI_THEME_LIGHT;
 }
 
 void app_chrome_notify(app_chrome *chrome, cui_ctx *ui, const char *message, cui_tone tone) {
@@ -130,15 +140,17 @@ void chrome_open_log_file(app_chrome *chrome, cui_ctx *ui) {
 
 void chrome_format_debug_info(const app_chrome *chrome, cui_ctx *ui, char *out, size_t cap) {
     if (!out || cap == 0) return;
-    static const char *const mode_names[APP_THEME_COUNT] = { "System", "Light", "Dark" };
     char os_info[128] = "unknown";
     app_os_info(os_info, sizeof os_info);
 
     const char *backend = cui_app_backend(NULL);
     const char *renderer = cui_app_is_software(NULL) ? "Software" : "OpenGL";
-    const char *resolved_theme = (ui && cui_get_theme_mode(ui) == CUI_THEME_DARK) ? "Dark" : "Light";
     app_theme_mode mode = chrome ? chrome->settings.appearance.theme_mode : APP_THEME_SYSTEM;
-    const char *mode_name = (mode >= 0 && mode < APP_THEME_COUNT) ? mode_names[mode] : "System";
+    const app_theme_spec *active = app_theme_current(ui);
+    const char *resolved_theme = active ? active->label : "Light";
+    const char *mode_name = (mode == APP_THEME_SYSTEM)
+        ? "System"
+        : (active && active->is_dark ? "Dark" : "Light");
     int scale_pct = chrome ? (int)lroundf(chrome->settings.appearance.font_scale * 100.0f) : 100;
     cui_vec2 win = cui_app_ui(NULL) ? cui_app_size(NULL) : (cui_vec2){ 0, 0 };
     int win_w = (int)lroundf(win.x);
@@ -347,9 +359,12 @@ void chrome_apply_appearance(app_chrome *chrome, cui_ctx *ui) {
         chrome->has_cached_system_dark = false;
     }
 
+    app_theme_mode resolved = APP_THEME_LIGHT;
     if (!chrome->env_theme_override) {
-        cui_theme_mode target = resolve_theme_mode(chrome, ui, chrome->settings.appearance.theme_mode, CUI_THEME_LIGHT);
-        cui_set_theme(ui, target);
+        resolved = resolve_concrete_theme(chrome, ui, chrome->settings.appearance.theme_mode, CUI_THEME_LIGHT);
+        cui_set_theme(ui, app_theme_spec_get(resolved)->is_dark ? CUI_THEME_DARK : CUI_THEME_LIGHT);
+    } else {
+        resolved = (cui_get_theme_mode(ui) == CUI_THEME_DARK) ? APP_THEME_DARK : APP_THEME_LIGHT;
     }
     if (cui_app_ui(NULL) == ui) {
         app_window_set_dark(cui_app_native_window(NULL), cui_app_backend(NULL),
@@ -358,27 +373,8 @@ void chrome_apply_appearance(app_chrome *chrome, cui_ctx *ui) {
     if (!chrome->env_accent_override) {
         cui_set_accent(ui, chrome->settings.appearance.accent);
     }
+    app_theme_apply(ui, resolved, cui_get_accent(ui));
     cui_theme *theme = cui_theme_get(ui);
-    if (cui_get_theme_mode(ui) == CUI_THEME_DARK) {
-        /* Deep cool-graphite surface ladder: avoids pure #000000 halation while
-         * keeping chrome rails (#0f1014), workspace (#141519), and cards distinct. */
-        theme->colors[CUI_TOKEN_BACKGROUND]     = CUI_RGBA(0x141519ffu);
-        theme->colors[CUI_TOKEN_SURFACE]        = CUI_RGBA(0x1a1c22ffu);
-        theme->colors[CUI_TOKEN_SURFACE_RAISED] = CUI_RGBA(0x20222affu);
-        theme->colors[CUI_TOKEN_SURFACE_MUTED]  = CUI_RGBA(0x252831ffu);
-        theme->colors[CUI_TOKEN_BORDER]         = CUI_RGBA(0x292c36ffu);
-        theme->colors[CUI_TOKEN_BORDER_SUBTLE]  = CUI_RGBA(0x20222bffu);
-        theme->colors[CUI_TOKEN_BORDER_STRONG]  = CUI_RGBA(0x484c5cffu);
-    } else {
-        /* Crisp white workspace framed by soft cool-tinted sidebars and hairlines. */
-        theme->colors[CUI_TOKEN_BACKGROUND]     = CUI_RGBA(0xffffffffu);
-        theme->colors[CUI_TOKEN_SURFACE]        = CUI_RGBA(0xffffffffu);
-        theme->colors[CUI_TOKEN_SURFACE_RAISED] = CUI_RGBA(0xffffffffu);
-        theme->colors[CUI_TOKEN_SURFACE_MUTED]  = CUI_RGBA(0xf5f6f8ffu);
-        theme->colors[CUI_TOKEN_BORDER]         = CUI_RGBA(0xe3e6ecffu);
-        theme->colors[CUI_TOKEN_BORDER_SUBTLE]  = CUI_RGBA(0xedf0f4ffu);
-        theme->colors[CUI_TOKEN_BORDER_STRONG]  = CUI_RGBA(0xb7bcc8ffu);
-    }
     float scale = chrome->settings.appearance.font_scale;
     if (scale < FONT_SCALE_MIN || scale > FONT_SCALE_MAX || !isfinite(scale)) scale = 1.0f;
     theme->font_scale = scale;

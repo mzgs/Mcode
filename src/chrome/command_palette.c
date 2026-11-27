@@ -1,5 +1,6 @@
 #include "chrome_internal.h"
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 enum {
@@ -8,13 +9,11 @@ enum {
     BUILTIN_APPEARANCE_SETTINGS,
     BUILTIN_KEYBINDINGS,
     BUILTIN_ABOUT,
-    BUILTIN_THEME_SYSTEM,
-    BUILTIN_THEME_LIGHT,
-    BUILTIN_THEME_DARK,
     BUILTIN_TOGGLE_FULLSCREEN,
     BUILTIN_OPEN_SETTINGS_FOLDER,
     BUILTIN_OPEN_LOG_FILE,
     BUILTIN_CHECK_UPDATES,
+    BUILTIN_THEME_FIRST,
 };
 
 typedef struct {
@@ -135,7 +134,7 @@ static void coalesce_groups(const app_palette_builder *builder,
 
 static void populate_palette(app_chrome *chrome, cui_ctx *ui, app_palette_builder *builder) {
     memset(builder, 0, sizeof *builder);
-    int builtin_count = 10 + (app_updater_configured() ? 1 : 0);
+    int builtin_count = 7 + APP_THEME_COUNT + (app_updater_configured() ? 1 : 0);
     builder->max_dynamic = APP_MAX_PALETTE_COMMANDS - builtin_count;
 
     /* 1. App-registered actions */
@@ -170,12 +169,14 @@ static void populate_palette(app_chrome *chrome, cui_ctx *ui, app_palette_builde
     palette_push_raw(builder, "About " APP_NAME, chrome_section_icons[SETTINGS_SECTION_ABOUT],
                      "Navigation", NULL, NULL, NULL, BUILTIN_ABOUT);
 
-    palette_push_raw(builder, "Theme: System", chrome_theme_icons[APP_THEME_SYSTEM],
-                     "Appearance", NULL, NULL, NULL, BUILTIN_THEME_SYSTEM);
-    palette_push_raw(builder, "Theme: Light", chrome_theme_icons[APP_THEME_LIGHT],
-                     "Appearance", NULL, NULL, NULL, BUILTIN_THEME_LIGHT);
-    palette_push_raw(builder, "Theme: Dark", chrome_theme_icons[APP_THEME_DARK],
-                     "Appearance", NULL, NULL, NULL, BUILTIN_THEME_DARK);
+    int theme_count = 0;
+    const app_theme_mode *theme_order = app_theme_display_order(&theme_count);
+    for (int i = 0; i < theme_count; ++i) {
+        const app_theme_spec *spec = app_theme_spec_get(theme_order[i]);
+        palette_push_raw(builder, spec->palette_title, spec->icon,
+                         "Appearance", NULL, NULL, NULL,
+                         BUILTIN_THEME_FIRST + (int)theme_order[i]);
+    }
     palette_push_raw(builder, "Toggle Fullscreen", CUI_ICON_MAXIMIZE_2,
                      "Appearance", NULL, NULL, NULL, BUILTIN_TOGGLE_FULLSCREEN);
 
@@ -222,6 +223,23 @@ void chrome_collect_palette_snapshot(app_chrome *chrome, cui_ctx *ui, chrome_pal
 }
 
 static void dispatch_builtin(app_chrome *chrome, cui_ctx *ui, int builtin_id) {
+    if (builtin_id >= BUILTIN_THEME_FIRST &&
+        builtin_id < BUILTIN_THEME_FIRST + APP_THEME_COUNT) {
+        app_theme_mode mode = (app_theme_mode)(builtin_id - BUILTIN_THEME_FIRST);
+        const app_theme_spec *spec = app_theme_spec_get(mode);
+        chrome->settings.appearance.theme_mode = mode;
+        chrome->env_theme_override = false;
+        chrome->has_cached_system_dark = false;
+        chrome_apply_appearance(chrome, ui);
+        cui_request_redraw(ui);
+        if (chrome_save_settings(chrome, ui)) {
+            char msg[96];
+            snprintf(msg, sizeof msg, "Theme set to %s.", spec->label);
+            app_chrome_notify(chrome, ui, msg, CUI_TONE_INFO);
+        }
+        return;
+    }
+
     switch (builtin_id) {
     case BUILTIN_OPEN_SETTINGS:
         chrome->settings_open = true;
@@ -238,22 +256,6 @@ static void dispatch_builtin(app_chrome *chrome, cui_ctx *ui, int builtin_id) {
         chrome->settings_section = SETTINGS_SECTION_ABOUT;
         chrome->settings_open = true;
         break;
-    case BUILTIN_THEME_SYSTEM:
-    case BUILTIN_THEME_LIGHT:
-    case BUILTIN_THEME_DARK: {
-        static const app_theme_mode modes[] = { APP_THEME_SYSTEM, APP_THEME_LIGHT, APP_THEME_DARK };
-        static const char *const messages[] = {
-            "Theme set to System.", "Theme set to Light.", "Theme set to Dark."
-        };
-        int idx = builtin_id - BUILTIN_THEME_SYSTEM;
-        chrome->settings.appearance.theme_mode = modes[idx];
-        chrome->env_theme_override = false;
-        chrome->has_cached_system_dark = false;
-        chrome_apply_appearance(chrome, ui);
-        if (chrome_save_settings(chrome, ui))
-            app_chrome_notify(chrome, ui, messages[idx], CUI_TONE_INFO);
-        break;
-    }
     case BUILTIN_TOGGLE_FULLSCREEN:
         chrome_toggle_fullscreen();
         break;

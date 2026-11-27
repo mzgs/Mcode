@@ -505,9 +505,9 @@ int mcode_ui_draw_commit_msg_input(mcode_app *app, cui_ctx *ui, const char *id,
             cui_color icon_col = btn_disabled
                 ? cui_alpha(fg, dark ? 0.28f : 0.30f)
                 : (gen_hov
-                       ? (cui_get_accent(ui) == CUI_ACCENT_NEUTRAL
-                              ? CUI_COLOR_FOREGROUND
-                              : CUI_COLOR_ACCENT)
+                       ? (app_theme_has_accent(ui)
+                              ? CUI_COLOR_ACCENT
+                              : CUI_COLOR_FOREGROUND)
                        : CUI_COLOR_TEXT_SECONDARY);
 
             cui_push_disabled(ui, btn_disabled);
@@ -634,9 +634,13 @@ static void draw_source_control_commit_box(mcode_app *app, cui_ctx *ui,
             mode = SC_BTN_COMMIT;
         }
 
-        cui_color active_bg = (cui_get_accent(ui) == CUI_ACCENT_NEUTRAL)
-            ? (dark ? CUI_RGBA(0x3a63b8ffu) : CUI_RGBA(0x2563ebffu))
-            : cui_color_of(ui, CUI_COLOR_ACCENT);
+        bool has_accent = app_theme_has_accent(ui);
+        cui_color active_bg = has_accent
+            ? cui_color_of(ui, CUI_COLOR_ACCENT)
+            : (dark ? CUI_RGBA(0x3a63b8ffu) : CUI_RGBA(0x2563ebffu));
+        cui_color active_fg = has_accent
+            ? cui_color_of(ui, CUI_COLOR_ACCENT_FOREGROUND)
+            : CUI_RGBA(0xffffffffu);
 
         if (mode == SC_BTN_BUSY || mode == SC_BTN_SYNC || mode == SC_BTN_PUBLISH) {
             char btn_label[96] = "";
@@ -687,7 +691,7 @@ static void draw_source_control_commit_box(mcode_app *app, cui_ctx *ui,
                            .loading = (mode == SC_BTN_BUSY),
                            .full_width = true,
                            .bg = active_bg,
-                           .color = CUI_RGBA(0xffffffffu),
+                           .color = active_fg,
                            .radius = 6.0f,
                            .tooltip = btn_tooltip)) {
                 if (mode == SC_BTN_SYNC) {
@@ -699,10 +703,10 @@ static void draw_source_control_commit_box(mcode_app *app, cui_ctx *ui,
         } else {
             cui_color accent_bg = has_changes
                 ? active_bg
-                : (dark ? CUI_RGBA(0x1f335cffu) : CUI_RGBA(0x93b4f5ffu));
+                : cui_mix(active_bg, mcode_ui_chrome_bg(ui), dark ? 0.58f : 0.50f);
             cui_color btn_fg = has_changes
-                ? CUI_RGBA(0xffffffffu)
-                : cui_alpha(CUI_RGBA(0xffffffffu), 0.72f);
+                ? active_fg
+                : cui_alpha(active_fg, 0.72f);
 
             cui_row(ui, .width = CUI_FILL, .gap = 0, .radius = 6.0f, .clip = true,
                     .align = CUI_ALIGN_STRETCH) {
@@ -723,7 +727,7 @@ static void draw_source_control_commit_box(mcode_app *app, cui_ctx *ui,
                 }
 
                 cui_box(ui, .width = CUI_PX(1), .height = CUI_FILL,
-                        .bg = cui_alpha(CUI_RGBA(0xffffffffu), 0.22f)) {}
+                        .bg = cui_alpha(active_fg, 0.22f)) {}
 
                 if (cui_icon_button(ui, CUI_ICON_CHEVRON_DOWN,
                                     .variant = CUI_BUTTON_PRIMARY,
@@ -941,8 +945,11 @@ static bool draw_change_file_rows(mcode_app *app, cui_ctx *ui, const char *workd
         bool btn_hov = rect_contains(cui_get_rect(ui, btn_id), mp);
         bool any_hov = row_hov || btn_hov;
 
+        cui_color sel_tint = app_theme_has_accent(ui)
+            ? cui_color_of(ui, CUI_COLOR_ACCENT)
+            : cui_color_of(ui, CUI_COLOR_INFO);
         cui_color row_bg = selected
-            ? (dark ? CUI_RGBA(0x1d2638ffu) : CUI_RGBA(0xe2ecfcffu))
+            ? cui_mix(mcode_ui_chrome_bg(ui), sel_tint, dark ? 0.20f : 0.14f)
             : (any_hov ? right_hover_bg(ui, dark ? 0.065f : 0.045f)
                        : CUI_RGBA(0x00000001u));
 
@@ -1232,8 +1239,11 @@ static void draw_file_tree_nodes(mcode_app *app, cui_ctx *ui,
         cui_id row_id = cui_make_id(ui, "fs-row");
         bool hov = rect_contains(cui_get_rect(ui, row_id), cui_mouse_pos(ui));
 
+        cui_color sel_tint = app_theme_has_accent(ui)
+            ? cui_color_of(ui, CUI_COLOR_ACCENT)
+            : cui_color_of(ui, CUI_COLOR_INFO);
         cui_color row_bg = selected
-            ? (dark ? CUI_RGBA(0x1d2638ffu) : CUI_RGBA(0xe2ecfcffu))
+            ? cui_mix(mcode_ui_chrome_bg(ui), sel_tint, dark ? 0.20f : 0.14f)
             : (hov ? right_hover_bg(ui, dark ? 0.065f : 0.045f)
                    : CUI_RGBA(0x00000001u));
 

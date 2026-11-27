@@ -4,7 +4,6 @@
 #include "app_chrome.h"
 #include "updater.h"
 
-extern const char *const chrome_theme_icons[APP_THEME_COUNT];
 extern const char *const chrome_section_labels[SETTINGS_SECTION_COUNT];
 extern const char *const chrome_section_icons[SETTINGS_SECTION_COUNT];
 
@@ -12,6 +11,7 @@ bool app_contains_ignore_case(const char *text, const char *query);
 
 app_settings chrome_default_settings(void);
 void chrome_reset_settings(app_chrome *chrome);
+app_theme_mode chrome_resolve_theme(app_chrome *chrome, cui_ctx *ui);
 void chrome_apply_appearance(app_chrome *chrome, cui_ctx *ui);
 void chrome_reload_appearance(app_chrome *chrome, cui_ctx *ui);
 bool chrome_save_settings(app_chrome *chrome, cui_ctx *ui);
