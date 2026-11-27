@@ -45,7 +45,7 @@ find_package(Threads REQUIRED)
 include(FetchContent)
 FetchContent_Declare(cui
     GIT_REPOSITORY https://github.com/mzgs/Better-C-UI.git
-    GIT_TAG d5f4bd6f4d4359ca3667e8a848324e0bb05a17d8)
+    GIT_TAG 2b0ff0e61b406ccae8e230a56b0485c8df1fc61f)
 FetchContent_Declare(yyjson
     GIT_REPOSITORY https://github.com/ibireme/yyjson.git
     GIT_TAG 6447536015f3d600f3d65323b10976103b337ca7)
