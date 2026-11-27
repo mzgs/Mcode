@@ -376,7 +376,14 @@ void mcode_file_tree_refresh(mcode_file_tree *tree, const char *root_path, bool 
         return;
     }
 
-    bool same_root = (strcmp(tree->root_path, root_path) == 0);
+    char norm_root[MCODE_PATH_MAX];
+    mcode_normalize_path(norm_root, sizeof norm_root, root_path);
+    if (!norm_root[0]) {
+        mcode_file_tree_clear(tree);
+        return;
+    }
+
+    bool same_root = (strcmp(tree->root_path, norm_root) == 0);
     char **saved_expanded = NULL;
     int saved_count = 0;
 
@@ -397,11 +404,7 @@ void mcode_file_tree_refresh(mcode_file_tree *tree, const char *root_path, bool 
     }
 
     mcode_file_tree_clear(tree);
-    snprintf(tree->root_path, sizeof tree->root_path, "%s", root_path);
-    size_t rlen = strlen(tree->root_path);
-    while (rlen > 1 && (tree->root_path[rlen - 1] == '/' || tree->root_path[rlen - 1] == '\\')) {
-        tree->root_path[--rlen] = '\0';
-    }
+    snprintf(tree->root_path, sizeof tree->root_path, "%s", norm_root);
     tree->is_git_repo = is_git_repo;
 
     if (git_files && git_file_count > 0) {

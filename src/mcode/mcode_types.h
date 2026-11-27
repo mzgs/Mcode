@@ -267,6 +267,8 @@ double mcode_now_mono(void);
 int64_t mcode_now_epoch(void);
 /* Generate a short unique hex ID. */
 void mcode_gen_id(char *out, size_t cap, const char *prefix);
+/* Copy a filesystem path and strip redundant trailing slashes. */
+void mcode_normalize_path(char *out, size_t cap, const char *path);
 
 /* Helper constructors / destructors for turns and blocks. */
 mcode_turn *mcode_thread_add_turn(mcode_thread *thread, const char *prompt);

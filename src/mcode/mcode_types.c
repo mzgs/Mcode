@@ -100,6 +100,24 @@ void mcode_gen_id(char *out, size_t cap, const char *prefix) {
     }
 }
 
+void mcode_normalize_path(char *out, size_t cap, const char *path) {
+    if (!out || cap == 0) return;
+    if (!path || !path[0]) {
+        out[0] = '\0';
+        return;
+    }
+    if (out != path) {
+        snprintf(out, cap, "%s", path);
+    } else {
+        out[cap - 1] = '\0';
+    }
+    size_t len = strlen(out);
+    while (len > 1 && (out[len - 1] == '/' || out[len - 1] == '\\')) {
+        if (len == 3 && isalpha((unsigned char)out[0]) && out[1] == ':') break;
+        out[--len] = '\0';
+    }
+}
+
 mcode_turn *mcode_thread_add_turn(mcode_thread *thread, const char *prompt) {
     if (!thread) return NULL;
     if (thread->turn_count >= thread->turn_cap) {

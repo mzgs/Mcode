@@ -233,16 +233,19 @@ void mcode_ui_refresh_workspace_git(mcode_app *app) {
         return;
     }
 
+    char norm_root[MCODE_PATH_MAX];
+    mcode_normalize_path(norm_root, sizeof norm_root, root);
+
     if (app->commit_gen_run && app->commit_gen_target == MCODE_COMMIT_GEN_SIDEBAR &&
-        strcmp(app->commit_gen_workdir, root) != 0) {
+        strcmp(app->commit_gen_workdir, norm_root) != 0) {
         mcode_ui_cancel_commit_msg_gen(app);
     }
 
-    snprintf(app->git_workdir, sizeof app->git_workdir, "%s", root);
+    snprintf(app->git_workdir, sizeof app->git_workdir, "%s", norm_root);
 
     mcode_diff_file *files = NULL;
     int count = 0, add = 0, rem = 0;
-    if (!mcode_git_list_changes(root, &files, &count, &add, &rem)) {
+    if (!mcode_git_list_changes(norm_root, &files, &count, &add, &rem)) {
         free(files);
         files = NULL;
         count = 0;
@@ -250,7 +253,7 @@ void mcode_ui_refresh_workspace_git(mcode_app *app) {
         rem = 0;
     }
 
-    if (!mcode_git_get_sync_status(root, &app->git_sync)) {
+    if (!mcode_git_get_sync_status(norm_root, &app->git_sync)) {
         memset(&app->git_sync, 0, sizeof app->git_sync);
     }
 
@@ -276,7 +279,7 @@ void mcode_ui_refresh_workspace_git(mcode_app *app) {
 
     /* Keep selected thread's diff snapshot & live branch mirrored for topbar & commit dialog */
     mcode_thread *t = mcode_store_selected_thread(&app->store);
-    if (t && strcmp(t->workdir, root) == 0) {
+    if (t && strcmp(t->workdir, norm_root) == 0) {
         free(t->diff_files);
         t->diff_files = NULL;
         if (count > 0) {
@@ -295,13 +298,13 @@ void mcode_ui_refresh_workspace_git(mcode_app *app) {
         }
     }
     if (app->git_sync.valid && app->git_sync.branch[0]) {
-        mcode_project *p = mcode_store_find_project_by_path(&app->store, root);
+        mcode_project *p = mcode_store_find_project_by_path(&app->store, norm_root);
         if (p && strcmp(p->default_branch, app->git_sync.branch) != 0) {
             snprintf(p->default_branch, sizeof p->default_branch, "%s", app->git_sync.branch);
         }
     }
 
-    mcode_file_tree_refresh(&app->file_tree, root, is_git, app->git_files, app->git_file_count);
+    mcode_file_tree_refresh(&app->file_tree, norm_root, is_git, app->git_files, app->git_file_count);
 }
 
 bool mcode_ui_is_git_op_running(const mcode_app *app, const char *workdir) {
@@ -1043,6 +1046,8 @@ static bool start_thread_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread,
         thread->is_draft = false;
         thread->created_at = mcode_now_epoch();
         thread->updated_at = thread->created_at;
+        mcode_project *proj = mcode_store_find_project(&app->store, thread->project_id);
+        if (proj) proj->collapsed = false;
         nav_history_push(app, thread->id);
         mcode_ui_refresh_thread_diff(thread);
     }

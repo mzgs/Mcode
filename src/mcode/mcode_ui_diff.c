@@ -1425,9 +1425,9 @@ void mcode_ui_draw_diff(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
     if (proj) snprintf(proj_id, sizeof proj_id, "%s", proj->id);
     char workdir[MCODE_PATH_MAX] = "";
     if (thread && thread->workdir[0]) {
-        snprintf(workdir, sizeof workdir, "%s", thread->workdir);
+        mcode_normalize_path(workdir, sizeof workdir, thread->workdir);
     } else if (proj && proj->path[0]) {
-        snprintf(workdir, sizeof workdir, "%s", proj->path);
+        mcode_normalize_path(workdir, sizeof workdir, proj->path);
     }
     char proj_name[MCODE_NAME_MAX];
     snprintf(proj_name, sizeof proj_name, "%s", proj ? proj->name : "Project");

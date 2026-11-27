@@ -296,7 +296,7 @@ static bool draw_project_section(mcode_app *app, cui_ctx *ui, int proj_idx, bool
     cui_push_id(ui, proj_id);
 
     cui_column(ui, .width = CUI_FILL, .gap = 3) {
-        /* Project header row: clickable folder toggle + subtle 1-click "+" action */
+        /* Project header row: clickable toggle + new thread screen + subtle 1-click "+" action */
         cui_vec2 mp = cui_mouse_pos(ui);
         cui_id hid = cui_make_id(ui, "phdr");
         cui_id pid = cui_make_id(ui, "padd");
@@ -394,10 +394,13 @@ static bool draw_project_section(mcode_app *app, cui_ctx *ui, int proj_idx, bool
             if (hdr_clicked && !removed) {
                 mcode_project *cur = mcode_store_find_project(&app->store, proj_id);
                 if (cur) {
-                    if (!searching) cur->collapsed = !cur->collapsed;
-                    snprintf(app->store.selected_project_id,
-                             sizeof app->store.selected_project_id, "%s", cur->id);
-                    mcode_ui_mark_dirty(app);
+                    bool next_collapsed = searching ? cur->collapsed : !cur->collapsed;
+                    mcode_ui_quick_new_thread(app, ui, cur);
+                    cur = mcode_store_find_project(&app->store, proj_id);
+                    if (cur) {
+                        cur->collapsed = next_collapsed;
+                        mcode_ui_mark_dirty(app);
+                    }
                 }
             }
 

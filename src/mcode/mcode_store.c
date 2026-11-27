@@ -53,8 +53,11 @@ mcode_project *mcode_store_find_project(mcode_store *store, const char *id) {
 
 mcode_project *mcode_store_find_project_by_path(mcode_store *store, const char *path) {
     if (!store || !path || !path[0]) return NULL;
+    char norm[MCODE_PATH_MAX];
+    mcode_normalize_path(norm, sizeof norm, path);
+    if (!norm[0]) return NULL;
     for (int i = 0; i < store->project_count; ++i) {
-        if (strcmp(store->projects[i].path, path) == 0) return &store->projects[i];
+        if (strcmp(store->projects[i].path, norm) == 0) return &store->projects[i];
     }
     return NULL;
 }
@@ -149,7 +152,10 @@ mcode_project *mcode_store_move_project_to_top(mcode_store *store, const char *i
 
 mcode_project *mcode_store_add_project(mcode_store *store, const char *path, const char *name) {
     if (!store || !path || !path[0]) return NULL;
-    mcode_project *existing = mcode_store_find_project_by_path(store, path);
+    char norm_path[MCODE_PATH_MAX];
+    mcode_normalize_path(norm_path, sizeof norm_path, path);
+    if (!norm_path[0]) return NULL;
+    mcode_project *existing = mcode_store_find_project_by_path(store, norm_path);
     if (existing) {
         char existing_id[MCODE_ID_MAX];
         snprintf(existing_id, sizeof existing_id, "%s", existing->id);
@@ -173,11 +179,11 @@ mcode_project *mcode_store_add_project(mcode_store *store, const char *path, con
     mcode_project *p = &store->projects[0];
     memset(p, 0, sizeof *p);
     mcode_gen_id(p->id, sizeof p->id, "proj");
-    snprintf(p->path, sizeof p->path, "%s", path);
+    snprintf(p->path, sizeof p->path, "%s", norm_path);
     if (name && name[0]) {
         snprintf(p->name, sizeof p->name, "%s", name);
     } else {
-        derive_folder_name(path, p->name, sizeof p->name);
+        derive_folder_name(norm_path, p->name, sizeof p->name);
     }
     mcode_git_inspect_repo(p->path, &p->is_git_repo,
                            p->default_branch, sizeof p->default_branch,
@@ -237,8 +243,8 @@ mcode_thread *mcode_store_add_thread(mcode_store *store, const mcode_project *pr
     if (model && model[0]) snprintf(t->model, sizeof t->model, "%s", model);
     t->auto_approve = auto_approve;
     t->perm_mode = auto_approve ? MCODE_PERM_FULL_ACCESS : MCODE_PERM_ACCEPT_EDITS;
-    if (workdir && workdir[0]) snprintf(t->workdir, sizeof t->workdir, "%s", workdir);
-    else if (proj) snprintf(t->workdir, sizeof t->workdir, "%s", proj->path);
+    if (workdir && workdir[0]) mcode_normalize_path(t->workdir, sizeof t->workdir, workdir);
+    else if (proj) mcode_normalize_path(t->workdir, sizeof t->workdir, proj->path);
     if (branch && branch[0]) snprintf(t->branch, sizeof t->branch, "%s", branch);
     else if (proj) snprintf(t->branch, sizeof t->branch, "%s", proj->default_branch);
     t->state = MCODE_THREAD_ACTIVE;
@@ -315,8 +321,8 @@ bool mcode_store_load(mcode_store *store, const char *path) {
              jstr_or(root, "selected_project_id", ""));
     snprintf(store->selected_thread_id, sizeof store->selected_thread_id, "%s",
              jstr_or(root, "selected_thread_id", ""));
-    snprintf(store->default_project_dir, sizeof store->default_project_dir, "%s",
-             jstr_or(root, "default_project_dir", ""));
+    mcode_normalize_path(store->default_project_dir, sizeof store->default_project_dir,
+                         jstr_or(root, "default_project_dir", ""));
 
     yyjson_val *layout = yyjson_obj_get(root, "layout");
     if (yyjson_is_obj(layout)) {
@@ -357,7 +363,7 @@ bool mcode_store_load(mcode_store *store, const char *path) {
             snprintf(p->id, sizeof p->id, "%s", jstr_or(pv, "id", ""));
             if (!p->id[0]) mcode_gen_id(p->id, sizeof p->id, "proj");
             snprintf(p->name, sizeof p->name, "%s", jstr_or(pv, "name", "Project"));
-            snprintf(p->path, sizeof p->path, "%s", ppath);
+            mcode_normalize_path(p->path, sizeof p->path, ppath);
             snprintf(p->default_branch, sizeof p->default_branch, "%s", jstr_or(pv, "default_branch", ""));
             snprintf(p->remote_url, sizeof p->remote_url, "%s", jstr_or(pv, "remote_url", ""));
             p->is_git_repo = jbool_or(pv, "is_git_repo", false);
@@ -420,7 +426,7 @@ bool mcode_store_load(mcode_store *store, const char *path) {
             } else {
                 t->perm_mode = t->auto_approve ? MCODE_PERM_FULL_ACCESS : MCODE_PERM_ACCEPT_EDITS;
             }
-            snprintf(t->workdir, sizeof t->workdir, "%s", jstr_or(tv, "workdir", ""));
+            mcode_normalize_path(t->workdir, sizeof t->workdir, jstr_or(tv, "workdir", ""));
             snprintf(t->branch, sizeof t->branch, "%s", jstr_or(tv, "branch", ""));
             snprintf(t->session_id, sizeof t->session_id, "%s", jstr_or(tv, "session_id", ""));
             int st = jint_or(tv, "state", MCODE_THREAD_ACTIVE);
