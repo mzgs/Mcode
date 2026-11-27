@@ -23,6 +23,8 @@ void mcode_ui_load_workspace_diff(mcode_app *app);
 bool mcode_ui_start_git_op(mcode_app *app, cui_ctx *ui, mcode_git_op_kind kind,
                            const char *workdir, bool commit_followup);
 bool mcode_ui_is_git_op_running(const mcode_app *app, const char *workdir);
+void mcode_ui_open_discard_all_dialog(mcode_app *app, const char *workdir);
+void mcode_ui_perform_discard_all(mcode_app *app, cui_ctx *ui);
 void mcode_ui_refresh_file_tree(mcode_app *app);
 void mcode_ui_open_diff_file(mcode_app *app, int file_idx);
 void mcode_ui_open_file_preview(mcode_app *app, cui_ctx *ui, const char *root_path,

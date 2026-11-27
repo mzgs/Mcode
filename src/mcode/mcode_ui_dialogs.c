@@ -685,10 +685,61 @@ static void draw_project_actions_dialog(mcode_app *app, cui_ctx *ui) {
     }
 }
 
+static void draw_discard_all_dialog(mcode_app *app, cui_ctx *ui) {
+    int tracked = app->discard_dialog_tracked_count;
+    int untracked = app->discard_dialog_untracked_count;
+    int total = tracked + untracked;
+    int staged = app->discard_dialog_staged_count;
+
+    char desc[256];
+    if (tracked > 0 && untracked > 0) {
+        snprintf(desc, sizeof desc,
+                 "Revert %d modified %s and permanently delete %d untracked %s.",
+                 tracked, tracked == 1 ? "file" : "files",
+                 untracked, untracked == 1 ? "file" : "files");
+    } else if (untracked > 0) {
+        snprintf(desc, sizeof desc,
+                 "Permanently delete %d untracked %s.",
+                 untracked, untracked == 1 ? "file" : "files");
+    } else {
+        snprintf(desc, sizeof desc,
+                 "Revert uncommitted changes in %d %s.",
+                 total, total == 1 ? "file" : "files");
+    }
+
+    const char *warn_desc = staged > 0
+        ? "Staged changes will remain intact in the index."
+        : (tracked > 0 && untracked > 0)
+              ? "All unstaged edits and untracked files will be permanently lost."
+              : (untracked > 0)
+                    ? "These untracked files will be permanently deleted from disk."
+                    : "All unstaged working tree edits will be permanently lost.";
+
+    cui_dialog(ui, "Discard All Changes?", &app->discard_dialog_open,
+               .description = desc,
+               .width = 430) {
+        cui_alert(ui, "This action cannot be undone.",
+                  .description = warn_desc,
+                  .tone = CUI_TONE_DANGER);
+
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "Cancel")) {
+                app->discard_dialog_open = false;
+            }
+            if (cui_button(ui, "Discard All Changes",
+                           .variant = CUI_BUTTON_DANGER,
+                           .icon = CUI_ICON_UNDO_2)) {
+                mcode_ui_perform_discard_all(app, ui);
+            }
+        }
+    }
+}
+
 void mcode_ui_draw_dialogs(mcode_app *app, cui_ctx *ui) {
     draw_project_dialog(app, ui);
     draw_rename_project_dialog(app, ui);
     draw_new_thread_dialog(app, ui);
     draw_git_dialog(app, ui);
     draw_project_actions_dialog(app, ui);
+    draw_discard_all_dialog(app, ui);
 }

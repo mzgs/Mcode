@@ -73,6 +73,10 @@ bool mcode_git_unstage_file(const char *workdir, const char *rel_path,
 bool mcode_git_stage_all(const char *workdir, char *err, size_t err_cap);
 bool mcode_git_unstage_all(const char *workdir, char *err, size_t err_cap);
 
+/* Discard all unstaged working tree changes and remove untracked (non-ignored) files.
+ * Preserves staged index changes and gitignored files. */
+bool mcode_git_discard_all(const char *workdir, char *err, size_t err_cap);
+
 /* Push current branch to upstream (or `git push -u <remote> HEAD` if no upstream). */
 bool mcode_git_push(const char *workdir, char *err, size_t err_cap);
 

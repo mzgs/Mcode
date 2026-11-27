@@ -347,6 +347,94 @@ bool mcode_ui_start_git_op(mcode_app *app, cui_ctx *ui, mcode_git_op_kind kind,
     return true;
 }
 
+void mcode_ui_open_discard_all_dialog(mcode_app *app, const char *workdir) {
+    if (!app || !workdir || !workdir[0]) return;
+    int tracked = 0;
+    int untracked = 0;
+    int staged = 0;
+    for (int i = 0; i < app->git_file_count; ++i) {
+        const mcode_diff_file *f = &app->git_files[i];
+        if (f->staged) {
+            ++staged;
+        } else if (f->untracked) {
+            ++untracked;
+        } else {
+            ++tracked;
+        }
+    }
+    if (tracked + untracked == 0) return;
+    snprintf(app->discard_dialog_workdir, sizeof app->discard_dialog_workdir, "%s", workdir);
+    app->discard_dialog_tracked_count = tracked;
+    app->discard_dialog_untracked_count = untracked;
+    app->discard_dialog_staged_count = staged;
+    app->discard_dialog_open = true;
+}
+
+void mcode_ui_perform_discard_all(mcode_app *app, cui_ctx *ui) {
+    if (!app || !app->discard_dialog_workdir[0]) {
+        if (app) app->discard_dialog_open = false;
+        return;
+    }
+
+    char workdir[MCODE_PATH_MAX];
+    snprintf(workdir, sizeof workdir, "%s", app->discard_dialog_workdir);
+    int staged_before = app->discard_dialog_staged_count;
+
+    char err[256] = "";
+    bool ok = mcode_git_discard_all(workdir, err, sizeof err);
+    app->discard_dialog_open = false;
+
+    if (ok) {
+        mcode_project *p = mcode_store_find_project_by_path(&app->store, workdir);
+        if (p) {
+            char pid[MCODE_ID_MAX];
+            snprintf(pid, sizeof pid, "%s", p->id);
+            mcode_ui_promote_project(app, pid);
+        }
+        mcode_ui_refresh_workspace_git(app);
+        if (app->commit_gen_run && app->commit_gen_target == MCODE_COMMIT_GEN_SIDEBAR &&
+            app->git_file_count == 0) {
+            mcode_ui_cancel_commit_msg_gen(app);
+        }
+        if (app->inspector_open && app->inspector_mode == MCODE_INSPECTOR_DIFF &&
+            app->git_file_count == 0) {
+            mcode_ui_close_inspector(app);
+        } else if (app->inspector_open && app->inspector_mode == MCODE_INSPECTOR_FILE &&
+                   strcmp(app->preview_workdir, workdir) == 0 &&
+                   app->preview_rel_path[0]) {
+            char *buf = NULL;
+            size_t cap = 0;
+            bool is_bin = false;
+            bool trunc = false;
+            int64_t fsz = 0;
+            if (mcode_file_read_preview(app->preview_workdir, app->preview_rel_path,
+                                        &buf, &cap, &is_bin, &trunc, &fsz)) {
+                free(app->preview_text);
+                app->preview_text = buf;
+                app->preview_buf_cap = cap;
+                app->preview_is_binary = is_bin;
+                app->preview_truncated = trunc;
+                app->preview_file_size = fsz;
+            } else {
+                mcode_ui_close_inspector(app);
+            }
+        }
+        if (ui) {
+            app_chrome_notify(app->chrome, ui,
+                              staged_before > 0 ? "Discarded all unstaged changes."
+                                                : "Discarded all changes.",
+                              CUI_TONE_INFO);
+        }
+    } else {
+        mcode_ui_refresh_workspace_git(app);
+        if (ui) {
+            app_chrome_notify(app->chrome, ui,
+                              err[0] ? err : "Could not discard changes.",
+                              CUI_TONE_DANGER);
+        }
+    }
+}
+
 void mcode_ui_refresh_file_tree(mcode_app *app) {
     if (!app) return;
     const char *root = NULL;

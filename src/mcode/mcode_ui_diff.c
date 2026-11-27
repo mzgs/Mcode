@@ -473,7 +473,8 @@ int mcode_ui_draw_commit_msg_input(mcode_app *app, cui_ctx *ui, const char *id,
     bool hover_blocked = (target == MCODE_COMMIT_GEN_SIDEBAR &&
                           (app->git_dialog_open || app->project_dialog_open ||
                            app->rename_project_open || app->new_thread_open ||
-                           app->actions_dialog_open || app->file_ctx_open ||
+                           app->actions_dialog_open || app->discard_dialog_open ||
+                           app->file_ctx_open ||
                            (app->chrome && (app->chrome->settings_open ||
                                             app->chrome->palette_open))));
 
@@ -815,6 +816,11 @@ static void draw_source_control_commit_box(mcode_app *app, cui_ctx *ui,
                             }
                             close_pop = true;
                         }
+                        if (draw_commit_menu_item(ui, "sc-act-discard-all", CUI_ICON_UNDO_2,
+                                                  "Discard All Changes...", unstaged_count == 0)) {
+                            mcode_ui_open_discard_all_dialog(app, workdir);
+                            close_pop = true;
+                        }
                         if (draw_commit_menu_item(ui, "sc-act-dlg", CUI_ICON_SQUARE_PEN,
                                                   "Commit Dialog...", !thread)) {
                             mcode_app_action_commit(ui, app);
@@ -836,15 +842,27 @@ static void draw_change_group_header(mcode_app *app, cui_ctx *ui, const char *wo
                                      bool persist_toggle) {
     bool dark = (cui_get_theme_mode(ui) == CUI_THEME_DARK);
     cui_color fg = cui_color_of(ui, CUI_COLOR_FOREGROUND);
+    bool hover_blocked = (app->git_dialog_open || app->project_dialog_open ||
+                          app->rename_project_open || app->new_thread_open ||
+                          app->actions_dialog_open || app->discard_dialog_open ||
+                          app->file_ctx_open ||
+                          (app->chrome && (app->chrome->settings_open ||
+                                           app->chrome->palette_open)));
 
     cui_push_id(ui, id_prefix);
     cui_vec2 mp = cui_mouse_pos(ui);
+    cui_id row_id = cui_make_id(ui, "row");
     cui_id hid = cui_make_id(ui, "hdr");
+    cui_id did = cui_make_id(ui, "discard");
     cui_id aid = cui_make_id(ui, "act");
-    bool hdr_hov = rect_contains(cui_get_rect(ui, hid), mp);
-    bool act_hov = rect_contains(cui_get_rect(ui, aid), mp);
+    bool row_hov = !hover_blocked && rect_contains(cui_get_rect(ui, row_id), mp);
+    bool hdr_hov = !hover_blocked && rect_contains(cui_get_rect(ui, hid), mp);
+    bool discard_hov = !hover_blocked && rect_contains(cui_get_rect(ui, did), mp);
+    bool act_hov = !hover_blocked && rect_contains(cui_get_rect(ui, aid), mp);
+    bool show_actions = (row_hov || hdr_hov || discard_hov || act_hov) &&
+                        count > 0 && workdir && workdir[0];
 
-    cui_row(ui, .width = CUI_FILL, .pad_left = 6, .pad_right = 8, .gap = 2,
+    cui_row(ui, .id = "row", .width = CUI_FILL, .pad_left = 6, .pad_right = 8, .gap = 2,
             .align = CUI_ALIGN_CENTER) {
         bool clicked = cui_card_begin(ui, &(cui_card_opts){
             .id = "hdr",
@@ -871,7 +889,31 @@ static void draw_change_group_header(mcode_app *app, cui_ctx *ui, const char *wo
             if (persist_toggle) mcode_ui_mark_dirty(app);
         }
 
-        if ((hdr_hov || act_hov) && count > 0 && workdir && workdir[0]) {
+        if (show_actions) {
+            if (!is_staged_group) {
+                bool discard_clicked = cui_card_begin(ui, &(cui_card_opts){
+                    .id = "discard",
+                    .width = CUI_PX(22),
+                    .height = CUI_PX(22),
+                    .pad = 1,
+                    .hoverable = true,
+                    .border = -1.0f,
+                    .radius = 5.0f,
+                    .bg = discard_hov ? right_hover_bg(ui, dark ? 0.12f : 0.08f)
+                                      : CUI_RGBA(0x00000001u),
+                });
+                cui_box(ui, .width = CUI_FILL, .height = CUI_FILL,
+                        .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER) {
+                    cui_icon(ui, CUI_ICON_UNDO_2, 12.0f,
+                             discard_hov ? CUI_COLOR_FOREGROUND : CUI_COLOR_TEXT_MUTED);
+                }
+                cui_card_end(ui);
+                cui_tooltip(ui, "Discard All Changes");
+                if (discard_clicked) {
+                    mcode_ui_open_discard_all_dialog(app, workdir);
+                }
+            }
+
             bool act_clicked = cui_card_begin(ui, &(cui_card_opts){
                 .id = "act",
                 .width = CUI_PX(22),

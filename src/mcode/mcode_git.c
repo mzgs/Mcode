@@ -922,6 +922,84 @@ static void extract_git_error_line(const char *raw, char *out, size_t cap) {
     out[clen] = '\0';
 }
 
+bool mcode_git_discard_all(const char *workdir, char *err, size_t err_cap) {
+    if (err && err_cap) err[0] = '\0';
+    if (!workdir || !workdir[0]) return false;
+
+    const char *argv_status[] = { "git", "status", "--porcelain=v1", "-uall", NULL };
+    int rc = -1;
+    char *status_out = NULL;
+    if (!mcode_proc_run_capture(argv_status, workdir, true, &rc, &status_out, NULL) || rc != 0) {
+        if (err && err_cap) {
+            if (status_out && status_out[0]) extract_git_error_line(status_out, err, err_cap);
+            if (!err[0]) snprintf(err, err_cap, "git status failed.");
+        }
+        free(status_out);
+        return false;
+    }
+
+    bool has_tracked_unstaged = false;
+    bool has_untracked = false;
+    if (status_out) {
+        const char *p = status_out;
+        while (*p) {
+            const char *eol = strchr(p, '\n');
+            size_t line_len = eol ? (size_t)(eol - p) : strlen(p);
+            while (line_len > 0 && p[line_len - 1] == '\r') --line_len;
+            if (line_len >= 4) {
+                char x = p[0];
+                char y = p[1];
+                if (x == '?' && y == '?') {
+                    has_untracked = true;
+                } else if (x != '!' && y != '!' && y != ' ' && y != '?') {
+                    has_tracked_unstaged = true;
+                }
+            }
+            if (!eol) break;
+            p = eol + 1;
+        }
+    }
+    free(status_out);
+
+    if (has_tracked_unstaged) {
+        const char *argv_restore[] = { "git", "restore", "--worktree", "--", ":/", NULL };
+        char *out = NULL;
+        bool ok = (mcode_proc_run_capture(argv_restore, workdir, true, &rc, &out, NULL) && rc == 0);
+        if (!ok) {
+            free(out);
+            out = NULL;
+            /* Fallback for older git without `git restore` */
+            const char *argv_co[] = { "git", "checkout", "--", ":/", NULL };
+            ok = (mcode_proc_run_capture(argv_co, workdir, true, &rc, &out, NULL) && rc == 0);
+        }
+        if (!ok) {
+            if (err && err_cap) {
+                if (out && out[0]) extract_git_error_line(out, err, err_cap);
+                if (!err[0]) snprintf(err, err_cap, "Could not discard tracked changes.");
+            }
+            free(out);
+            return false;
+        }
+        free(out);
+    }
+
+    if (has_untracked) {
+        const char *argv_clean[] = { "git", "clean", "-fd", "--", ":/", NULL };
+        char *out = NULL;
+        if (!mcode_proc_run_capture(argv_clean, workdir, true, &rc, &out, NULL) || rc != 0) {
+            if (err && err_cap) {
+                if (out && out[0]) extract_git_error_line(out, err, err_cap);
+                if (!err[0]) snprintf(err, err_cap, "git clean -fd failed.");
+            }
+            free(out);
+            return false;
+        }
+        free(out);
+    }
+
+    return true;
+}
+
 bool mcode_git_get_sync_status(const char *workdir, mcode_git_sync_status *out) {
     if (!out) return false;
     memset(out, 0, sizeof *out);

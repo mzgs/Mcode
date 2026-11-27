@@ -129,6 +129,13 @@ typedef struct {
     char pr_title[160];
     char pr_body[2048];
 
+    /* Discard All Changes confirmation dialog state */
+    bool discard_dialog_open;
+    char discard_dialog_workdir[MCODE_PATH_MAX];
+    int discard_dialog_tracked_count;
+    int discard_dialog_untracked_count;
+    int discard_dialog_staged_count;
+
     /* Right sidebar (Source Control + Project Files Tree) & Center Inspector */
     mcode_file_tree file_tree;
     char git_workdir[MCODE_PATH_MAX];
