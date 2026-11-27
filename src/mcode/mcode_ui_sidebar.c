@@ -137,7 +137,7 @@ static bool draw_thread_row(mcode_app *app, cui_ctx *ui, int idx, bool show_proj
         }
         cui_text(ui, t->title,
                  .font = is_selected ? CUI_FONT_MEDIUM : CUI_FONT_BODY,
-                 .size = 12.5f,
+                 .size = 13.5f,
                  .color = title_color,
                  .width = CUI_FILL,
                  .nowrap = true);
@@ -148,7 +148,7 @@ static bool draw_thread_row(mcode_app *app, cui_ctx *ui, int idx, bool show_proj
             char elapsed[24];
             float secs = (float)(mcode_now_mono() - t->run_started_mono);
             mcode_ui_format_elapsed(secs, elapsed, sizeof elapsed);
-            cui_text(ui, elapsed, .font = CUI_FONT_MONO, .size = 10.5f,
+            cui_text(ui, elapsed, .font = CUI_FONT_MONO, .size = 11.5f,
                      .color = CUI_COLOR_TEXT_SECONDARY, .tabular = true);
         }
 
@@ -167,7 +167,7 @@ static bool draw_thread_row(mcode_app *app, cui_ctx *ui, int idx, bool show_proj
                          : hov         ? 0.55f
                                        : 0.36f;
         cui_color icon_tint = cui_alpha(cui_color_of(ui, CUI_COLOR_TEXT_SECONDARY), icon_alpha);
-        mcode_ui_draw_provider_icon(app, ui, t->agent, 13.0f, icon_tint);
+        mcode_ui_draw_provider_icon(app, ui, t->agent, 14.0f, icon_tint);
     }
 
     /* Optional second line: cleanly indented under the title text */
@@ -184,7 +184,7 @@ static bool draw_thread_row(mcode_app *app, cui_ctx *ui, int idx, bool show_proj
             cui_color_of(ui, CUI_COLOR_TEXT_MUTED),
             is_selected ? 0.92f : 0.78f);
         cui_row(ui, .width = CUI_FILL, .pad_left = 21, .gap = 4, .align = CUI_ALIGN_CENTER) {
-            cui_text(ui, meta, .size = 11.0f, .color = meta_color,
+            cui_text(ui, meta, .size = 12.0f, .color = meta_color,
                      .width = CUI_FILL, .nowrap = true);
         }
     }
@@ -323,13 +323,13 @@ static bool draw_project_section(mcode_app *app, cui_ctx *ui, int proj_idx, bool
                 .bg = hbg,
             });
             cui_icon(ui, expanded ? CUI_ICON_CHEVRON_DOWN : CUI_ICON_CHEVRON_RIGHT,
-                     11.5f, cui_alpha(fg, hdr_hov ? 0.65f : 0.40f));
+                     12.5f, cui_alpha(fg, hdr_hov ? 0.65f : 0.40f));
 
-            mcode_ui_draw_project_badge(ui, p->name, 18.0f);
+            mcode_ui_draw_project_badge(ui, p->name, 19.0f);
 
             cui_text(ui, p->name,
                      .font = CUI_FONT_MEDIUM,
-                     .size = 12.5f,
+                     .size = 13.5f,
                      .color = (expanded || is_active_proj)
                                   ? CUI_COLOR_FOREGROUND
                                   : CUI_COLOR_TEXT_SECONDARY,
@@ -477,10 +477,10 @@ static bool draw_project_section(mcode_app *app, cui_ctx *ui, int proj_idx, bool
                         });
                         cui_box(ui, .width = CUI_PX(14), .height = CUI_PX(14),
                                 .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER) {
-                            cui_icon(ui, CUI_ICON_PLUS, 12.0f,
+                            cui_icon(ui, CUI_ICON_PLUS, 13.0f,
                                      nhov ? CUI_COLOR_TEXT_SECONDARY : CUI_COLOR_TEXT_MUTED);
                         }
-                        cui_text(ui, "New thread", .size = 12.0f,
+                        cui_text(ui, "New thread", .size = 13.0f,
                                  .color = nhov ? CUI_COLOR_TEXT_SECONDARY : CUI_COLOR_TEXT_MUTED,
                                  .width = CUI_FILL, .nowrap = true);
                         cui_card_end(ui);
@@ -541,6 +541,7 @@ void mcode_ui_draw_sidebar(mcode_app *app, cui_ctx *ui) {
             cui_search(ui, "thread-search", app->thread_search, sizeof app->thread_search,
                        .placeholder = "Filter threads...",
                        .size = CUI_SIZE_SM,
+                       .font_size = 13.0f,
                        .width = CUI_FILL,
                        .bg = search_bg,
                        .border_color = search_bdr,
@@ -576,10 +577,10 @@ void mcode_ui_draw_sidebar(mcode_app *app, cui_ctx *ui) {
                             .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER) {
                         cui_icon(ui, CUI_ICON_FOLDER_OPEN, 16, CUI_COLOR_TEXT_MUTED);
                     }
-                    cui_text(ui, "No projects yet", .font = CUI_FONT_MEDIUM, .size = 12.5f,
+                    cui_text(ui, "No projects yet", .font = CUI_FONT_MEDIUM, .size = 13.5f,
                              .color = CUI_COLOR_TEXT_SECONDARY);
                     cui_text(ui, "Open a repo or create a folder to start.",
-                             .size = 11.5f, .color = CUI_COLOR_TEXT_MUTED,
+                             .size = 12.5f, .color = CUI_COLOR_TEXT_MUTED,
                              .align = CUI_TEXT_CENTER);
                     cui_gap(ui, 4);
                     cui_column(ui, .width = CUI_FILL, .gap = 5) {
@@ -652,13 +653,13 @@ void mcode_ui_draw_sidebar(mcode_app *app, cui_ctx *ui) {
                     cui_icon(ui, app->store.settled_expanded
                                      ? CUI_ICON_CHEVRON_DOWN
                                      : CUI_ICON_CHEVRON_RIGHT,
-                             11.5f, cui_alpha(fg, shov ? 0.65f : 0.40f));
-                    cui_text(ui, "Settled", .font = CUI_FONT_MEDIUM, .size = 12.0f,
+                             12.5f, cui_alpha(fg, shov ? 0.65f : 0.40f));
+                    cui_text(ui, "Settled", .font = CUI_FONT_MEDIUM, .size = 13.0f,
                              .color = shov ? CUI_COLOR_TEXT_SECONDARY : CUI_COLOR_TEXT_MUTED,
                              .width = CUI_FILL, .nowrap = true);
                     char cnt[16];
                     snprintf(cnt, sizeof cnt, "%d", settled_count);
-                    cui_text(ui, cnt, .font = CUI_FONT_MONO, .size = 11.0f,
+                    cui_text(ui, cnt, .font = CUI_FONT_MONO, .size = 12.0f,
                              .color = CUI_COLOR_TEXT_MUTED, .tabular = true);
                     cui_card_end(ui);
 
@@ -693,7 +694,7 @@ void mcode_ui_draw_sidebar(mcode_app *app, cui_ctx *ui) {
                 cui_column(ui, .width = CUI_FILL, .pad_top = 28, .pad_x = 12, .gap = 8,
                            .align = CUI_ALIGN_CENTER) {
                     cui_icon(ui, CUI_ICON_SEARCH, 18, CUI_COLOR_TEXT_MUTED);
-                    cui_text(ui, "No matching threads", .font = CUI_FONT_MEDIUM, .size = 12.5f,
+                    cui_text(ui, "No matching threads", .font = CUI_FONT_MEDIUM, .size = 13.5f,
                              .color = CUI_COLOR_TEXT_SECONDARY);
                     if (cui_button(ui, "Clear filter", .variant = CUI_BUTTON_GHOST,
                                    .size = CUI_SIZE_SM)) {

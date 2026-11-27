@@ -239,18 +239,18 @@ static bool draw_commit_menu_item(cui_ctx *ui, const char *id, const char *icon,
         .bg = bg,
     });
     if (icon && icon[0]) {
-        cui_icon(ui, icon, 13.5f, ic);
+        cui_icon(ui, icon, 14.0f, ic);
     }
-    cui_text(ui, label, .size = 12.5f, .color = txt, .width = CUI_FILL, .nowrap = true);
+    cui_text(ui, label, .size = 13.5f, .color = txt, .width = CUI_FILL, .nowrap = true);
     cui_card_end(ui);
     return clicked && !disabled;
 }
 
 static float context_menu_width(void) {
 #if defined(__APPLE__) || defined(_WIN32)
-    return 168.0f;
+    return 176.0f;
 #else
-    return 184.0f;
+    return 192.0f;
 #endif
 }
 
@@ -277,9 +277,9 @@ static bool draw_context_menu_item(cui_ctx *ui, const char *id, const char *icon
         .bg = bg,
     });
     if (icon && icon[0]) {
-        cui_icon(ui, icon, 13.0f, ic);
+        cui_icon(ui, icon, 14.0f, ic);
     }
-    cui_text(ui, label, .size = 12.0f, .color = txt, .width = CUI_FILL, .nowrap = true);
+    cui_text(ui, label, .size = 13.0f, .color = txt, .width = CUI_FILL, .nowrap = true);
     cui_card_end(ui);
     return clicked && !disabled;
 }
@@ -388,9 +388,9 @@ static void draw_diff_line_stats(cui_ctx *ui, int added, int removed) {
     snprintf(add_buf, sizeof add_buf, "+%d", added);
     snprintf(rem_buf, sizeof rem_buf, "-%d", removed);
     cui_row(ui, .gap = 4, .align = CUI_ALIGN_CENTER) {
-        cui_text(ui, add_buf, .font = CUI_FONT_MONO, .size = 11.0f,
+        cui_text(ui, add_buf, .font = CUI_FONT_MONO, .size = 12.0f,
                  .color = color_for_git_status_char(ui, 'A'), .tabular = true, .nowrap = true);
-        cui_text(ui, rem_buf, .font = CUI_FONT_MONO, .size = 11.0f,
+        cui_text(ui, rem_buf, .font = CUI_FONT_MONO, .size = 12.0f,
                  .color = color_for_git_status_char(ui, 'D'), .tabular = true, .nowrap = true);
     }
 }
@@ -398,7 +398,7 @@ static void draw_diff_line_stats(cui_ctx *ui, int added, int removed) {
 static void draw_right_sidebar_top_header(mcode_app *app, cui_ctx *ui) {
     cui_row(ui, .width = CUI_FILL, .pad_left = 12, .pad_right = 8,
             .pad_top = 6, .pad_bottom = 0, .gap = 6, .align = CUI_ALIGN_CENTER) {
-        cui_text(ui, "Changes", .font = CUI_FONT_MEDIUM, .size = 13.0f,
+        cui_text(ui, "Changes", .font = CUI_FONT_MEDIUM, .size = 14.0f,
                  .color = CUI_COLOR_FOREGROUND, .nowrap = true);
         if (app->git_file_count > 0 &&
             (app->git_total_added > 0 || app->git_total_removed > 0)) {
@@ -445,6 +445,7 @@ static void draw_source_control_commit_box(mcode_app *app, cui_ctx *ui,
                               sizeof app->sidebar_commit_msg,
                               .placeholder = placeholder,
                               .size = CUI_SIZE_SM,
+                              .font_size = 13.0f,
                               .width = CUI_FILL,
                               .bg = input_bg,
                               .border_color = input_bdr,
@@ -474,6 +475,7 @@ static void draw_source_control_commit_box(mcode_app *app, cui_ctx *ui,
             if (cui_button(ui, "Commit",
                            .variant = CUI_BUTTON_PRIMARY,
                            .size = CUI_SIZE_SM,
+                           .font_size = 13.0f,
                            .icon = CUI_ICON_CHECK,
                            .disabled = !has_changes,
                            .full_width = true,
@@ -591,7 +593,7 @@ static void draw_change_group_header(mcode_app *app, cui_ctx *ui, const char *wo
         });
         cui_icon(ui, *expanded ? CUI_ICON_CHEVRON_DOWN : CUI_ICON_CHEVRON_RIGHT,
                  12.0f, cui_alpha(fg, hdr_hov ? 0.78f : 0.55f));
-        cui_text(ui, title, .font = CUI_FONT_MEDIUM, .size = 12.5f,
+        cui_text(ui, title, .font = CUI_FONT_MEDIUM, .size = 13.0f,
                  .color = CUI_COLOR_FOREGROUND, .width = CUI_FILL, .nowrap = true);
         cui_card_end(ui);
 
@@ -639,7 +641,7 @@ static void draw_change_group_header(mcode_app *app, cui_ctx *ui, const char *wo
         cui_box(ui, .pad_x = 6, .pad_y = 1, .radius = 9.0f,
                 .bg = cui_alpha(fg, dark ? 0.14f : 0.10f),
                 .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER) {
-            cui_text(ui, cnt_buf, .font = CUI_FONT_MEDIUM, .size = 10.5f,
+            cui_text(ui, cnt_buf, .font = CUI_FONT_MEDIUM, .size = 11.5f,
                      .color = cui_alpha(fg, 0.85f), .tabular = true, .nowrap = true);
         }
     }
@@ -699,7 +701,7 @@ static bool draw_change_file_rows(mcode_app *app, cui_ctx *ui, const char *workd
             cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER, .clip = true) {
                 cui_text(ui, base_name,
                          .font = selected ? CUI_FONT_MEDIUM : CUI_FONT_BODY,
-                         .size = 12.5f,
+                         .size = 13.0f,
                          .color = selected ? CUI_COLOR_FOREGROUND
                                            : cui_mix(cui_color_of(ui, CUI_COLOR_FOREGROUND),
                                                      cui_color_of(ui, CUI_COLOR_TEXT_SECONDARY),
@@ -794,7 +796,7 @@ static void draw_source_control_lists(mcode_app *app, cui_ctx *ui,
     if (proj && !proj->is_git_repo) {
         cui_column(ui, .width = CUI_FILL, .pad_x = 14, .pad_y = 12, .gap = 8,
                    .align = CUI_ALIGN_START) {
-            cui_text(ui, "Not a Git repository.", .size = 12.0f,
+            cui_text(ui, "Not a Git repository.", .size = 13.0f,
                      .color = CUI_COLOR_TEXT_MUTED);
             if (cui_button(ui, "Initialize Git Repo", .variant = CUI_BUTTON_SECONDARY,
                            .size = CUI_SIZE_SM, .icon = CUI_ICON_GIT_BRANCH)) {
@@ -834,7 +836,7 @@ static void draw_source_control_lists(mcode_app *app, cui_ctx *ui,
                         (void)draw_change_file_rows(app, ui, workdir, false);
                     } else if (staged_count == 0) {
                         cui_column(ui, .width = CUI_FILL, .pad_x = 12, .pad_y = 8) {
-                            cui_text(ui, "Working tree clean", .size = 12.0f,
+                            cui_text(ui, "Working tree clean", .size = 13.0f,
                                      .color = CUI_COLOR_TEXT_MUTED);
                         }
                     }
@@ -877,7 +879,7 @@ static void draw_files_header(mcode_app *app, cui_ctx *ui, const char *project_n
         cui_icon(ui, app->store.files_expanded ? CUI_ICON_CHEVRON_DOWN : CUI_ICON_CHEVRON_RIGHT,
                  12.0f, cui_alpha(fg, hdr_hov ? 0.78f : 0.55f));
         cui_text(ui, (project_name && project_name[0]) ? project_name : "Files",
-                 .font = CUI_FONT_MEDIUM, .size = 12.5f,
+                 .font = CUI_FONT_MEDIUM, .size = 13.0f,
                  .color = CUI_COLOR_FOREGROUND, .width = CUI_FILL, .nowrap = true);
         cui_card_end(ui);
 
@@ -1032,14 +1034,14 @@ static void draw_file_tree_nodes(mcode_app *app, cui_ctx *ui,
 
         cui_text(ui, node.name,
                  .font = selected ? CUI_FONT_MEDIUM : CUI_FONT_BODY,
-                 .size = 12.5f,
+                 .size = 13.0f,
                  .color = name_col,
                  .width = CUI_FILL,
                  .nowrap = true);
 
         if (!node.is_dir && node.git_status != 0 && !node.git_ignored) {
             char st[2] = { node.git_status, '\0' };
-            cui_text(ui, st, .font = CUI_FONT_MEDIUM, .size = 11.0f,
+            cui_text(ui, st, .font = CUI_FONT_MEDIUM, .size = 11.5f,
                      .color = color_for_git_status_char(ui, node.git_status),
                      .nowrap = true);
         } else if (node.is_dir && node.has_changed_descendant && !node.git_ignored) {
@@ -1085,7 +1087,7 @@ static void draw_files_tree_body(mcode_app *app, cui_ctx *ui, const char *workdi
     cui_color bg = right_sidebar_bg(ui);
     if (app->file_tree.first_root < 0) {
         cui_column(ui, .width = CUI_FILL, .pad_x = 16, .pad_y = 10) {
-            cui_text(ui, "Empty folder", .size = 12.0f, .color = CUI_COLOR_TEXT_MUTED);
+            cui_text(ui, "Empty folder", .size = 13.0f, .color = CUI_COLOR_TEXT_MUTED);
         }
         return;
     }
@@ -1128,7 +1130,7 @@ void mcode_ui_draw_diff(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
                        .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER,
                        .pad = 20, .gap = 8) {
                 cui_icon(ui, CUI_ICON_FOLDER_OPEN, 20, CUI_COLOR_TEXT_MUTED);
-                cui_text(ui, "No project open", .font = CUI_FONT_MEDIUM, .size = 12.5f,
+                cui_text(ui, "No project open", .font = CUI_FONT_MEDIUM, .size = 13.5f,
                          .color = CUI_COLOR_TEXT_SECONDARY);
             }
         } else {
