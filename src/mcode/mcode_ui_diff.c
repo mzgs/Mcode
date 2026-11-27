@@ -338,17 +338,47 @@ static void promote_project_for_workdir(mcode_app *app, const char *workdir) {
     }
 }
 
+static bool str_is_blank(const char *s) {
+    if (!s) return true;
+    while (*s) {
+        if (!isspace((unsigned char)*s)) return false;
+        ++s;
+    }
+    return true;
+}
+
+typedef enum {
+    MCODE_POST_COMMIT_NONE = 0,
+    MCODE_POST_COMMIT_PUSH,
+    MCODE_POST_COMMIT_SYNC,
+} mcode_post_commit_action;
+
+static void format_sync_changes_text(const mcode_git_sync_status *sync, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    if (sync && sync->behind > 0 && sync->ahead > 0) {
+        snprintf(out, cap, "Sync Changes %d\xe2\x86\x93 %d\xe2\x86\x91", sync->behind, sync->ahead);
+    } else if (sync && sync->behind > 0) {
+        snprintf(out, cap, "Sync Changes %d\xe2\x86\x93", sync->behind);
+    } else if (sync && sync->ahead > 0) {
+        snprintf(out, cap, "Sync Changes %d\xe2\x86\x91", sync->ahead);
+    } else {
+        snprintf(out, cap, "Sync Changes");
+    }
+}
+
 static void perform_sidebar_commit(mcode_app *app, cui_ctx *ui, const char *workdir,
-                                   bool also_push) {
+                                   mcode_post_commit_action post_action) {
     if (!app || !workdir || !workdir[0]) return;
-    if (!app->sidebar_commit_msg[0]) {
+    if (str_is_blank(app->sidebar_commit_msg)) {
         if (ui) app_chrome_notify(app->chrome, ui, "Enter a commit message first.", CUI_TONE_WARNING);
+        app->sidebar_commit_want_focus = true;
         return;
     }
 
     int staged_count = 0, unstaged_count = 0;
     count_git_groups(app, &staged_count, &unstaged_count);
     if (staged_count == 0 && unstaged_count == 0) {
+        mcode_ui_refresh_workspace_git(app);
         if (ui) app_chrome_notify(app->chrome, ui, "No changes to commit.", CUI_TONE_INFO);
         return;
     }
@@ -357,9 +387,6 @@ static void perform_sidebar_commit(mcode_app *app, cui_ctx *ui, const char *work
     bool ok = (staged_count > 0)
         ? mcode_git_commit_staged(workdir, app->sidebar_commit_msg, err, sizeof err)
         : mcode_git_commit_all(workdir, app->sidebar_commit_msg, err, sizeof err);
-    if (ok && also_push) {
-        ok = mcode_git_push(workdir, err, sizeof err);
-    }
     if (ok) {
         if (app->commit_gen_run && app->commit_gen_target == MCODE_COMMIT_GEN_SIDEBAR) {
             mcode_ui_cancel_commit_msg_gen(app);
@@ -371,15 +398,24 @@ static void perform_sidebar_commit(mcode_app *app, cui_ctx *ui, const char *work
             app->git_file_count == 0) {
             mcode_ui_close_inspector(app);
         }
-        if (ui) {
-            app_chrome_notify(app->chrome, ui,
-                              also_push ? "Committed and pushed." : "Changes committed.",
-                              CUI_TONE_SUCCESS);
+        if (post_action == MCODE_POST_COMMIT_PUSH || post_action == MCODE_POST_COMMIT_SYNC) {
+            bool need_publish = (app->git_sync.valid && strcmp(app->git_workdir, workdir) == 0 &&
+                                 !app->git_sync.has_upstream && !app->git_sync.is_unborn &&
+                                 !app->git_sync.is_detached && app->git_sync.has_remote);
+            mcode_git_op_kind op_kind = need_publish
+                ? MCODE_GIT_OP_PUBLISH
+                : (post_action == MCODE_POST_COMMIT_SYNC ? MCODE_GIT_OP_SYNC : MCODE_GIT_OP_PUSH);
+            if (!mcode_ui_start_git_op(app, ui, op_kind, workdir, true) && ui) {
+                app_chrome_notify(app->chrome, ui, "Changes committed.", CUI_TONE_SUCCESS);
+            }
+        } else if (ui) {
+            app_chrome_notify(app->chrome, ui, "Changes committed.", CUI_TONE_SUCCESS);
         }
     } else {
+        mcode_ui_refresh_workspace_git(app);
         if (ui) {
             app_chrome_notify(app->chrome, ui,
-                              err[0] ? err : (also_push ? "Commit & push failed." : "Commit failed."),
+                              err[0] ? err : "Commit failed.",
                               CUI_TONE_DANGER);
         }
     }
@@ -512,7 +548,10 @@ int mcode_ui_draw_commit_msg_input(mcode_app *app, cui_ctx *ui, const char *id,
         }
     }
 
-    if (app->commit_gen_focus_target == target && input_cid != 0) {
+    if (target == MCODE_COMMIT_GEN_SIDEBAR && app->sidebar_commit_want_focus && input_cid != 0) {
+        cui_set_focus(ui, input_cid);
+        app->sidebar_commit_want_focus = false;
+    } else if (app->commit_gen_focus_target == target && input_cid != 0) {
         if (!cui_wants_keyboard(ui)) {
             cui_set_focus(ui, input_cid);
         }
@@ -523,17 +562,34 @@ int mcode_ui_draw_commit_msg_input(mcode_app *app, cui_ctx *ui, const char *id,
     return flags;
 }
 
+typedef enum {
+    SC_BTN_COMMIT = 0,
+    SC_BTN_SYNC,
+    SC_BTN_PUBLISH,
+    SC_BTN_BUSY,
+} sc_primary_btn_mode;
+
 static void draw_source_control_commit_box(mcode_app *app, cui_ctx *ui,
                                            mcode_thread *thread, mcode_project *proj,
                                            const char *workdir) {
     bool dark = (cui_get_theme_mode(ui) == CUI_THEME_DARK);
-    const char *branch = (thread && thread->branch[0]) ? thread->branch
+    const mcode_git_sync_status *sync =
+        (app->git_sync.valid && strcmp(app->git_workdir, workdir) == 0)
+            ? &app->git_sync : NULL;
+    const char *branch = (sync && sync->branch[0]) ? sync->branch
+                       : (thread && thread->branch[0]) ? thread->branch
                        : (proj && proj->default_branch[0]) ? proj->default_branch
                        : "HEAD";
     int staged_count = 0, unstaged_count = 0;
     count_git_groups(app, &staged_count, &unstaged_count);
     int change_count = app->git_file_count;
     bool has_changes = (change_count > 0);
+    bool op_busy = mcode_ui_is_git_op_running(app, workdir);
+    bool can_sync = (sync != NULL && sync->has_upstream && (sync->ahead > 0 || sync->behind > 0));
+    bool can_publish = (sync != NULL && !sync->has_upstream && !sync->is_unborn &&
+                        !sync->is_detached && sync->has_remote);
+    bool can_push_remote = (sync != NULL && sync->has_remote && !sync->is_unborn);
+    bool can_pull_remote = (sync != NULL && sync->has_upstream);
 
     static char placeholder[160];
 #ifdef __APPLE__
@@ -553,110 +609,218 @@ static void draw_source_control_commit_box(mcode_app *app, cui_ctx *ui,
             placeholder, CUI_SIZE_SM, 13.0f, input_bg, input_bdr, 6.0f,
             workdir, staged_count > 0, has_changes, MCODE_COMMIT_GEN_SIDEBAR);
 
-        bool can_commit = (app->sidebar_commit_msg[0] != '\0' && has_changes);
+        bool can_commit = (!str_is_blank(app->sidebar_commit_msg) && has_changes && !op_busy);
         if (can_commit && ((flags & CUI_SUBMITTED) ||
                            ((flags & CUI_FOCUSED) &&
                             cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_ENTER)))) {
-            perform_sidebar_commit(app, ui, workdir, false);
+            perform_sidebar_commit(app, ui, workdir, MCODE_POST_COMMIT_NONE);
         }
 
-        /* Full-width Commit split button (matching VS Code) */
+        /* VS Code Source Control primary action button:
+         * - Working tree / staged changes -> Commit split button
+         * - No changes + unpublished branch (with remote) -> Publish Branch
+         * - No changes + ahead/behind upstream -> Sync Changes [N↓] [M↑]
+         * - No changes + clean & up to date -> disabled Commit split button */
+        sc_primary_btn_mode mode = SC_BTN_COMMIT;
+        if (op_busy) {
+            mode = SC_BTN_BUSY;
+        } else if (has_changes) {
+            mode = SC_BTN_COMMIT;
+        } else if (can_publish) {
+            mode = SC_BTN_PUBLISH;
+        } else if (can_sync) {
+            mode = SC_BTN_SYNC;
+        } else {
+            mode = SC_BTN_COMMIT;
+        }
+
         cui_color active_bg = (cui_get_accent(ui) == CUI_ACCENT_NEUTRAL)
             ? (dark ? CUI_RGBA(0x3a63b8ffu) : CUI_RGBA(0x2563ebffu))
             : cui_color_of(ui, CUI_COLOR_ACCENT);
-        cui_color accent_bg = has_changes
-            ? active_bg
-            : (dark ? CUI_RGBA(0x1f335cffu) : CUI_RGBA(0x93b4f5ffu));
-        cui_color btn_fg = has_changes
-            ? CUI_RGBA(0xffffffffu)
-            : cui_alpha(CUI_RGBA(0xffffffffu), 0.72f);
 
-        cui_row(ui, .width = CUI_FILL, .gap = 0, .radius = 6.0f, .clip = true,
-                .align = CUI_ALIGN_STRETCH) {
-            if (cui_button(ui, "Commit",
+        if (mode == SC_BTN_BUSY || mode == SC_BTN_SYNC || mode == SC_BTN_PUBLISH) {
+            char btn_label[96] = "";
+            char btn_tooltip[192] = "";
+            const char *btn_icon = CUI_ICON_REFRESH_CW;
+
+            if (mode == SC_BTN_BUSY) {
+                mcode_git_op_kind opk = mcode_git_op_kind_of(app->git_op);
+                const char *busy_text = "Syncing Changes...";
+                if (opk == MCODE_GIT_OP_PUBLISH) busy_text = "Publishing Branch...";
+                else if (opk == MCODE_GIT_OP_PUSH) busy_text = "Pushing...";
+                else if (opk == MCODE_GIT_OP_PULL) busy_text = "Pulling...";
+                else if (opk == MCODE_GIT_OP_FETCH) busy_text = "Fetching...";
+                snprintf(btn_label, sizeof btn_label, "%s###sc-primary-action", busy_text);
+                snprintf(btn_tooltip, sizeof btn_tooltip, "%s", busy_text);
+                btn_icon = NULL;
+            } else if (mode == SC_BTN_PUBLISH) {
+                btn_icon = CUI_ICON_UPLOAD;
+                snprintf(btn_label, sizeof btn_label, "Publish Branch###sc-primary-action");
+                snprintf(btn_tooltip, sizeof btn_tooltip, "Publish Branch \"%s\" to %s",
+                         branch, (sync && sync->remote[0]) ? sync->remote : "origin");
+            } else {
+                btn_icon = CUI_ICON_REFRESH_CW;
+                char sync_txt[64];
+                format_sync_changes_text(sync, sync_txt, sizeof sync_txt);
+                snprintf(btn_label, sizeof btn_label, "%s###sc-primary-action", sync_txt);
+                const char *up = (sync && sync->upstream[0]) ? sync->upstream : "remote";
+                if (sync->behind > 0 && sync->ahead > 0) {
+                    snprintf(btn_tooltip, sizeof btn_tooltip,
+                             "Synchronize Changes — Pull %d and push %d commits (%s)",
+                             sync->behind, sync->ahead, up);
+                } else if (sync->behind > 0) {
+                    snprintf(btn_tooltip, sizeof btn_tooltip,
+                             "Synchronize Changes — Pull %d %s from %s",
+                             sync->behind, sync->behind == 1 ? "commit" : "commits", up);
+                } else {
+                    snprintf(btn_tooltip, sizeof btn_tooltip,
+                             "Synchronize Changes — Push %d %s to %s",
+                             sync->ahead, sync->ahead == 1 ? "commit" : "commits", up);
+                }
+            }
+
+            if (cui_button(ui, btn_label,
                            .variant = CUI_BUTTON_PRIMARY,
                            .size = CUI_SIZE_SM,
                            .font_size = 13.0f,
-                           .icon = CUI_ICON_CHECK,
-                           .disabled = !has_changes,
+                           .icon = btn_icon,
+                           .loading = (mode == SC_BTN_BUSY),
                            .full_width = true,
-                           .bg = accent_bg,
-                           .color = btn_fg,
-                           .radius = -1.0f)) {
-                perform_sidebar_commit(app, ui, workdir, false);
-            }
-
-            cui_box(ui, .width = CUI_PX(1), .height = CUI_FILL,
-                    .bg = cui_alpha(CUI_RGBA(0xffffffffu), 0.22f)) {}
-
-            if (cui_icon_button(ui, CUI_ICON_CHEVRON_DOWN,
-                                .variant = CUI_BUTTON_PRIMARY,
-                                .size = CUI_SIZE_SM,
-                                .width = CUI_PX(28),
-                                .bg = accent_bg,
-                                .color = btn_fg,
-                                .radius = -1.0f,
-                                .tooltip = "More Commit Actions")) {
-                cui_popover_toggle(ui, "sc-commit-more-pop");
-            }
-
-            bool close_pop = false;
-            cui_popover(ui, "sc-commit-more-pop", .placement = CUI_PLACE_BOTTOM_END,
-                        .width = 216, .pad = 5, .gap = 2) {
-                cui_column(ui, .width = CUI_FILL, .gap = 2) {
-                    if (draw_commit_menu_item(ui, "sc-act-cpush", CUI_ICON_UPLOAD,
-                                              "Commit & Push", !can_commit)) {
-                        perform_sidebar_commit(app, ui, workdir, true);
-                        close_pop = true;
-                    }
-                    if (draw_commit_menu_item(ui, "sc-act-push", CUI_ICON_ARROW_UP_RIGHT,
-                                              "Push", false)) {
-                        char err[256] = "";
-                        if (mcode_git_push(workdir, err, sizeof err)) {
-                            app_chrome_notify(app->chrome, ui, "Branch pushed.", CUI_TONE_SUCCESS);
-                        } else {
-                            app_chrome_notify(app->chrome, ui,
-                                              err[0] ? err : "Push failed.", CUI_TONE_DANGER);
-                        }
-                        close_pop = true;
-                    }
-                    if (draw_commit_menu_item(ui, "sc-act-pr", CUI_ICON_GIT_BRANCH,
-                                              "Push & Create PR...", !thread)) {
-                        mcode_app_action_create_pr(ui, app);
-                        close_pop = true;
-                    }
-                    cui_separator(ui);
-                    if (draw_commit_menu_item(ui, "sc-act-stage-all", CUI_ICON_PLUS,
-                                              "Stage All Changes", unstaged_count == 0)) {
-                        char err[256] = "";
-                        if (mcode_git_stage_all(workdir, err, sizeof err)) {
-                            promote_project_for_workdir(app, workdir);
-                            mcode_ui_refresh_workspace_git(app);
-                        } else if (err[0]) {
-                            app_chrome_notify(app->chrome, ui, err, CUI_TONE_DANGER);
-                        }
-                        close_pop = true;
-                    }
-                    if (draw_commit_menu_item(ui, "sc-act-unstage-all", CUI_ICON_MINUS,
-                                              "Unstage All Changes", staged_count == 0)) {
-                        char err[256] = "";
-                        if (mcode_git_unstage_all(workdir, err, sizeof err)) {
-                            promote_project_for_workdir(app, workdir);
-                            mcode_ui_refresh_workspace_git(app);
-                        } else if (err[0]) {
-                            app_chrome_notify(app->chrome, ui, err, CUI_TONE_DANGER);
-                        }
-                        close_pop = true;
-                    }
-                    if (draw_commit_menu_item(ui, "sc-act-dlg", CUI_ICON_SQUARE_PEN,
-                                              "Commit Dialog...", !thread)) {
-                        mcode_app_action_commit(ui, app);
-                        close_pop = true;
-                    }
+                           .bg = active_bg,
+                           .color = CUI_RGBA(0xffffffffu),
+                           .radius = 6.0f,
+                           .tooltip = btn_tooltip)) {
+                if (mode == SC_BTN_SYNC) {
+                    mcode_ui_start_git_op(app, ui, MCODE_GIT_OP_SYNC, workdir, false);
+                } else if (mode == SC_BTN_PUBLISH) {
+                    mcode_ui_start_git_op(app, ui, MCODE_GIT_OP_PUBLISH, workdir, false);
                 }
             }
-            if (close_pop) {
-                cui_popover_close(ui, "sc-commit-more-pop");
+        } else {
+            cui_color accent_bg = has_changes
+                ? active_bg
+                : (dark ? CUI_RGBA(0x1f335cffu) : CUI_RGBA(0x93b4f5ffu));
+            cui_color btn_fg = has_changes
+                ? CUI_RGBA(0xffffffffu)
+                : cui_alpha(CUI_RGBA(0xffffffffu), 0.72f);
+
+            cui_row(ui, .width = CUI_FILL, .gap = 0, .radius = 6.0f, .clip = true,
+                    .align = CUI_ALIGN_STRETCH) {
+                if (cui_button(ui, "Commit###sc-primary-action",
+                               .variant = CUI_BUTTON_PRIMARY,
+                               .size = CUI_SIZE_SM,
+                               .font_size = 13.0f,
+                               .icon = CUI_ICON_CHECK,
+                               .disabled = !has_changes,
+                               .full_width = true,
+                               .bg = accent_bg,
+                               .color = btn_fg,
+                               .radius = -1.0f,
+                               .tooltip = has_changes
+                                   ? (staged_count > 0 ? "Commit Staged Changes" : "Commit All Changes")
+                                   : "No changes to commit")) {
+                    perform_sidebar_commit(app, ui, workdir, MCODE_POST_COMMIT_NONE);
+                }
+
+                cui_box(ui, .width = CUI_PX(1), .height = CUI_FILL,
+                        .bg = cui_alpha(CUI_RGBA(0xffffffffu), 0.22f)) {}
+
+                if (cui_icon_button(ui, CUI_ICON_CHEVRON_DOWN,
+                                    .variant = CUI_BUTTON_PRIMARY,
+                                    .size = CUI_SIZE_SM,
+                                    .width = CUI_PX(28),
+                                    .bg = accent_bg,
+                                    .color = btn_fg,
+                                    .radius = -1.0f,
+                                    .tooltip = "More Commit Actions")) {
+                    cui_popover_toggle(ui, "sc-commit-more-pop");
+                }
+
+                bool close_pop = false;
+                cui_popover(ui, "sc-commit-more-pop", .placement = CUI_PLACE_BOTTOM_END,
+                            .width = 224, .pad = 5, .gap = 2) {
+                    cui_column(ui, .width = CUI_FILL, .gap = 2) {
+                        if (draw_commit_menu_item(ui, "sc-act-cpush", CUI_ICON_UPLOAD,
+                                                  "Commit & Push",
+                                                  !can_commit || !(sync && sync->has_remote))) {
+                            perform_sidebar_commit(app, ui, workdir, MCODE_POST_COMMIT_PUSH);
+                            close_pop = true;
+                        }
+                        if (draw_commit_menu_item(ui, "sc-act-csync", CUI_ICON_REFRESH_CW,
+                                                  "Commit & Sync",
+                                                  !can_commit || !(sync && (sync->has_upstream || sync->has_remote)))) {
+                            perform_sidebar_commit(app, ui, workdir, MCODE_POST_COMMIT_SYNC);
+                            close_pop = true;
+                        }
+                        cui_separator(ui);
+                        if (can_publish) {
+                            if (draw_commit_menu_item(ui, "sc-act-publish", CUI_ICON_UPLOAD,
+                                                      "Publish Branch", op_busy)) {
+                                mcode_ui_start_git_op(app, ui, MCODE_GIT_OP_PUBLISH, workdir, false);
+                                close_pop = true;
+                            }
+                        } else {
+                            char sync_item[64];
+                            format_sync_changes_text(sync, sync_item, sizeof sync_item);
+                            if (draw_commit_menu_item(ui, "sc-act-sync", CUI_ICON_REFRESH_CW,
+                                                      sync_item, op_busy || !can_pull_remote)) {
+                                mcode_ui_start_git_op(app, ui, MCODE_GIT_OP_SYNC, workdir, false);
+                                close_pop = true;
+                            }
+                        }
+                        if (draw_commit_menu_item(ui, "sc-act-pull", CUI_ICON_DOWNLOAD,
+                                                  "Pull", op_busy || !can_pull_remote)) {
+                            mcode_ui_start_git_op(app, ui, MCODE_GIT_OP_PULL, workdir, false);
+                            close_pop = true;
+                        }
+                        if (draw_commit_menu_item(ui, "sc-act-push", CUI_ICON_ARROW_UP_RIGHT,
+                                                  "Push", op_busy || !can_push_remote)) {
+                            mcode_ui_start_git_op(app, ui, MCODE_GIT_OP_PUSH, workdir, false);
+                            close_pop = true;
+                        }
+                        if (draw_commit_menu_item(ui, "sc-act-fetch", CUI_ICON_ROTATE_CCW,
+                                                  "Fetch", op_busy || !(sync && sync->has_remote))) {
+                            mcode_ui_start_git_op(app, ui, MCODE_GIT_OP_FETCH, workdir, false);
+                            close_pop = true;
+                        }
+                        if (draw_commit_menu_item(ui, "sc-act-pr", CUI_ICON_GIT_BRANCH,
+                                                  "Push & Create PR...", !thread || op_busy)) {
+                            mcode_app_action_create_pr(ui, app);
+                            close_pop = true;
+                        }
+                        cui_separator(ui);
+                        if (draw_commit_menu_item(ui, "sc-act-stage-all", CUI_ICON_PLUS,
+                                                  "Stage All Changes", unstaged_count == 0)) {
+                            char err[256] = "";
+                            if (mcode_git_stage_all(workdir, err, sizeof err)) {
+                                promote_project_for_workdir(app, workdir);
+                                mcode_ui_refresh_workspace_git(app);
+                            } else if (err[0]) {
+                                app_chrome_notify(app->chrome, ui, err, CUI_TONE_DANGER);
+                            }
+                            close_pop = true;
+                        }
+                        if (draw_commit_menu_item(ui, "sc-act-unstage-all", CUI_ICON_MINUS,
+                                                  "Unstage All Changes", staged_count == 0)) {
+                            char err[256] = "";
+                            if (mcode_git_unstage_all(workdir, err, sizeof err)) {
+                                promote_project_for_workdir(app, workdir);
+                                mcode_ui_refresh_workspace_git(app);
+                            } else if (err[0]) {
+                                app_chrome_notify(app->chrome, ui, err, CUI_TONE_DANGER);
+                            }
+                            close_pop = true;
+                        }
+                        if (draw_commit_menu_item(ui, "sc-act-dlg", CUI_ICON_SQUARE_PEN,
+                                                  "Commit Dialog...", !thread)) {
+                            mcode_app_action_commit(ui, app);
+                            close_pop = true;
+                        }
+                    }
+                }
+                if (close_pop) {
+                    cui_popover_close(ui, "sc-commit-more-pop");
+                }
             }
         }
     }

@@ -73,8 +73,54 @@ bool mcode_git_unstage_file(const char *workdir, const char *rel_path,
 bool mcode_git_stage_all(const char *workdir, char *err, size_t err_cap);
 bool mcode_git_unstage_all(const char *workdir, char *err, size_t err_cap);
 
-/* Push current branch to origin (`git push -u origin HEAD`). */
+/* Push current branch to upstream (or `git push -u <remote> HEAD` if no upstream). */
 bool mcode_git_push(const char *workdir, char *err, size_t err_cap);
+
+typedef struct {
+    bool valid;
+    bool is_unborn;      /* true when repository has no commits yet */
+    bool is_detached;    /* true when HEAD is detached */
+    bool has_remote;     /* true when at least one remote is configured */
+    bool has_upstream;   /* true when current branch tracks a live upstream */
+    bool upstream_gone;  /* true when configured upstream ref is gone */
+    char branch[MCODE_BRANCH_MAX];
+    char upstream[MCODE_BRANCH_MAX];
+    char remote[64];     /* preferred remote name ("origin" or first configured remote) */
+    int ahead;
+    int behind;
+} mcode_git_sync_status;
+
+/* Inspect local branch / upstream / ahead / behind / remote status (fast, no network). */
+bool mcode_git_get_sync_status(const char *workdir, mcode_git_sync_status *out);
+
+typedef enum {
+    MCODE_GIT_OP_NONE = 0,
+    MCODE_GIT_OP_SYNC,      /* pull then push (if ahead) */
+    MCODE_GIT_OP_PUBLISH,   /* git push -u <remote> HEAD */
+    MCODE_GIT_OP_PUSH,      /* git push (or -u <remote> HEAD without upstream) */
+    MCODE_GIT_OP_PULL,      /* git pull --no-edit */
+    MCODE_GIT_OP_FETCH,     /* git fetch */
+} mcode_git_op_kind;
+
+typedef struct mcode_git_op mcode_git_op;
+
+/* Start an asynchronous Git remote operation (sync/publish/push/pull/fetch). */
+mcode_git_op *mcode_git_op_start(mcode_git_op_kind kind, const char *workdir,
+                                 const char *remote, bool has_upstream);
+
+/* Poll completion. Returns true once finished and writes result + status/error text. */
+bool mcode_git_op_poll(mcode_git_op *op, bool *ok_out, char *msg_out, size_t msg_cap);
+
+/* Request cancellation / immediate termination (safe during shutdown). */
+void mcode_git_op_stop(mcode_git_op *op);
+void mcode_git_op_kill(mcode_git_op *op);
+
+/* Join worker thread and free resources. */
+void mcode_git_op_destroy(mcode_git_op *op);
+void mcode_git_op_destroy_timeout(mcode_git_op *op, int grace_ms);
+
+mcode_git_op_kind mcode_git_op_kind_of(const mcode_git_op *op);
+const char *mcode_git_op_workdir(const mcode_git_op *op);
 
 /* Create a PR using `gh pr create` if available, else build a GitHub/GitLab compare URL.
  * If opened via gh, writes PR URL to url_out; if fallback, writes compare URL to url_out and sets *used_gh = false. */

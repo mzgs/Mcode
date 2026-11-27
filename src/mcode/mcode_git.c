@@ -14,7 +14,9 @@
 
 #ifndef _WIN32
 #include <dirent.h>
+#include <pthread.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #else
 #include <direct.h>
@@ -845,17 +847,238 @@ bool mcode_git_unstage_all(const char *workdir, char *err, size_t err_cap) {
     return true;
 }
 
+static void extract_git_error_line(const char *raw, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (!raw || !raw[0]) return;
+
+    const char *best_fatal = NULL;
+    size_t best_fatal_len = 0;
+    const char *best_error = NULL;
+    size_t best_error_len = 0;
+    const char *best_conflict = NULL;
+    size_t best_conflict_len = 0;
+    const char *best_reject = NULL;
+    size_t best_reject_len = 0;
+    const char *last_non_hint = NULL;
+    size_t last_non_hint_len = 0;
+    const char *first_non_empty = NULL;
+    size_t first_non_empty_len = 0;
+
+    const char *p = raw;
+    while (*p) {
+        const char *eol = strchr(p, '\n');
+        size_t len = eol ? (size_t)(eol - p) : strlen(p);
+        while (len > 0 && (p[len - 1] == '\r' || p[len - 1] == ' ' || p[len - 1] == '\t')) {
+            --len;
+        }
+        const char *s = p;
+        while (len > 0 && (*s == ' ' || *s == '\t')) {
+            ++s;
+            --len;
+        }
+        if (len > 0) {
+            if (!first_non_empty) {
+                first_non_empty = s;
+                first_non_empty_len = len;
+            }
+            if (!best_fatal && len >= 6 && strncmp(s, "fatal:", 6) == 0) {
+                best_fatal = s;
+                best_fatal_len = len;
+            } else if (!best_conflict && len >= 8 && strncmp(s, "CONFLICT", 8) == 0) {
+                best_conflict = s;
+                best_conflict_len = len;
+            } else if (!best_error && len >= 6 && strncmp(s, "error:", 6) == 0) {
+                best_error = s;
+                best_error_len = len;
+            } else if (!best_reject && len >= 3 && strncmp(s, "! [", 3) == 0) {
+                best_reject = s;
+                best_reject_len = len;
+            }
+            if (!(len >= 5 && strncmp(s, "hint:", 5) == 0)) {
+                last_non_hint = s;
+                last_non_hint_len = len;
+            }
+        }
+        if (!eol) break;
+        p = eol + 1;
+    }
+
+    const char *chosen = best_fatal ? best_fatal
+                       : best_conflict ? best_conflict
+                       : best_error ? best_error
+                       : best_reject ? best_reject
+                       : last_non_hint ? last_non_hint
+                       : first_non_empty;
+    size_t clen = best_fatal ? best_fatal_len
+                : best_conflict ? best_conflict_len
+                : best_error ? best_error_len
+                : best_reject ? best_reject_len
+                : last_non_hint ? last_non_hint_len
+                : first_non_empty_len;
+    if (!chosen || clen == 0) return;
+    if (clen >= cap) clen = cap - 1;
+    memcpy(out, chosen, clen);
+    out[clen] = '\0';
+}
+
+bool mcode_git_get_sync_status(const char *workdir, mcode_git_sync_status *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof *out);
+    if (!workdir || !workdir[0]) return false;
+
+    const char *argv[] = {
+        "git", "status", "--porcelain=v2", "--branch", "--untracked-files=no", NULL
+    };
+    int rc = -1;
+    char *text = NULL;
+    if (!mcode_proc_run_capture(argv, workdir, false, &rc, &text, NULL) || rc != 0 || !text) {
+        free(text);
+        return false;
+    }
+
+    out->valid = true;
+
+    const char *p = text;
+    while (*p) {
+        const char *eol = strchr(p, '\n');
+        size_t len = eol ? (size_t)(eol - p) : strlen(p);
+        while (len > 0 && (p[len - 1] == '\r' || p[len - 1] == ' ' || p[len - 1] == '\t')) {
+            --len;
+        }
+        if (len == 0 || p[0] != '#') {
+            break;
+        }
+        if (len > 13 && strncmp(p, "# branch.oid ", 13) == 0) {
+            const char *val = p + 13;
+            size_t vlen = len - 13;
+            if (vlen == 9 && strncmp(val, "(initial)", 9) == 0) {
+                out->is_unborn = true;
+            }
+        } else if (len > 14 && strncmp(p, "# branch.head ", 14) == 0) {
+            const char *val = p + 14;
+            size_t vlen = len - 14;
+            if (vlen == 10 && strncmp(val, "(detached)", 10) == 0) {
+                out->is_detached = true;
+            } else if (vlen > 0) {
+                size_t copy = vlen < sizeof(out->branch) - 1 ? vlen : sizeof(out->branch) - 1;
+                memcpy(out->branch, val, copy);
+                out->branch[copy] = '\0';
+            }
+        } else if (len > 18 && strncmp(p, "# branch.upstream ", 18) == 0) {
+            const char *val = p + 18;
+            size_t vlen = len - 18;
+            if (vlen > 0) {
+                size_t copy = vlen < sizeof(out->upstream) - 1 ? vlen : sizeof(out->upstream) - 1;
+                memcpy(out->upstream, val, copy);
+                out->upstream[copy] = '\0';
+            }
+        } else if (len > 12 && strncmp(p, "# branch.ab ", 12) == 0) {
+            char ab_buf[64];
+            size_t vlen = len - 12;
+            if (vlen >= sizeof ab_buf) vlen = sizeof ab_buf - 1;
+            memcpy(ab_buf, p + 12, vlen);
+            ab_buf[vlen] = '\0';
+            int a = 0, b = 0;
+            if (sscanf(ab_buf, "+%d -%d", &a, &b) == 2) {
+                out->has_upstream = true;
+                out->ahead = a > 0 ? a : 0;
+                out->behind = b > 0 ? b : 0;
+            }
+        }
+        if (!eol) break;
+        p = eol + 1;
+    }
+    free(text);
+
+    if (out->upstream[0] && !out->has_upstream) {
+        out->upstream_gone = true;
+    }
+
+    char upstream_remote[64] = "";
+    if (out->upstream[0]) {
+        const char *slash = strchr(out->upstream, '/');
+        if (slash && slash > out->upstream) {
+            size_t rlen = (size_t)(slash - out->upstream);
+            if (rlen >= sizeof upstream_remote) rlen = sizeof upstream_remote - 1;
+            memcpy(upstream_remote, out->upstream, rlen);
+            upstream_remote[rlen] = '\0';
+        }
+    }
+
+    if (out->has_upstream) {
+        out->has_remote = true;
+        snprintf(out->remote, sizeof out->remote, "%s",
+                 upstream_remote[0] ? upstream_remote : "origin");
+    } else {
+        const char *argv_rem[] = { "git", "remote", NULL };
+        char *rem_out = NULL;
+        if (mcode_proc_run_capture(argv_rem, workdir, false, &rc, &rem_out, NULL) &&
+            rc == 0 && rem_out) {
+            char first[64] = "";
+            bool found_origin = false;
+            bool found_upstream_rem = false;
+            const char *q = rem_out;
+            while (*q) {
+                const char *eol = strchr(q, '\n');
+                size_t rlen = eol ? (size_t)(eol - q) : strlen(q);
+                while (rlen > 0 && (q[rlen - 1] == '\r' || q[rlen - 1] == ' ' || q[rlen - 1] == '\t')) {
+                    --rlen;
+                }
+                if (rlen > 0 && rlen < sizeof first) {
+                    char cand[64];
+                    memcpy(cand, q, rlen);
+                    cand[rlen] = '\0';
+                    if (!first[0]) snprintf(first, sizeof first, "%s", cand);
+                    if (strcmp(cand, "origin") == 0) found_origin = true;
+                    if (upstream_remote[0] && strcmp(cand, upstream_remote) == 0) {
+                        found_upstream_rem = true;
+                    }
+                }
+                if (!eol) break;
+                q = eol + 1;
+            }
+            if (found_upstream_rem) {
+                out->has_remote = true;
+                snprintf(out->remote, sizeof out->remote, "%s", upstream_remote);
+            } else if (found_origin) {
+                out->has_remote = true;
+                snprintf(out->remote, sizeof out->remote, "origin");
+            } else if (first[0]) {
+                out->has_remote = true;
+                snprintf(out->remote, sizeof out->remote, "%s", first);
+            }
+        }
+        free(rem_out);
+    }
+
+    return true;
+}
+
 bool mcode_git_push(const char *workdir, char *err, size_t err_cap) {
     if (err && err_cap) err[0] = '\0';
     if (!workdir || !workdir[0]) return false;
 
-    const char *argv[] = { "git", "push", "-u", "origin", "HEAD", NULL };
+    mcode_git_sync_status st;
+    bool has_st = mcode_git_get_sync_status(workdir, &st);
+    const char *remote = (has_st && st.remote[0]) ? st.remote : "origin";
+
     int rc = -1;
     char *out = NULL;
-    if (!mcode_proc_run_capture(argv, workdir, true, &rc, &out, NULL) || rc != 0) {
+    bool ran = false;
+    if (has_st && st.has_upstream) {
+        const char *argv[] = { "git", "push", NULL };
+        ran = mcode_proc_run_capture(argv, workdir, true, &rc, &out, NULL);
+    } else {
+        const char *argv[] = { "git", "push", "-u", remote, "HEAD", NULL };
+        ran = mcode_proc_run_capture(argv, workdir, true, &rc, &out, NULL);
+    }
+    if (!ran || rc != 0) {
         if (err && err_cap) {
-            if (out && out[0]) { trim_trailing(out); snprintf(err, err_cap, "%s", out); }
-            else snprintf(err, err_cap, "git push failed.");
+            if (out && out[0]) {
+                extract_git_error_line(out, err, err_cap);
+            }
+            if (!err[0]) snprintf(err, err_cap, "git push failed.");
         }
         free(out);
         return false;
@@ -863,6 +1086,382 @@ bool mcode_git_push(const char *workdir, char *err, size_t err_cap) {
     free(out);
     return true;
 }
+
+#ifdef _WIN32
+
+struct mcode_git_op {
+    mcode_git_op_kind kind;
+    char workdir[MCODE_PATH_MAX];
+    bool ok;
+    char message[256];
+};
+
+mcode_git_op *mcode_git_op_start(mcode_git_op_kind kind, const char *workdir,
+                                 const char *remote, bool has_upstream) {
+    (void)remote;
+    (void)has_upstream;
+    if (kind == MCODE_GIT_OP_NONE || !workdir || !workdir[0]) return NULL;
+    mcode_git_op *op = calloc(1, sizeof *op);
+    if (!op) return NULL;
+    op->kind = kind;
+    snprintf(op->workdir, sizeof op->workdir, "%s", workdir);
+    op->ok = false;
+    snprintf(op->message, sizeof op->message, "Git remote operations are not supported on this platform yet.");
+    return op;
+}
+
+bool mcode_git_op_poll(mcode_git_op *op, bool *ok_out, char *msg_out, size_t msg_cap) {
+    if (!op) return true;
+    if (ok_out) *ok_out = op->ok;
+    if (msg_out && msg_cap > 0) snprintf(msg_out, msg_cap, "%s", op->message);
+    return true;
+}
+
+void mcode_git_op_stop(mcode_git_op *op) { (void)op; }
+void mcode_git_op_kill(mcode_git_op *op) { (void)op; }
+void mcode_git_op_destroy_timeout(mcode_git_op *op, int grace_ms) { (void)grace_ms; free(op); }
+void mcode_git_op_destroy(mcode_git_op *op) { free(op); }
+mcode_git_op_kind mcode_git_op_kind_of(const mcode_git_op *op) { return op ? op->kind : MCODE_GIT_OP_NONE; }
+const char *mcode_git_op_workdir(const mcode_git_op *op) { return op ? op->workdir : ""; }
+
+#else
+
+struct mcode_git_op {
+    mcode_git_op_kind kind;
+    char workdir[MCODE_PATH_MAX];
+    char remote[64];
+    bool has_upstream;
+
+    pthread_t thread;
+    bool thread_started;
+    pthread_mutex_t mu;
+    pthread_cond_t done_cond;
+    mcode_proc *active_proc;
+    bool stop_requested;
+    bool kill_requested;
+    bool finished;
+    bool ok;
+    char message[256];
+};
+
+typedef struct {
+    mcode_str buf;
+    pthread_mutex_t mu;
+    pthread_cond_t done_cond;
+    bool done;
+    int exit_code;
+    bool killed;
+} git_op_cmd_ctx;
+
+static void git_op_cmd_on_bytes(const char *data, size_t len, bool is_stderr, void *user) {
+    (void)is_stderr;
+    git_op_cmd_ctx *ctx = (git_op_cmd_ctx *)user;
+    pthread_mutex_lock(&ctx->mu);
+    if (ctx->buf.len < 64 * 1024) {
+        size_t take = len;
+        if (ctx->buf.len + take > 64 * 1024) take = 64 * 1024 - ctx->buf.len;
+        mcode_str_append(&ctx->buf, data, take);
+    }
+    pthread_mutex_unlock(&ctx->mu);
+}
+
+static void git_op_cmd_on_exit(int exit_code, bool killed, void *user) {
+    git_op_cmd_ctx *ctx = (git_op_cmd_ctx *)user;
+    pthread_mutex_lock(&ctx->mu);
+    ctx->exit_code = exit_code;
+    ctx->killed = killed;
+    ctx->done = true;
+    pthread_cond_broadcast(&ctx->done_cond);
+    pthread_mutex_unlock(&ctx->mu);
+}
+
+static bool git_op_run_cmd(mcode_git_op *op, const char *const *argv,
+                           int *out_exit, char **out_buf) {
+    if (out_exit) *out_exit = -1;
+    if (out_buf) *out_buf = NULL;
+
+    pthread_mutex_lock(&op->mu);
+    bool cancelled = op->stop_requested || op->kill_requested;
+    pthread_mutex_unlock(&op->mu);
+    if (cancelled) return false;
+
+    git_op_cmd_ctx ctx;
+    memset(&ctx, 0, sizeof ctx);
+    mcode_str_init(&ctx.buf);
+    pthread_mutex_init(&ctx.mu, NULL);
+    pthread_cond_init(&ctx.done_cond, NULL);
+    ctx.exit_code = -1;
+
+    mcode_proc *proc = mcode_proc_spawn(&(mcode_proc_desc){
+        .argv = argv,
+        .cwd = op->workdir,
+        .merge_stderr = true,
+        .on_bytes = git_op_cmd_on_bytes,
+        .on_exit = git_op_cmd_on_exit,
+        .user = &ctx,
+    });
+    if (!proc) {
+        pthread_cond_destroy(&ctx.done_cond);
+        pthread_mutex_destroy(&ctx.mu);
+        mcode_str_free(&ctx.buf);
+        return false;
+    }
+
+    pthread_mutex_lock(&op->mu);
+    op->active_proc = proc;
+    bool want_kill = op->kill_requested;
+    bool want_stop = op->stop_requested;
+    if (want_kill) {
+        mcode_proc_kill(proc);
+    } else if (want_stop) {
+        mcode_proc_stop(proc);
+    }
+    pthread_mutex_unlock(&op->mu);
+
+    pthread_mutex_lock(&ctx.mu);
+    while (!ctx.done) {
+        pthread_cond_wait(&ctx.done_cond, &ctx.mu);
+    }
+    int rc = ctx.exit_code;
+    bool killed = ctx.killed;
+    pthread_mutex_unlock(&ctx.mu);
+
+    pthread_mutex_lock(&op->mu);
+    op->active_proc = NULL;
+    pthread_mutex_unlock(&op->mu);
+
+    mcode_proc_destroy_timeout(proc, 0);
+
+    pthread_cond_destroy(&ctx.done_cond);
+    pthread_mutex_destroy(&ctx.mu);
+
+    if (out_exit) *out_exit = rc;
+    if (out_buf) {
+        if (ctx.buf.data) {
+            *out_buf = ctx.buf.data;
+            ctx.buf.data = NULL;
+        } else {
+            *out_buf = strdup("");
+        }
+    }
+    mcode_str_free(&ctx.buf);
+    return !killed;
+}
+
+static void *git_op_worker_main(void *arg) {
+    mcode_git_op *op = (mcode_git_op *)arg;
+    const char *remote = op->remote[0] ? op->remote : "origin";
+    bool ok = false;
+    char msg[256] = "";
+
+    int rc = -1;
+    char *out = NULL;
+
+    if (op->kind == MCODE_GIT_OP_FETCH) {
+        const char *argv[] = { "git", "fetch", NULL };
+        if (git_op_run_cmd(op, argv, &rc, &out) && rc == 0) {
+            ok = true;
+            snprintf(msg, sizeof msg, "Fetched latest changes.");
+        } else {
+            extract_git_error_line(out, msg, sizeof msg);
+            if (!msg[0]) snprintf(msg, sizeof msg, "git fetch failed.");
+            if (out && out[0]) app_log_warn("git fetch failed in %s: %s", op->workdir, out);
+        }
+        free(out);
+    } else if (op->kind == MCODE_GIT_OP_PULL) {
+        const char *argv[] = { "git", "pull", "--no-edit", NULL };
+        if (git_op_run_cmd(op, argv, &rc, &out) && rc == 0) {
+            ok = true;
+            snprintf(msg, sizeof msg, "Pulled latest changes.");
+        } else {
+            extract_git_error_line(out, msg, sizeof msg);
+            if (!msg[0]) snprintf(msg, sizeof msg, "git pull failed.");
+            if (out && out[0]) app_log_warn("git pull failed in %s: %s", op->workdir, out);
+        }
+        free(out);
+    } else if (op->kind == MCODE_GIT_OP_PUBLISH) {
+        const char *argv[] = { "git", "push", "-u", remote, "HEAD", NULL };
+        if (git_op_run_cmd(op, argv, &rc, &out) && rc == 0) {
+            ok = true;
+            snprintf(msg, sizeof msg, "Branch published.");
+        } else {
+            extract_git_error_line(out, msg, sizeof msg);
+            if (!msg[0]) snprintf(msg, sizeof msg, "Publish branch failed.");
+            if (out && out[0]) app_log_warn("git push -u failed in %s: %s", op->workdir, out);
+        }
+        free(out);
+    } else if (op->kind == MCODE_GIT_OP_PUSH) {
+        bool ran = false;
+        if (op->has_upstream) {
+            const char *argv[] = { "git", "push", NULL };
+            ran = git_op_run_cmd(op, argv, &rc, &out);
+        } else {
+            const char *argv[] = { "git", "push", "-u", remote, "HEAD", NULL };
+            ran = git_op_run_cmd(op, argv, &rc, &out);
+        }
+        if (ran && rc == 0) {
+            ok = true;
+            snprintf(msg, sizeof msg, "Branch pushed.");
+        } else {
+            extract_git_error_line(out, msg, sizeof msg);
+            if (!msg[0]) snprintf(msg, sizeof msg, "git push failed.");
+            if (out && out[0]) app_log_warn("git push failed in %s: %s", op->workdir, out);
+        }
+        free(out);
+    } else if (op->kind == MCODE_GIT_OP_SYNC) {
+        const char *argv_pull[] = { "git", "pull", "--no-edit", NULL };
+        if (!git_op_run_cmd(op, argv_pull, &rc, &out) || rc != 0) {
+            extract_git_error_line(out, msg, sizeof msg);
+            if (!msg[0]) snprintf(msg, sizeof msg, "Sync failed during pull.");
+            if (out && out[0]) app_log_warn("git sync pull failed in %s: %s", op->workdir, out);
+            free(out);
+        } else {
+            free(out);
+            out = NULL;
+            mcode_git_sync_status st;
+            bool has_st = mcode_git_get_sync_status(op->workdir, &st);
+            if (has_st && st.has_upstream && st.ahead == 0) {
+                ok = true;
+                snprintf(msg, sizeof msg, "Changes synced.");
+            } else {
+                bool ran = false;
+                if (!has_st || st.has_upstream) {
+                    const char *argv_push[] = { "git", "push", NULL };
+                    ran = git_op_run_cmd(op, argv_push, &rc, &out);
+                } else {
+                    const char *push_rem = st.remote[0] ? st.remote : remote;
+                    const char *argv_push[] = { "git", "push", "-u", push_rem, "HEAD", NULL };
+                    ran = git_op_run_cmd(op, argv_push, &rc, &out);
+                }
+                if (ran && rc == 0) {
+                    ok = true;
+                    snprintf(msg, sizeof msg, "Changes synced.");
+                } else {
+                    extract_git_error_line(out, msg, sizeof msg);
+                    if (!msg[0]) snprintf(msg, sizeof msg, "Sync failed during push.");
+                    if (out && out[0]) app_log_warn("git sync push failed in %s: %s", op->workdir, out);
+                }
+                free(out);
+            }
+        }
+    }
+
+    pthread_mutex_lock(&op->mu);
+    op->ok = ok;
+    snprintf(op->message, sizeof op->message, "%s", msg);
+    op->finished = true;
+    pthread_cond_broadcast(&op->done_cond);
+    pthread_mutex_unlock(&op->mu);
+    return NULL;
+}
+
+mcode_git_op *mcode_git_op_start(mcode_git_op_kind kind, const char *workdir,
+                                 const char *remote, bool has_upstream) {
+    if (kind == MCODE_GIT_OP_NONE || !workdir || !workdir[0]) return NULL;
+    mcode_git_op *op = calloc(1, sizeof *op);
+    if (!op) return NULL;
+    op->kind = kind;
+    snprintf(op->workdir, sizeof op->workdir, "%s", workdir);
+    snprintf(op->remote, sizeof op->remote, "%s",
+             (remote && remote[0]) ? remote : "origin");
+    op->has_upstream = has_upstream;
+    pthread_mutex_init(&op->mu, NULL);
+    pthread_cond_init(&op->done_cond, NULL);
+
+    if (pthread_create(&op->thread, NULL, git_op_worker_main, op) != 0) {
+        pthread_cond_destroy(&op->done_cond);
+        pthread_mutex_destroy(&op->mu);
+        free(op);
+        return NULL;
+    }
+    op->thread_started = true;
+    return op;
+}
+
+bool mcode_git_op_poll(mcode_git_op *op, bool *ok_out, char *msg_out, size_t msg_cap) {
+    if (ok_out) *ok_out = false;
+    if (msg_out && msg_cap > 0) msg_out[0] = '\0';
+    if (!op) return true;
+
+    pthread_mutex_lock(&op->mu);
+    bool done = op->finished;
+    if (done) {
+        if (ok_out) *ok_out = op->ok;
+        if (msg_out && msg_cap > 0) snprintf(msg_out, msg_cap, "%s", op->message);
+    }
+    pthread_mutex_unlock(&op->mu);
+    return done;
+}
+
+void mcode_git_op_stop(mcode_git_op *op) {
+    if (!op) return;
+    pthread_mutex_lock(&op->mu);
+    op->stop_requested = true;
+    if (op->active_proc) mcode_proc_stop(op->active_proc);
+    pthread_mutex_unlock(&op->mu);
+}
+
+void mcode_git_op_kill(mcode_git_op *op) {
+    if (!op) return;
+    pthread_mutex_lock(&op->mu);
+    op->stop_requested = true;
+    op->kill_requested = true;
+    if (op->active_proc) mcode_proc_kill(op->active_proc);
+    pthread_mutex_unlock(&op->mu);
+}
+
+void mcode_git_op_destroy_timeout(mcode_git_op *op, int grace_ms) {
+    if (!op) return;
+    pthread_mutex_lock(&op->mu);
+    bool done = op->finished;
+    pthread_mutex_unlock(&op->mu);
+
+    if (!done) {
+        if (grace_ms > 0) {
+            mcode_git_op_stop(op);
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += grace_ms / 1000;
+            ts.tv_nsec += (long)(grace_ms % 1000) * 1000000L;
+            if (ts.tv_nsec >= 1000000000L) {
+                ts.tv_sec += 1;
+                ts.tv_nsec -= 1000000000L;
+            }
+            pthread_mutex_lock(&op->mu);
+            while (!op->finished) {
+                int wrc = pthread_cond_timedwait(&op->done_cond, &op->mu, &ts);
+                if (wrc == ETIMEDOUT) break;
+                if (wrc != 0 && wrc != EINTR) break;
+            }
+            done = op->finished;
+            pthread_mutex_unlock(&op->mu);
+        }
+        if (!done) {
+            mcode_git_op_kill(op);
+        }
+    }
+    if (op->thread_started) {
+        pthread_join(op->thread, NULL);
+        op->thread_started = false;
+    }
+    pthread_cond_destroy(&op->done_cond);
+    pthread_mutex_destroy(&op->mu);
+    free(op);
+}
+
+void mcode_git_op_destroy(mcode_git_op *op) {
+    mcode_git_op_destroy_timeout(op, 150);
+}
+
+mcode_git_op_kind mcode_git_op_kind_of(const mcode_git_op *op) {
+    return op ? op->kind : MCODE_GIT_OP_NONE;
+}
+
+const char *mcode_git_op_workdir(const mcode_git_op *op) {
+    return op ? op->workdir : "";
+}
+
+#endif
 
 static void url_encode_append(mcode_str *s, const char *text) {
     static const char hex[] = "0123456789ABCDEF";

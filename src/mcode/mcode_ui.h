@@ -137,6 +137,9 @@ typedef struct {
     int git_total_added;
     int git_total_removed;
     int git_selected_idx;
+    mcode_git_sync_status git_sync;
+    mcode_git_op *git_op;
+    bool git_op_was_commit_followup;
     char *git_diff_old_text;
     char *git_diff_new_text;
     char git_diff_loaded_path[512];
@@ -147,6 +150,7 @@ typedef struct {
     uint64_t last_focus_generation;
     double last_focus_refresh_at;
     char sidebar_commit_msg[512];
+    bool sidebar_commit_want_focus;
     mcode_commit_msg_run *commit_gen_run;
     mcode_commit_gen_target commit_gen_target;
     char commit_gen_workdir[MCODE_PATH_MAX];

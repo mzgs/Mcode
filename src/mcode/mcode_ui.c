@@ -218,6 +218,7 @@ void mcode_ui_refresh_workspace_git(mcode_app *app) {
 
     if (!root || !root[0]) {
         app->git_workdir[0] = '\0';
+        memset(&app->git_sync, 0, sizeof app->git_sync);
         if (app->commit_gen_run && app->commit_gen_target == MCODE_COMMIT_GEN_SIDEBAR) {
             mcode_ui_cancel_commit_msg_gen(app);
         }
@@ -249,6 +250,10 @@ void mcode_ui_refresh_workspace_git(mcode_app *app) {
         rem = 0;
     }
 
+    if (!mcode_git_get_sync_status(root, &app->git_sync)) {
+        memset(&app->git_sync, 0, sizeof app->git_sync);
+    }
+
     free(app->git_files);
     app->git_files = files;
     app->git_file_count = count;
@@ -269,7 +274,7 @@ void mcode_ui_refresh_workspace_git(mcode_app *app) {
         mcode_ui_load_workspace_diff(app);
     }
 
-    /* Keep selected thread's diff snapshot mirrored for topbar & commit dialog */
+    /* Keep selected thread's diff snapshot & live branch mirrored for topbar & commit dialog */
     mcode_thread *t = mcode_store_selected_thread(&app->store);
     if (t && strcmp(t->workdir, root) == 0) {
         free(t->diff_files);
@@ -284,9 +289,62 @@ void mcode_ui_refresh_workspace_git(mcode_app *app) {
         t->total_added = add;
         t->total_removed = rem;
         t->selected_diff_file = (t->diff_file_count > 0) ? next_sel : -1;
+        if (app->git_sync.valid && app->git_sync.branch[0] &&
+            strcmp(t->branch, app->git_sync.branch) != 0) {
+            snprintf(t->branch, sizeof t->branch, "%s", app->git_sync.branch);
+        }
+    }
+    if (app->git_sync.valid && app->git_sync.branch[0]) {
+        mcode_project *p = mcode_store_find_project_by_path(&app->store, root);
+        if (p && strcmp(p->default_branch, app->git_sync.branch) != 0) {
+            snprintf(p->default_branch, sizeof p->default_branch, "%s", app->git_sync.branch);
+        }
     }
 
     mcode_file_tree_refresh(&app->file_tree, root, is_git, app->git_files, app->git_file_count);
+}
+
+bool mcode_ui_is_git_op_running(const mcode_app *app, const char *workdir) {
+    if (!app || !app->git_op) return false;
+    if (!workdir || !workdir[0]) return true;
+    return strcmp(mcode_git_op_workdir(app->git_op), workdir) == 0;
+}
+
+bool mcode_ui_start_git_op(mcode_app *app, cui_ctx *ui, mcode_git_op_kind kind,
+                           const char *workdir, bool commit_followup) {
+    if (!app || kind == MCODE_GIT_OP_NONE || !workdir || !workdir[0]) return false;
+    if (app->git_op) {
+        if (ui) {
+            app_chrome_notify(app->chrome, ui,
+                              "A Git operation is already in progress.", CUI_TONE_INFO);
+        }
+        return false;
+    }
+
+    mcode_git_sync_status local_st;
+    const mcode_git_sync_status *st = NULL;
+    if (app->git_sync.valid && strcmp(app->git_workdir, workdir) == 0) {
+        st = &app->git_sync;
+    } else if (mcode_git_get_sync_status(workdir, &local_st)) {
+        st = &local_st;
+    }
+
+    const char *remote = (st && st->remote[0]) ? st->remote : "origin";
+    bool has_upstream = (st && st->has_upstream);
+
+    mcode_git_op *op = mcode_git_op_start(kind, workdir, remote, has_upstream);
+    if (!op) {
+        if (ui) {
+            app_chrome_notify(app->chrome, ui,
+                              "Could not start Git operation.", CUI_TONE_DANGER);
+        }
+        return false;
+    }
+
+    app->git_op = op;
+    app->git_op_was_commit_followup = commit_followup;
+    if (ui) cui_request_redraw(ui);
+    return true;
 }
 
 void mcode_ui_refresh_file_tree(mcode_app *app) {
@@ -1137,6 +1195,9 @@ void mcode_app_shutdown(mcode_app *app) {
     if (app->clone_proc) {
         mcode_proc_stop(app->clone_proc);
     }
+    if (app->git_op) {
+        mcode_git_op_stop(app->git_op);
+    }
     if (app->commit_gen_run) {
         mcode_agent_commit_msg_kill(app->commit_gen_run);
     }
@@ -1169,13 +1230,20 @@ void mcode_app_shutdown(mcode_app *app) {
     mcode_model_catalog_free(&app->models);
     mcode_cli_updates_free(&app->cli_updates);
 
-    /* Reap active agent turns and clones sharing a single short grace budget. */
+    /* Reap active agent turns, git ops, and clones sharing a single short grace budget. */
     enum { SHUTDOWN_GRACE_MS = 80 };
     if (app->clone_proc) {
         int elapsed = (int)((mcode_now_mono() - shutdown_start) * 1000.0);
         int rem = SHUTDOWN_GRACE_MS - elapsed;
         mcode_proc_destroy_timeout(app->clone_proc, rem > 0 ? rem : 0);
         app->clone_proc = NULL;
+    }
+    if (app->git_op) {
+        int elapsed = (int)((mcode_now_mono() - shutdown_start) * 1000.0);
+        int rem = SHUTDOWN_GRACE_MS - elapsed;
+        mcode_git_op_destroy_timeout(app->git_op, rem > 0 ? rem : 0);
+        app->git_op = NULL;
+        app->git_op_was_commit_followup = false;
     }
     for (int i = 0; i < app->store.thread_count; ++i) {
         if (app->store.threads[i].title_run) {
@@ -1481,6 +1549,50 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
     bool term_visible_running = app->store.show_terminal_panel &&
                                 app->term && cui_vterm_is_running(app->term);
 
+    /* Poll async git remote operation (sync / publish / push / pull / fetch) */
+    bool git_op_running = false;
+    if (app->git_op) {
+        bool ok = false;
+        char msg[256] = "";
+        if (mcode_git_op_poll(app->git_op, &ok, msg, sizeof msg)) {
+            mcode_git_op_kind kind = mcode_git_op_kind_of(app->git_op);
+            char op_wd[MCODE_PATH_MAX];
+            snprintf(op_wd, sizeof op_wd, "%s", mcode_git_op_workdir(app->git_op));
+            bool was_commit_followup = app->git_op_was_commit_followup;
+
+            mcode_git_op_destroy(app->git_op);
+            app->git_op = NULL;
+            app->git_op_was_commit_followup = false;
+            any_finished = true;
+
+            if (ok && op_wd[0]) {
+                mcode_project *p = mcode_store_find_project_by_path(&app->store, op_wd);
+                if (p) {
+                    char pid[MCODE_ID_MAX];
+                    snprintf(pid, sizeof pid, "%s", p->id);
+                    mcode_ui_promote_project(app, pid);
+                }
+            }
+            if (!op_wd[0] || strcmp(app->git_workdir, op_wd) == 0) {
+                mcode_ui_refresh_workspace_git(app);
+            }
+            if (ui) {
+                const char *toast = msg;
+                if (ok && was_commit_followup) {
+                    if (kind == MCODE_GIT_OP_SYNC) toast = "Committed and synced.";
+                    else if (kind == MCODE_GIT_OP_PUBLISH) toast = "Committed and published branch.";
+                    else toast = "Committed and pushed.";
+                } else if (!toast[0]) {
+                    toast = ok ? "Git operation completed." : "Git operation failed.";
+                }
+                app_chrome_notify(app->chrome, ui, toast,
+                                  ok ? CUI_TONE_SUCCESS : CUI_TONE_DANGER);
+            }
+        } else {
+            git_op_running = true;
+        }
+    }
+
     /* Poll async git clone */
     bool clone_active = (app->clone_proc != NULL);
     if (clone_active) {
@@ -1584,7 +1696,7 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
 
     if (term_dirty) {
         cui_request_redraw(ui);
-    } else if (running > 0 || clone_active || commit_gen_running || term_visible_running) {
+    } else if (running > 0 || clone_active || commit_gen_running || git_op_running || term_visible_running) {
         cui_request_wakeup(ui, 0.033f);
     } else if (title_running > 0 || app->models.loading_agy ||
                mcode_usage_tracker_is_loading(&app->usage) ||
@@ -1995,6 +2107,38 @@ static void draw_topbar_right_controls(mcode_app *app, cui_ctx *ui, mcode_thread
                                                   "Commit Changes...", "Cmd Shift C", false)) {
                             mcode_app_action_commit(ui, app);
                             close_actions = true;
+                        }
+                        if (app->git_sync.valid && strcmp(app->git_workdir, thread->workdir) == 0 &&
+                            !mcode_ui_is_git_op_running(app, thread->workdir)) {
+                            if (!app->git_sync.has_upstream && !app->git_sync.is_unborn &&
+                                !app->git_sync.is_detached && app->git_sync.has_remote) {
+                                if (draw_actions_pop_item(ui, "act-publish", CUI_ICON_UPLOAD,
+                                                          "Publish Branch", NULL, false)) {
+                                    mcode_ui_start_git_op(app, ui, MCODE_GIT_OP_PUBLISH,
+                                                          thread->workdir, false);
+                                    close_actions = true;
+                                }
+                            } else if (app->git_sync.has_upstream &&
+                                       (app->git_sync.ahead > 0 || app->git_sync.behind > 0)) {
+                                char sync_lbl[64];
+                                if (app->git_sync.behind > 0 && app->git_sync.ahead > 0) {
+                                    snprintf(sync_lbl, sizeof sync_lbl,
+                                             "Sync Changes %d\xe2\x86\x93 %d\xe2\x86\x91",
+                                             app->git_sync.behind, app->git_sync.ahead);
+                                } else if (app->git_sync.behind > 0) {
+                                    snprintf(sync_lbl, sizeof sync_lbl,
+                                             "Sync Changes %d\xe2\x86\x93", app->git_sync.behind);
+                                } else {
+                                    snprintf(sync_lbl, sizeof sync_lbl,
+                                             "Sync Changes %d\xe2\x86\x91", app->git_sync.ahead);
+                                }
+                                if (draw_actions_pop_item(ui, "act-sync", CUI_ICON_REFRESH_CW,
+                                                          sync_lbl, NULL, false)) {
+                                    mcode_ui_start_git_op(app, ui, MCODE_GIT_OP_SYNC,
+                                                          thread->workdir, false);
+                                    close_actions = true;
+                                }
+                            }
                         }
                         if (draw_actions_pop_item(ui, "act-pr", CUI_ICON_ARROW_UP_RIGHT,
                                                   "Push & Create PR...", "Cmd Shift P", false)) {
@@ -2506,9 +2650,102 @@ static void on_palette_toggle_busy_submit(cui_ctx *ui, void *user) {
     }
 }
 
+static void on_palette_git_sync(cui_ctx *ui, void *user) {
+    mcode_app *app = (mcode_app *)user;
+    if (!app || !app->git_workdir[0]) return;
+    if (app->git_sync.valid && !app->git_sync.has_upstream &&
+        !app->git_sync.is_unborn && !app->git_sync.is_detached && app->git_sync.has_remote) {
+        mcode_ui_start_git_op(app, ui, MCODE_GIT_OP_PUBLISH, app->git_workdir, false);
+    } else {
+        mcode_ui_start_git_op(app, ui, MCODE_GIT_OP_SYNC, app->git_workdir, false);
+    }
+}
+
+static void on_palette_git_pull(cui_ctx *ui, void *user) {
+    mcode_app *app = (mcode_app *)user;
+    if (app && app->git_workdir[0]) {
+        mcode_ui_start_git_op(app, ui, MCODE_GIT_OP_PULL, app->git_workdir, false);
+    }
+}
+
+static void on_palette_git_push(cui_ctx *ui, void *user) {
+    mcode_app *app = (mcode_app *)user;
+    if (app && app->git_workdir[0]) {
+        mcode_ui_start_git_op(app, ui, MCODE_GIT_OP_PUSH, app->git_workdir, false);
+    }
+}
+
+static void on_palette_git_fetch(cui_ctx *ui, void *user) {
+    mcode_app *app = (mcode_app *)user;
+    if (app && app->git_workdir[0]) {
+        mcode_ui_start_git_op(app, ui, MCODE_GIT_OP_FETCH, app->git_workdir, false);
+    }
+}
+
 void mcode_app_palette_provider(app_palette_builder *builder, void *user) {
     mcode_app *app = (mcode_app *)user;
     if (!app) return;
+
+    if (app->git_workdir[0] && app->git_sync.valid) {
+        bool can_pub = (!app->git_sync.has_upstream && !app->git_sync.is_unborn &&
+                        !app->git_sync.is_detached && app->git_sync.has_remote);
+        if (can_pub) {
+            app_palette_add(builder, &(app_palette_command){
+                .title = "Git: Publish Branch",
+                .icon = CUI_ICON_UPLOAD,
+                .group = "Git",
+                .on_trigger = on_palette_git_sync,
+                .user = app,
+            });
+        } else if (app->git_sync.has_upstream) {
+            char sync_title[64];
+            if (app->git_sync.behind > 0 && app->git_sync.ahead > 0) {
+                snprintf(sync_title, sizeof sync_title,
+                         "Git: Sync Changes %d\xe2\x86\x93 %d\xe2\x86\x91",
+                         app->git_sync.behind, app->git_sync.ahead);
+            } else if (app->git_sync.behind > 0) {
+                snprintf(sync_title, sizeof sync_title,
+                         "Git: Sync Changes %d\xe2\x86\x93", app->git_sync.behind);
+            } else if (app->git_sync.ahead > 0) {
+                snprintf(sync_title, sizeof sync_title,
+                         "Git: Sync Changes %d\xe2\x86\x91", app->git_sync.ahead);
+            } else {
+                snprintf(sync_title, sizeof sync_title, "Git: Sync Changes");
+            }
+            app_palette_add(builder, &(app_palette_command){
+                .title = sync_title,
+                .icon = CUI_ICON_REFRESH_CW,
+                .group = "Git",
+                .on_trigger = on_palette_git_sync,
+                .user = app,
+            });
+            app_palette_add(builder, &(app_palette_command){
+                .title = "Git: Pull",
+                .icon = CUI_ICON_DOWNLOAD,
+                .group = "Git",
+                .on_trigger = on_palette_git_pull,
+                .user = app,
+            });
+        }
+        if (app->git_sync.has_remote) {
+            if (!app->git_sync.is_unborn) {
+                app_palette_add(builder, &(app_palette_command){
+                    .title = "Git: Push",
+                    .icon = CUI_ICON_ARROW_UP_RIGHT,
+                    .group = "Git",
+                    .on_trigger = on_palette_git_push,
+                    .user = app,
+                });
+            }
+            app_palette_add(builder, &(app_palette_command){
+                .title = "Git: Fetch",
+                .icon = CUI_ICON_ROTATE_CCW,
+                .group = "Git",
+                .on_trigger = on_palette_git_fetch,
+                .user = app,
+            });
+        }
+    }
 
     mcode_thread *sel_thr = mcode_store_selected_thread(&app->store);
     if (sel_thr && sel_thr->queued_count > 0) {

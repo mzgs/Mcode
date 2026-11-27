@@ -24,6 +24,9 @@ void mcode_ui_refresh_thread_diff(mcode_thread *thread);
 void mcode_ui_load_selected_diff(mcode_thread *thread);
 void mcode_ui_refresh_workspace_git(mcode_app *app);
 void mcode_ui_load_workspace_diff(mcode_app *app);
+bool mcode_ui_start_git_op(mcode_app *app, cui_ctx *ui, mcode_git_op_kind kind,
+                           const char *workdir, bool commit_followup);
+bool mcode_ui_is_git_op_running(const mcode_app *app, const char *workdir);
 void mcode_ui_refresh_file_tree(mcode_app *app);
 void mcode_ui_open_diff_file(mcode_app *app, int file_idx);
 void mcode_ui_open_file_preview(mcode_app *app, cui_ctx *ui, const char *root_path,
