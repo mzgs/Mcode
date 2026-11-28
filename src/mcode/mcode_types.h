@@ -55,6 +55,7 @@ typedef enum {
     MCODE_BLOCK_TOOL,
     MCODE_BLOCK_ERROR,
     MCODE_BLOCK_STEER,
+    MCODE_BLOCK_IMAGE,
 } mcode_block_kind;
 
 typedef struct {
@@ -71,6 +72,9 @@ typedef struct {
     mcode_str input;
     mcode_str output;
     cui_task_status status;
+
+    /* Image block fields */
+    char image_path[MCODE_PATH_MAX];
 
     double started_mono;
     float duration_sec;

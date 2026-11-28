@@ -1997,23 +1997,70 @@ void mcode_ui_draw_workspace_main(mcode_app *app, cui_ctx *ui, mcode_thread *thr
             }
         } else if (app->inspector_mode == MCODE_INSPECTOR_FILE) {
             if (app->preview_is_binary) {
-                char sz_buf[32];
-                format_file_size(app->preview_file_size, sz_buf, sizeof sz_buf);
-                char desc[128];
-                snprintf(desc, sizeof desc, "Binary file (%s) — preview not available.", sz_buf);
-                cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
-                           .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER,
-                           .pad = 24, .gap = 10) {
-                    cui_icon(ui, CUI_ICON_FILE, 28, CUI_COLOR_TEXT_MUTED);
-                    cui_text(ui, active_base, .font = CUI_FONT_MEDIUM, .size = 14.0f);
-                    cui_muted(ui, desc);
-                    if (app->preview_workdir[0] &&
-                        cui_button(ui, "Open Externally", .variant = CUI_BUTTON_SECONDARY,
-                                   .size = CUI_SIZE_SM, .icon = CUI_ICON_EXTERNAL_LINK)) {
-                        char full[MCODE_PATH_MAX + 512];
-                        snprintf(full, sizeof full, "%s/%s",
-                                 app->preview_workdir, app->preview_rel_path);
-                        cui_app_open_url(full);
+                char full_img[MCODE_PATH_MAX] = "";
+                const mcode_image_cache_entry *pimg = NULL;
+                if (app->preview_workdir[0] &&
+                    mcode_image_has_supported_ext(app->preview_rel_path)) {
+                    int n = snprintf(full_img, sizeof full_img, "%s/%s",
+                                     app->preview_workdir, app->preview_rel_path);
+                    if (n > 0 && (size_t)n < sizeof full_img) {
+                        pimg = mcode_ui_image_get(app, ui, full_img);
+                    }
+                }
+                if (pimg && pimg->tex) {
+                    if (strcmp(app->preview_image_path, full_img) != 0) {
+                        snprintf(app->preview_image_path, sizeof app->preview_image_path,
+                                 "%s", full_img);
+                        memset(&app->preview_image_view, 0, sizeof app->preview_image_view);
+                    }
+                    char sz_buf[32];
+                    format_file_size(app->preview_file_size, sz_buf, sizeof sz_buf);
+                    char meta[128];
+                    snprintf(meta, sizeof meta, "%d × %d px · %s",
+                             pimg->width, pimg->height, sz_buf);
+                    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad = 8, .gap = 6) {
+                        cui_push_id(ui, full_img);
+                        cui_id vid = cui_make_id(ui, "mcode-file-image-preview");
+                        if (cui_get_rect(ui, vid).w <= 0.0f) {
+                            cui_request_redraw(ui);
+                        }
+                        cui_image_viewer(ui, "mcode-file-image-preview",
+                                         pimg->tex, pimg->width, pimg->height,
+                                         &app->preview_image_view,
+                                         .width = CUI_FILL,
+                                         .height = CUI_FILL,
+                                         .checkerboard = true);
+                        cui_pop_id(ui);
+                        cui_row(ui, .width = CUI_FILL, .pad_x = 4, .gap = 10,
+                                .align = CUI_ALIGN_CENTER) {
+                            cui_text(ui, meta, .font = CUI_FONT_MONO, .size = 11.5f,
+                                     .color = CUI_COLOR_TEXT_SECONDARY, .tabular = true,
+                                     .nowrap = true);
+                            cui_spacer(ui);
+                            cui_text(ui, "Scroll to zoom · Drag to pan · Double-click for 100%",
+                                     .size = 11.5f, .color = CUI_COLOR_TEXT_MUTED,
+                                     .nowrap = true);
+                        }
+                    }
+                } else {
+                    char sz_buf[32];
+                    format_file_size(app->preview_file_size, sz_buf, sizeof sz_buf);
+                    char desc[128];
+                    snprintf(desc, sizeof desc, "Binary file (%s) — preview not available.", sz_buf);
+                    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
+                               .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER,
+                               .pad = 24, .gap = 10) {
+                        cui_icon(ui, CUI_ICON_FILE, 28, CUI_COLOR_TEXT_MUTED);
+                        cui_text(ui, active_base, .font = CUI_FONT_MEDIUM, .size = 14.0f);
+                        cui_muted(ui, desc);
+                        if (app->preview_workdir[0] &&
+                            cui_button(ui, "Open Externally", .variant = CUI_BUTTON_SECONDARY,
+                                       .size = CUI_SIZE_SM, .icon = CUI_ICON_EXTERNAL_LINK)) {
+                            char full[MCODE_PATH_MAX + 512];
+                            snprintf(full, sizeof full, "%s/%s",
+                                     app->preview_workdir, app->preview_rel_path);
+                            cui_app_open_url(full);
+                        }
                     }
                 }
             } else {

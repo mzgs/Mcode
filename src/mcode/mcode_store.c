@@ -475,13 +475,14 @@ bool mcode_store_load(mcode_store *store, const char *path) {
                         yyjson_arr_foreach(blocks, bi, bmax, bv) {
                             if (!yyjson_is_obj(bv)) continue;
                             int bk = jint_or(bv, "kind", MCODE_BLOCK_TEXT);
-                            if (bk < MCODE_BLOCK_TEXT || bk > MCODE_BLOCK_STEER) bk = MCODE_BLOCK_TEXT;
+                            if (bk < MCODE_BLOCK_TEXT || bk > MCODE_BLOCK_IMAGE) bk = MCODE_BLOCK_TEXT;
                             mcode_block *b = mcode_turn_add_block(turn, (mcode_block_kind)bk);
                             if (!b) break;
                             mcode_str_set(&b->text, jstr_or(bv, "text", ""));
                             snprintf(b->tool_id, sizeof b->tool_id, "%s", jstr_or(bv, "tool_id", ""));
                             snprintf(b->tool_name, sizeof b->tool_name, "%s", jstr_or(bv, "tool_name", ""));
                             snprintf(b->tool_detail, sizeof b->tool_detail, "%s", jstr_or(bv, "tool_detail", ""));
+                            snprintf(b->image_path, sizeof b->image_path, "%s", jstr_or(bv, "image_path", ""));
                             mcode_str_set(&b->input, jstr_or(bv, "input", ""));
                             mcode_str_set(&b->output, jstr_or(bv, "output", ""));
                             int bs = jint_or(bv, "status", CUI_TASK_DONE);
@@ -669,6 +670,8 @@ bool mcode_store_save(const mcode_store *store, const char *path) {
                     yyjson_mut_obj_add_str(doc, bo, "input", mcode_str_cstr(&b->input));
                     yyjson_mut_obj_add_str(doc, bo, "output", mcode_str_cstr(&b->output));
                     yyjson_mut_obj_add_int(doc, bo, "status", (int)b->status);
+                } else if (b->kind == MCODE_BLOCK_IMAGE && b->image_path[0]) {
+                    yyjson_mut_obj_add_str(doc, bo, "image_path", b->image_path);
                 }
                 yyjson_mut_obj_add_real(doc, bo, "duration_sec", b->duration_sec);
                 yyjson_mut_arr_append(blocks, bo);

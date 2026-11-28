@@ -15,7 +15,26 @@
 enum {
     MCODE_MAX_DISCOVERED_REPOS = 32,
     MCODE_NAV_HISTORY_MAX = 64,
+    MCODE_IMAGE_CACHE_MAX = 40,
 };
+
+typedef struct {
+    char path[MCODE_PATH_MAX];
+    cui_texture tex;
+    int width;
+    int height;
+    int64_t file_size;
+    int64_t mtime_sec;
+    int64_t mtime_nsec;
+    uint64_t last_used_frame;
+    double checked_mono;
+    bool occupied;
+    bool failed;
+} mcode_image_cache_entry;
+
+typedef struct {
+    mcode_image_cache_entry entries[MCODE_IMAGE_CACHE_MAX];
+} mcode_image_cache;
 
 typedef enum {
     MCODE_PROJ_DIALOG_OPEN = 0,
@@ -70,6 +89,15 @@ typedef struct {
     /* Cached real provider icon textures (Claude, Codex, Antigravity) */
     cui_texture provider_icons[APP_AGENT_COUNT];
     bool provider_icons_loaded;
+
+    /* Shared LRU texture cache for local PNG/JPEG image previews */
+    mcode_image_cache image_cache;
+
+    /* Image preview lightbox modal state */
+    bool image_lightbox_open;
+    char image_lightbox_path[MCODE_PATH_MAX];
+    char image_lightbox_title[256];
+    cui_image_view image_lightbox_view;
 
     /* Sidebar search & filter */
     char thread_search[128];
@@ -177,6 +205,8 @@ typedef struct {
     bool preview_is_binary;
     bool preview_truncated;
     int64_t preview_file_size;
+    cui_image_view preview_image_view;
+    char preview_image_path[MCODE_PATH_MAX];
 
     /* Compact mouse-positioned context menu for file browser & changes list */
     bool file_ctx_open;

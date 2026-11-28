@@ -150,6 +150,7 @@ add_library(app_mcode STATIC
     src/mcode/mcode_ui.c
     src/mcode/mcode_ui_sidebar.c
     src/mcode/mcode_ui_chat.c
+    src/mcode/mcode_ui_images.c
     src/mcode/mcode_ui_diff.c
     src/mcode/mcode_ui_terminal.c
     src/mcode/mcode_ui_usage.c

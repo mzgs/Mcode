@@ -12,11 +12,16 @@ typedef enum {
     TOOL_KIND_READ,
     TOOL_KIND_SEARCH,
     TOOL_KIND_WEB,
+    TOOL_KIND_IMAGE,
     TOOL_KIND_OTHER,
 } tool_kind;
 
 static tool_kind classify_tool_name(const char *name) {
     if (!name || !name[0]) return TOOL_KIND_OTHER;
+    if (strstr(name, "image_gen") || strstr(name, "imageGeneration") ||
+        strstr(name, "view_image") || strstr(name, "imageView") ||
+        strstr(name, "generate_image"))
+        return TOOL_KIND_IMAGE;
     if (strstr(name, "bash") || strstr(name, "Bash") || strstr(name, "command") || strstr(name, "shell"))
         return TOOL_KIND_CMD;
     if (strstr(name, "Edit") || strstr(name, "Write") || strstr(name, "edit") ||
@@ -41,6 +46,7 @@ static const char *tool_icon_for_kind(tool_kind kind) {
     case TOOL_KIND_READ:   return CUI_ICON_FILE_TEXT;
     case TOOL_KIND_SEARCH: return CUI_ICON_SEARCH;
     case TOOL_KIND_WEB:    return CUI_ICON_GLOBE;
+    case TOOL_KIND_IMAGE:  return CUI_ICON_IMAGE;
     default:               return CUI_ICON_ZAP;
     }
 }
@@ -54,55 +60,12 @@ static bool link_starts_with_icase(const char *s, const char *prefix) {
     return true;
 }
 
-static int hex_nibble(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
-    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
-    return -1;
-}
-
 static bool has_non_file_uri_scheme(const char *s) {
     if (!s || !isalpha((unsigned char)s[0])) return false;
     if (link_starts_with_icase(s, "mailto:") || link_starts_with_icase(s, "tel:")) return true;
     const char *p = s + 1;
     while (*p && (isalnum((unsigned char)*p) || *p == '+' || *p == '-' || *p == '.')) ++p;
     return (p[0] == ':' && p[1] == '/' && p[2] == '/');
-}
-
-static bool path_exists_on_disk(const char *path) {
-    if (!path || !path[0]) return false;
-    struct stat st;
-    return stat(path, &st) == 0;
-}
-
-static bool is_line_range_token(const char *s) {
-    if (!s || !isdigit((unsigned char)s[0])) return false;
-    bool saw_dash = false;
-    for (const char *p = s; *p; ++p) {
-        if (isdigit((unsigned char)*p)) continue;
-        if (*p == '-' && !saw_dash && isdigit((unsigned char)p[1])) {
-            saw_dash = true;
-            continue;
-        }
-        return false;
-    }
-    return true;
-}
-
-static void strip_line_col_suffix(char *path) {
-    if (!path || !path[0]) return;
-    for (int pass = 0; pass < 2; ++pass) {
-        const char *slash = strrchr(path, '/');
-        const char *bslash = strrchr(path, '\\');
-        const char *sep = (bslash && (!slash || bslash > slash)) ? bslash : slash;
-        char *colon = strrchr(path, ':');
-        if (!colon) break;
-        if (sep && colon < sep) break;
-        /* Preserve Windows drive letter prefix like "C:" */
-        if (colon == path + 1 && isalpha((unsigned char)path[0])) break;
-        if (!is_line_range_token(colon + 1)) break;
-        *colon = '\0';
-    }
 }
 
 static void open_markdown_link(mcode_app *app, cui_ctx *ui, const mcode_thread *thread,
@@ -117,76 +80,675 @@ static void open_markdown_link(mcode_app *app, cui_ctx *ui, const mcode_thread *
         return;
     }
 
-    char path[MCODE_PATH_MAX] = "";
-    if (is_file_uri) {
-        const char *p = raw_link + 7;
-        if (link_starts_with_icase(p, "localhost/")) p += 9;
-#ifdef _WIN32
-        if (p[0] == '/' && isalpha((unsigned char)p[1]) && p[2] == ':') ++p;
-#endif
-        size_t w = 0;
-        while (*p && w + 1 < sizeof path) {
-            if (*p == '#' || *p == '?') break;
-            if (*p == '%' && p[1] && p[2]) {
-                int hi = hex_nibble(p[1]);
-                int lo = hex_nibble(p[2]);
-                if (hi >= 0 && lo >= 0) {
-                    path[w++] = (char)((hi << 4) | lo);
-                    p += 3;
-                    continue;
-                }
-            }
-            path[w++] = *p++;
-        }
-        path[w] = '\0';
-    } else {
-        snprintf(path, sizeof path, "%s", raw_link);
-        size_t len = strlen(path);
-        while (len > 0 && isspace((unsigned char)path[len - 1])) path[--len] = '\0';
-    }
-
-    if (!path[0]) return;
-
-    /* Strip #L... fragment and :line[:col] suffixes when the literal path does not exist. */
-    if (!path_exists_on_disk(path)) {
-        char *hash = strchr(path, '#');
-        if (hash) *hash = '\0';
-        if (!path_exists_on_disk(path)) {
-            strip_line_col_suffix(path);
-        }
-    }
-
-    /* Expand leading ~/ */
     char resolved[MCODE_PATH_MAX] = "";
-    if (path[0] == '~' && (path[1] == '/' || path[1] == '\0')) {
-        const char *home = getenv("HOME");
-        if (home && home[0]) {
-            snprintf(resolved, sizeof resolved, "%s%s", home, path + 1);
+    const char *workdir = (thread && thread->workdir[0]) ? thread->workdir : NULL;
+    if (mcode_ui_resolve_local_path(raw_link, workdir, true, resolved, sizeof resolved)) {
+        if (app && ui && mcode_image_has_supported_ext(resolved) &&
+            mcode_ui_image_get(app, ui, resolved) != NULL) {
+            mcode_ui_open_image_lightbox(app, resolved, NULL);
         } else {
-            snprintf(resolved, sizeof resolved, "%s", path);
+            cui_app_open_url(resolved);
         }
-    } else {
-        bool is_abs = (path[0] == '/' || path[0] == '\\' ||
-                       (isalpha((unsigned char)path[0]) && path[1] == ':' &&
-                        (path[2] == '/' || path[2] == '\\')));
-        if (!is_abs && thread && thread->workdir[0]) {
-            size_t wlen = strlen(thread->workdir);
-            while (wlen > 1 && (thread->workdir[wlen - 1] == '/' ||
-                                thread->workdir[wlen - 1] == '\\')) {
-                --wlen;
-            }
-            snprintf(resolved, sizeof resolved, "%.*s/%s", (int)wlen, thread->workdir, path);
-        } else {
-            snprintf(resolved, sizeof resolved, "%s", path);
-        }
-    }
-
-    if (path_exists_on_disk(resolved)) {
-        cui_app_open_url(resolved);
     } else if (app && ui) {
         char msg[256];
-        snprintf(msg, sizeof msg, "File not found: %s", resolved);
+        snprintf(msg, sizeof msg, "File not found: %s", resolved[0] ? resolved : raw_link);
         app_chrome_notify(app->chrome, ui, msg, CUI_TONE_WARNING);
+    }
+}
+
+/* ---- Inline chat image scanning (Markdown images, image links, @image refs) ---- */
+
+enum {
+    MCODE_CHAT_MAX_INLINE_IMAGES = 24,
+    MCODE_CHAT_MAX_REF_IMAGES = 8,
+};
+
+typedef struct {
+    size_t start;
+    size_t end;
+    char alt[160];
+    char resolved[MCODE_PATH_MAX];
+} chat_md_image;
+
+typedef struct {
+    char label[160];
+    char resolved[MCODE_PATH_MAX];
+} chat_ref_image;
+
+static bool has_matching_backticks(const char *s, size_t len, size_t pos, size_t count) {
+    size_t i = pos;
+    while (i < len) {
+        if (s[i] == '`') {
+            size_t run = 0;
+            while (i + run < len && s[i + run] == '`') ++run;
+            if (run == count) return true;
+            i += run;
+        } else {
+            ++i;
+        }
+    }
+    return false;
+}
+
+static size_t skip_to_next_line(const char *s, size_t len, size_t pos) {
+    while (pos < len && s[pos] != '\n') ++pos;
+    if (pos < len && s[pos] == '\n') ++pos;
+    return pos;
+}
+
+/* Parse a markdown `[label](dest ...)` starting at `open_bracket` (where s[open_bracket] == '[').
+ * Returns true on a complete balanced link, writing label/dest (trimmed) and end offset past ')'. */
+static bool parse_md_bracket_link(const char *s, size_t len, size_t open_bracket,
+                                  char *label_out, size_t label_cap,
+                                  char *dest_out, size_t dest_cap,
+                                  size_t *out_end) {
+    if (!s || open_bracket >= len || s[open_bracket] != '[') return false;
+    size_t i = open_bracket + 1;
+    int bracket_depth = 0;
+    size_t label_start = i;
+    size_t close_bracket = 0;
+    bool found_close = false;
+
+    while (i < len) {
+        if (s[i] == '\\' && i + 1 < len) {
+            i += 2;
+            continue;
+        }
+        if (s[i] == '\n' && i + 1 < len && s[i + 1] == '\n') {
+            return false;
+        }
+        if (s[i] == '[') {
+            ++bracket_depth;
+        } else if (s[i] == ']') {
+            if (bracket_depth == 0) {
+                close_bracket = i;
+                found_close = true;
+                break;
+            }
+            --bracket_depth;
+        }
+        ++i;
+    }
+    if (!found_close || close_bracket + 1 >= len || s[close_bracket + 1] != '(') {
+        return false;
+    }
+
+    size_t j = close_bracket + 2;
+    while (j < len && (s[j] == ' ' || s[j] == '\t')) ++j;
+    if (j >= len || s[j] == '\n' || s[j] == '\r') return false;
+
+    size_t dest_start = j;
+    size_t dest_end = j;
+    if (s[j] == '<') {
+        ++j;
+        dest_start = j;
+        while (j < len && s[j] != '>' && s[j] != '\n' && s[j] != '\r') {
+            if (s[j] == '\\' && j + 1 < len) {
+                j += 2;
+                continue;
+            }
+            ++j;
+        }
+        if (j >= len || s[j] != '>') return false;
+        dest_end = j;
+        ++j;
+    } else {
+        int paren_depth = 0;
+        while (j < len) {
+            unsigned char ch = (unsigned char)s[j];
+            if (ch == '\\' && j + 1 < len) {
+                j += 2;
+                continue;
+            }
+            if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') break;
+            if (ch == '(') {
+                ++paren_depth;
+            } else if (ch == ')') {
+                if (paren_depth == 0) break;
+                --paren_depth;
+            }
+            ++j;
+        }
+        dest_end = j;
+    }
+    if (dest_end <= dest_start) return false;
+
+    while (j < len && (s[j] == ' ' || s[j] == '\t')) ++j;
+    /* Optional title in "...", '...', or (...) */
+    if (j < len && (s[j] == '"' || s[j] == '\'' || s[j] == '(')) {
+        char close_q = (s[j] == '(') ? ')' : s[j];
+        ++j;
+        while (j < len && s[j] != close_q && s[j] != '\n' && s[j] != '\r') {
+            if (s[j] == '\\' && j + 1 < len) {
+                j += 2;
+                continue;
+            }
+            ++j;
+        }
+        if (j >= len || s[j] != close_q) return false;
+        ++j;
+        while (j < len && (s[j] == ' ' || s[j] == '\t')) ++j;
+    }
+    if (j >= len || s[j] != ')') return false;
+
+    if (label_out && label_cap > 0) {
+        size_t lstart = label_start;
+        size_t lend = close_bracket;
+        while (lstart < lend && isspace((unsigned char)s[lstart])) ++lstart;
+        while (lend > lstart && isspace((unsigned char)s[lend - 1])) --lend;
+        size_t llen = lend - lstart;
+        if (llen >= label_cap) llen = label_cap - 1;
+        memcpy(label_out, s + lstart, llen);
+        label_out[llen] = '\0';
+    }
+    if (dest_out && dest_cap > 0) {
+        size_t dlen = dest_end - dest_start;
+        if (dlen >= dest_cap) dlen = dest_cap - 1;
+        memcpy(dest_out, s + dest_start, dlen);
+        dest_out[dlen] = '\0';
+    }
+    if (out_end) *out_end = j + 1;
+    return true;
+}
+
+static bool has_resolved_in_inline(const chat_md_image *imgs, int count, const char *resolved) {
+    for (int i = 0; i < count; ++i) {
+        if (strcmp(imgs[i].resolved, resolved) == 0) return true;
+    }
+    return false;
+}
+
+static bool has_resolved_in_refs(const chat_ref_image *refs, int count, const char *resolved) {
+    for (int i = 0; i < count; ++i) {
+        if (strcmp(refs[i].resolved, resolved) == 0) return true;
+    }
+    return false;
+}
+
+static void scan_markdown_images(mcode_app *app, cui_ctx *ui, const char *workdir,
+                                 const char *s, size_t len,
+                                 chat_md_image *inline_out, int *inline_count,
+                                 chat_ref_image *ref_out, int *ref_count) {
+    *inline_count = 0;
+    *ref_count = 0;
+    if (!app || !ui || !s || len == 0) return;
+
+    bool at_line_start = true;
+    bool in_fence = false;
+    char fence_char = 0;
+    size_t fence_len = 0;
+    size_t code_ticks = 0;
+
+    size_t i = 0;
+    while (i < len) {
+        if (at_line_start) {
+            size_t p = i;
+            int spaces = 0;
+            while (p < len && s[p] == ' ' && spaces < 3) { ++p; ++spaces; }
+            if (p < len && (s[p] == '`' || s[p] == '~')) {
+                char fc = s[p];
+                size_t fl = 0;
+                while (p + fl < len && s[p + fl] == fc) ++fl;
+                if (fl >= 3) {
+                    if (!in_fence) {
+                        bool ok = true;
+                        if (fc == '`') {
+                            for (size_t q = p + fl; q < len && s[q] != '\n'; ++q) {
+                                if (s[q] == '`') { ok = false; break; }
+                            }
+                        }
+                        if (ok) {
+                            in_fence = true;
+                            fence_char = fc;
+                            fence_len = fl;
+                            code_ticks = 0;
+                            i = skip_to_next_line(s, len, p + fl);
+                            at_line_start = true;
+                            continue;
+                        }
+                    } else if (fc == fence_char && fl >= fence_len) {
+                        size_t q = p + fl;
+                        while (q < len && (s[q] == ' ' || s[q] == '\t' || s[q] == '\r')) ++q;
+                        if (q >= len || s[q] == '\n') {
+                            in_fence = false;
+                            i = (q < len) ? q + 1 : len;
+                            at_line_start = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+            if (in_fence) {
+                i = skip_to_next_line(s, len, i);
+                at_line_start = true;
+                continue;
+            }
+        }
+
+        if (code_ticks == 0 && s[i] == '\\' && i + 1 < len) {
+            at_line_start = (s[i + 1] == '\n');
+            i += 2;
+            continue;
+        }
+
+        if (s[i] == '`') {
+            size_t run = 0;
+            while (i + run < len && s[i + run] == '`') ++run;
+            if (code_ticks == 0) {
+                if (has_matching_backticks(s, len, i + run, run)) {
+                    code_ticks = run;
+                }
+            } else if (run == code_ticks) {
+                code_ticks = 0;
+            }
+            i += run;
+            at_line_start = false;
+            continue;
+        }
+
+        if (code_ticks > 0) {
+            at_line_start = (s[i] == '\n');
+            ++i;
+            continue;
+        }
+
+        /* Case 1: Markdown image ![alt](dest), optionally wrapped as [![alt](dest)](url) */
+        if (s[i] == '!' && i + 1 < len && s[i + 1] == '[') {
+            char alt[160] = "";
+            char dest[MCODE_PATH_MAX] = "";
+            size_t end = 0;
+            if (parse_md_bracket_link(s, len, i + 1, alt, sizeof alt, dest, sizeof dest, &end)) {
+                char resolved[MCODE_PATH_MAX] = "";
+                if (mcode_image_has_supported_ext(dest) &&
+                    mcode_ui_resolve_local_path(dest, workdir, false, resolved, sizeof resolved) &&
+                    mcode_ui_image_get(app, ui, resolved) != NULL) {
+                    size_t span_start = i;
+                    size_t span_end = end;
+                    if (i > 0 && s[i - 1] == '[' && end < len && s[end] == ']' &&
+                        end + 1 < len && s[end + 1] == '(') {
+                        size_t outer_end = 0;
+                        if (parse_md_bracket_link(s, len, i - 1, NULL, 0, NULL, 0, &outer_end)) {
+                            span_start = i - 1;
+                            span_end = outer_end;
+                        }
+                    }
+                    if (*inline_count < MCODE_CHAT_MAX_INLINE_IMAGES) {
+                        chat_md_image *im = &inline_out[(*inline_count)++];
+                        im->start = span_start;
+                        im->end = span_end;
+                        snprintf(im->alt, sizeof im->alt, "%s", alt);
+                        snprintf(im->resolved, sizeof im->resolved, "%s", resolved);
+                    }
+                    at_line_start = false;
+                    i = span_end;
+                    continue;
+                }
+                at_line_start = false;
+                i = end;
+                continue;
+            }
+        }
+
+        /* Case 2: Regular markdown link [label](dest) targeting a local PNG/JPEG */
+        if (s[i] == '[' && !(i + 2 < len && s[i + 1] == '!' && s[i + 2] == '[')) {
+            char label[160] = "";
+            char dest[MCODE_PATH_MAX] = "";
+            size_t end = 0;
+            if (parse_md_bracket_link(s, len, i, label, sizeof label, dest, sizeof dest, &end)) {
+                char resolved[MCODE_PATH_MAX] = "";
+                if (mcode_image_has_supported_ext(dest) &&
+                    mcode_ui_resolve_local_path(dest, workdir, false, resolved, sizeof resolved) &&
+                    mcode_ui_image_get(app, ui, resolved) != NULL) {
+                    if (*ref_count < MCODE_CHAT_MAX_REF_IMAGES &&
+                        !has_resolved_in_refs(ref_out, *ref_count, resolved)) {
+                        chat_ref_image *rf = &ref_out[(*ref_count)++];
+                        snprintf(rf->label, sizeof rf->label, "%s", label);
+                        snprintf(rf->resolved, sizeof rf->resolved, "%s", resolved);
+                    }
+                }
+                at_line_start = false;
+                i = end;
+                continue;
+            }
+        }
+
+        /* Case 3: Bare file:// URI or absolute/home path to an existing local PNG/JPEG */
+        if (i == 0 || isspace((unsigned char)s[i - 1]) ||
+            s[i - 1] == '<' || s[i - 1] == '(' || s[i - 1] == '"' || s[i - 1] == '\'') {
+            bool is_file_uri = link_starts_with_icase(s + i, "file://");
+            bool is_home_path = (s[i] == '~' && i + 1 < len && (s[i + 1] == '/' || s[i + 1] == '\\'));
+            bool is_abs_path = (s[i] == '/' && i + 1 < len && !isspace((unsigned char)s[i + 1]) &&
+                                s[i + 1] != '/');
+            if (is_file_uri || is_home_path || is_abs_path) {
+                size_t end = i;
+                while (end < len && !isspace((unsigned char)s[end]) &&
+                       s[end] != '>' && s[end] != ')' && s[end] != ']' &&
+                       s[end] != '"' && s[end] != '\'') {
+                    ++end;
+                }
+                char tok[MCODE_PATH_MAX];
+                size_t tlen = end - i;
+                if (tlen >= sizeof tok) tlen = sizeof tok - 1;
+                memcpy(tok, s + i, tlen);
+                tok[tlen] = '\0';
+                while (tlen > 0 && (tok[tlen - 1] == '.' || tok[tlen - 1] == ',' ||
+                                    tok[tlen - 1] == ';' || tok[tlen - 1] == ':')) {
+                    tok[--tlen] = '\0';
+                }
+                char resolved[MCODE_PATH_MAX] = "";
+                if (mcode_image_has_supported_ext(tok) &&
+                    mcode_ui_resolve_local_path(tok, workdir, false, resolved, sizeof resolved) &&
+                    mcode_ui_image_get(app, ui, resolved) != NULL) {
+                    if (*ref_count < MCODE_CHAT_MAX_REF_IMAGES &&
+                        !has_resolved_in_refs(ref_out, *ref_count, resolved)) {
+                        chat_ref_image *rf = &ref_out[(*ref_count)++];
+                        rf->label[0] = '\0';
+                        snprintf(rf->resolved, sizeof rf->resolved, "%s", resolved);
+                    }
+                }
+                at_line_start = false;
+                i = end;
+                continue;
+            }
+        }
+
+        at_line_start = (s[i] == '\n');
+        ++i;
+    }
+
+    /* Filter out referenced links that were already rendered inline as ![alt](path). */
+    int kept = 0;
+    for (int r = 0; r < *ref_count; ++r) {
+        if (!has_resolved_in_inline(inline_out, *inline_count, ref_out[r].resolved)) {
+            if (kept != r) ref_out[kept] = ref_out[r];
+            ++kept;
+        }
+    }
+    *ref_count = kept;
+}
+
+static bool is_token_boundary_before(const char *s, size_t i) {
+    if (i == 0) return true;
+    unsigned char prev = (unsigned char)s[i - 1];
+    return isspace(prev) || prev == '(' || prev == '[' || prev == '"' || prev == '\'' || prev == '<';
+}
+
+static bool is_token_delim(unsigned char c) {
+    return isspace(c) || c == ')' || c == ']' || c == '>' || c == '"' || c == '\'' || c == ',' || c == ';';
+}
+
+static void trim_trailing_punct(char *tok) {
+    size_t n = strlen(tok);
+    while (n > 0 && (tok[n - 1] == '.' || tok[n - 1] == ',' || tok[n - 1] == ';' ||
+                     tok[n - 1] == ':' || tok[n - 1] == ')' || tok[n - 1] == ']' ||
+                     tok[n - 1] == '>' || tok[n - 1] == '"' || tok[n - 1] == '\'')) {
+        tok[--n] = '\0';
+    }
+}
+
+/* Try to match an unquoted path with spaces on the same line ending in .png/.jpg/.jpeg. */
+static size_t find_spaced_image_end(const char *s, size_t len, size_t start) {
+    static const char *const k_exts[] = { ".png", ".jpg", ".jpeg" };
+    size_t line_end = start;
+    while (line_end < len && s[line_end] != '\n' && s[line_end] != '\r') ++line_end;
+    if (line_end - start >= MCODE_PATH_MAX) line_end = start + MCODE_PATH_MAX - 1;
+
+    for (size_t p = start; p < line_end; ++p) {
+        if (s[p] != '.') continue;
+        for (size_t ei = 0; ei < sizeof k_exts / sizeof k_exts[0]; ++ei) {
+            size_t elen = strlen(k_exts[ei]);
+            if (p + elen <= line_end && link_starts_with_icase(s + p, k_exts[ei])) {
+                size_t after = p + elen;
+                if (after == line_end || is_token_delim((unsigned char)s[after])) {
+                    return after;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static void add_prompt_ref_if_valid(mcode_app *app, cui_ctx *ui, const char *workdir,
+                                    const char *raw_candidate, const char *label_opt,
+                                    chat_ref_image *out, int *count, int max_count) {
+    if (!raw_candidate || !raw_candidate[0] || *count >= max_count) return;
+    if (!mcode_image_has_supported_ext(raw_candidate)) return;
+    char resolved[MCODE_PATH_MAX] = "";
+    if (!mcode_ui_resolve_local_path(raw_candidate, workdir, false, resolved, sizeof resolved)) return;
+    if (has_resolved_in_refs(out, *count, resolved)) return;
+    if (!mcode_ui_image_get(app, ui, resolved)) return;
+
+    chat_ref_image *rf = &out[(*count)++];
+    snprintf(rf->resolved, sizeof rf->resolved, "%s", resolved);
+    snprintf(rf->label, sizeof rf->label, "%s", (label_opt && label_opt[0]) ? label_opt : "");
+}
+
+static int extract_prompt_images(mcode_app *app, cui_ctx *ui, const char *workdir,
+                                 const char *s, chat_ref_image *out, int max_count) {
+    int count = 0;
+    if (!app || !ui || !s || !s[0] || max_count <= 0) return 0;
+    size_t len = strlen(s);
+    size_t code_ticks = 0;
+    size_t i = 0;
+
+    while (i < len && count < max_count) {
+        if (s[i] == '`') {
+            size_t run = 0;
+            while (i + run < len && s[i + run] == '`') ++run;
+            if (code_ticks == 0) {
+                if (has_matching_backticks(s, len, i + run, run)) code_ticks = run;
+            } else if (run == code_ticks) {
+                code_ticks = 0;
+            }
+            i += run;
+            continue;
+        }
+        if (code_ticks > 0) {
+            ++i;
+            continue;
+        }
+
+        /* Markdown ![alt](dest) or [label](dest) */
+        if ((s[i] == '!' && i + 1 < len && s[i + 1] == '[') || s[i] == '[') {
+            size_t ob = (s[i] == '!') ? i + 1 : i;
+            char label[160] = "";
+            char dest[MCODE_PATH_MAX] = "";
+            size_t end = 0;
+            if (parse_md_bracket_link(s, len, ob, label, sizeof label, dest, sizeof dest, &end)) {
+                add_prompt_ref_if_valid(app, ui, workdir, dest, label, out, &count, max_count);
+                i = end;
+                continue;
+            }
+        }
+
+        if (!is_token_boundary_before(s, i)) {
+            ++i;
+            continue;
+        }
+
+        /* @path references (from composer attach or typed manually) */
+        if (s[i] == '@' && i + 1 < len && !isspace((unsigned char)s[i + 1])) {
+            size_t start = i + 1;
+            size_t end = start;
+            if (s[start] == '"' || s[start] == '\'') {
+                char q = s[start++];
+                end = start;
+                while (end < len && s[end] != q && s[end] != '\n' && s[end] != '\r') ++end;
+                char tok[MCODE_PATH_MAX];
+                size_t tlen = end - start;
+                if (tlen >= sizeof tok) tlen = sizeof tok - 1;
+                memcpy(tok, s + start, tlen);
+                tok[tlen] = '\0';
+                add_prompt_ref_if_valid(app, ui, workdir, tok, NULL, out, &count, max_count);
+                i = (end < len && s[end] == q) ? end + 1 : end;
+                continue;
+            }
+            while (end < len && !is_token_delim((unsigned char)s[end])) ++end;
+            char tok[MCODE_PATH_MAX];
+            size_t tlen = end - start;
+            if (tlen >= sizeof tok) tlen = sizeof tok - 1;
+            memcpy(tok, s + start, tlen);
+            tok[tlen] = '\0';
+            trim_trailing_punct(tok);
+            int before = count;
+            add_prompt_ref_if_valid(app, ui, workdir, tok, NULL, out, &count, max_count);
+            if (count == before) {
+                size_t spaced_end = find_spaced_image_end(s, len, start);
+                if (spaced_end > end) {
+                    tlen = spaced_end - start;
+                    if (tlen >= sizeof tok) tlen = sizeof tok - 1;
+                    memcpy(tok, s + start, tlen);
+                    tok[tlen] = '\0';
+                    add_prompt_ref_if_valid(app, ui, workdir, tok, NULL, out, &count, max_count);
+                    if (count > before) end = spaced_end;
+                }
+            }
+            i = end;
+            continue;
+        }
+
+        /* file:// URI or bare absolute / ~/ image paths */
+        bool is_file_uri = link_starts_with_icase(s + i, "file://");
+        bool is_home_path = (s[i] == '~' && i + 1 < len && (s[i + 1] == '/' || s[i + 1] == '\\'));
+        bool is_abs_path = (s[i] == '/' && i + 1 < len && !isspace((unsigned char)s[i + 1]));
+        if (is_file_uri || is_home_path || is_abs_path) {
+            size_t start = i;
+            size_t end = start;
+            while (end < len && !is_token_delim((unsigned char)s[end])) ++end;
+            char tok[MCODE_PATH_MAX];
+            size_t tlen = end - start;
+            if (tlen >= sizeof tok) tlen = sizeof tok - 1;
+            memcpy(tok, s + start, tlen);
+            tok[tlen] = '\0';
+            trim_trailing_punct(tok);
+            int before = count;
+            add_prompt_ref_if_valid(app, ui, workdir, tok, NULL, out, &count, max_count);
+            if (count == before && !is_file_uri) {
+                size_t spaced_end = find_spaced_image_end(s, len, start);
+                if (spaced_end > end) {
+                    tlen = spaced_end - start;
+                    if (tlen >= sizeof tok) tlen = sizeof tok - 1;
+                    memcpy(tok, s + start, tlen);
+                    tok[tlen] = '\0';
+                    add_prompt_ref_if_valid(app, ui, workdir, tok, NULL, out, &count, max_count);
+                    if (count > before) end = spaced_end;
+                }
+            }
+            i = end;
+            continue;
+        }
+
+        ++i;
+    }
+
+    return count;
+}
+
+static void draw_markdown_slice(mcode_app *app, cui_ctx *ui, const mcode_thread *thread,
+                                const char *id, const char *txt, size_t len,
+                                float fallback_md_w, bool streaming) {
+    if (!txt || len == 0) return;
+    cui_id md_id = cui_make_id(ui, id);
+    bool has_md_rect = cui_get_rect(ui, md_id).w > 0.0f;
+    cui_size md_width = (!has_md_rect && fallback_md_w > 0.0f)
+        ? CUI_PX(fallback_md_w)
+        : CUI_FILL;
+    cui_markdown_result mr = cui_markdown(ui, id, txt,
+                                          .length = (int)len,
+                                          .width = md_width,
+                                          .streaming = streaming);
+    if (!has_md_rect && fallback_md_w > 0.0f) {
+        cui_request_redraw(ui);
+    }
+    if (mr.link && mr.link[0]) {
+        open_markdown_link(app, ui, thread, mr.link);
+    }
+}
+
+static bool trim_markdown_slice(const char *txt, size_t start, size_t end,
+                                size_t *out_start, size_t *out_end) {
+    while (start < end && (txt[start] == '\r' || txt[start] == '\n')) ++start;
+    while (end > start && (txt[end - 1] == '\r' || txt[end - 1] == '\n')) --end;
+    bool has_non_ws = false;
+    for (size_t p = start; p < end; ++p) {
+        if (!isspace((unsigned char)txt[p])) {
+            has_non_ws = true;
+            break;
+        }
+    }
+    if (!has_non_ws) return false;
+    *out_start = start;
+    *out_end = end;
+    return true;
+}
+
+static void draw_assistant_markdown_block(mcode_app *app, cui_ctx *ui, const mcode_thread *thread,
+                                          const char *bid, const char *txt, size_t len,
+                                          float fallback_md_w, bool streaming) {
+    if (!txt || len == 0) return;
+    const char *workdir = (thread && thread->workdir[0]) ? thread->workdir : NULL;
+
+    chat_md_image inline_imgs[MCODE_CHAT_MAX_INLINE_IMAGES];
+    chat_ref_image ref_imgs[MCODE_CHAT_MAX_REF_IMAGES];
+    int inline_count = 0;
+    int ref_count = 0;
+    scan_markdown_images(app, ui, workdir, txt, len,
+                         inline_imgs, &inline_count, ref_imgs, &ref_count);
+
+    float col_w = (fallback_md_w > 0.0f) ? fallback_md_w : 640.0f;
+    float img_max_w = col_w - 16.0f;
+    if (img_max_w > 460.0f) img_max_w = 460.0f;
+    if (img_max_w < 160.0f) img_max_w = 160.0f;
+
+    if (inline_count == 0 && ref_count == 0) {
+        draw_markdown_slice(app, ui, thread, bid, txt, len, fallback_md_w, streaming);
+        return;
+    }
+
+    cui_column(ui, .width = CUI_FILL, .gap = 8) {
+        if (inline_count == 0) {
+            draw_markdown_slice(app, ui, thread, bid, txt, len, fallback_md_w, streaming);
+        } else {
+            size_t cursor = 0;
+            for (int ii = 0; ii < inline_count; ++ii) {
+                size_t seg_s = 0, seg_e = 0;
+                if (trim_markdown_slice(txt, cursor, inline_imgs[ii].start, &seg_s, &seg_e)) {
+                    char seg_id[64];
+                    snprintf(seg_id, sizeof seg_id, "%s-md-%d", bid, ii);
+                    draw_markdown_slice(app, ui, thread, seg_id,
+                                        txt + seg_s, seg_e - seg_s, fallback_md_w, false);
+                }
+                char img_id[64];
+                snprintf(img_id, sizeof img_id, "%s-img-%d", bid, ii);
+                mcode_ui_draw_image_preview_card(app, ui, img_id,
+                                                 inline_imgs[ii].resolved,
+                                                 inline_imgs[ii].alt,
+                                                 img_max_w, 280.0f, false);
+                cursor = inline_imgs[ii].end;
+            }
+            size_t tail_s = 0, tail_e = 0;
+            if (trim_markdown_slice(txt, cursor, len, &tail_s, &tail_e)) {
+                char seg_id[64];
+                snprintf(seg_id, sizeof seg_id, "%s-md-tail", bid);
+                draw_markdown_slice(app, ui, thread, seg_id,
+                                    txt + tail_s, tail_e - tail_s, fallback_md_w, streaming);
+            }
+        }
+
+        if (ref_count > 0) {
+            cui_row(ui, .width = CUI_FILL, .gap = 8, .wrap = true, .align = CUI_ALIGN_START) {
+                for (int ri = 0; ri < ref_count; ++ri) {
+                    char ref_id[64];
+                    snprintf(ref_id, sizeof ref_id, "%s-refimg-%d", bid, ri);
+                    float thumb_w = (ref_count == 1) ? (img_max_w < 320.0f ? img_max_w : 320.0f) : 180.0f;
+                    float thumb_h = (ref_count == 1) ? 200.0f : 124.0f;
+                    mcode_ui_draw_image_preview_card(app, ui, ref_id,
+                                                     ref_imgs[ri].resolved,
+                                                     ref_imgs[ri].label,
+                                                     thumb_w, thumb_h, ref_count > 1);
+                }
+            }
+        }
     }
 }
 
@@ -339,6 +901,16 @@ static void format_tool_row_title(const mcode_block *b, const char *workdir, flo
         verb = running ? "Fetching" : "Fetched";
         fallback = "web";
         break;
+    case TOOL_KIND_IMAGE:
+        if (strstr(b->tool_name, "view") || strstr(b->tool_name, "View")) {
+            verb = running ? "Viewing" : "Viewed";
+            fallback = "image";
+        } else {
+            verb = running ? "Generating image" : "Generated image";
+            fallback = "";
+            detail[0] = '\0';
+        }
+        break;
     default:
         verb = b->tool_name[0] ? b->tool_name : "Tool";
         fallback = "";
@@ -381,7 +953,7 @@ static void append_clause(char *buf, size_t cap, int *pos, const char *fmt, int 
 static void format_tool_group_title(const mcode_block *blocks, int start, int count,
                                     const char *workdir, char *out, size_t cap,
                                     bool *out_running, int *out_failed) {
-    int n_cmd = 0, n_edit = 0, n_read = 0, n_search = 0, n_web = 0, n_other = 0;
+    int n_cmd = 0, n_edit = 0, n_read = 0, n_search = 0, n_web = 0, n_image = 0, n_other = 0;
     int n_failed = 0;
     int running_idx = -1;
     float total_secs = 0.0f;
@@ -394,6 +966,7 @@ static void format_tool_group_title(const mcode_block *blocks, int start, int co
         case TOOL_KIND_READ:   ++n_read; break;
         case TOOL_KIND_SEARCH: ++n_search; break;
         case TOOL_KIND_WEB:    ++n_web; break;
+        case TOOL_KIND_IMAGE:  ++n_image; break;
         default:               ++n_other; break;
         }
         if (b->status == CUI_TASK_RUNNING) running_idx = start + i;
@@ -424,6 +997,7 @@ static void format_tool_group_title(const mcode_block *blocks, int start, int co
     if (n_cmd > 0)    append_clause(out, cap, &pos, "ran %d command%s", n_cmd);
     if (n_edit > 0)   append_clause(out, cap, &pos, "edited %d file%s", n_edit);
     if (n_web > 0)    append_clause(out, cap, &pos, "%d web lookup%s", n_web);
+    if (n_image > 0)  append_clause(out, cap, &pos, "processed %d image%s", n_image);
     if (n_other > 0)  append_clause(out, cap, &pos, "%d tool call%s", n_other);
 
     if (out[0] >= 'a' && out[0] <= 'z') {
@@ -661,10 +1235,15 @@ static void draw_empty_workspace(mcode_app *app, cui_ctx *ui) {
     }
 }
 
-static void draw_user_message(cui_ctx *ui, const char *thread_id, const char *text, bool steered) {
+static void draw_user_message(mcode_app *app, cui_ctx *ui, const char *thread_id,
+                              const char *workdir, const char *text, bool steered) {
     if (!text) text = "";
     cui_push_id(ui, (thread_id && thread_id[0]) ? thread_id : "thread");
     cui_push_id(ui, "user-msg");
+
+    chat_ref_image prompt_imgs[MCODE_CHAT_MAX_REF_IMAGES];
+    int prompt_img_count = extract_prompt_images(app, ui, workdir, text,
+                                                 prompt_imgs, MCODE_CHAT_MAX_REF_IMAGES);
 
     bool dark = (cui_get_theme_mode(ui) == CUI_THEME_DARK);
     bool has_accent = app_theme_has_accent(ui);
@@ -684,7 +1263,7 @@ static void draw_user_message(cui_ctx *ui, const char *thread_id, const char *te
     }
 
     cui_row(ui, .width = CUI_FILL, .justify = CUI_JUSTIFY_END, .pad_top = 10) {
-        cui_column(ui, .max_width = 480, .pad_x = 13, .pad_y = 8, .gap = 4,
+        cui_column(ui, .max_width = 480, .pad_x = 13, .pad_y = 8, .gap = 6,
                    .bg = bg, .border = 1.0f, .border_color = border_col,
                    .radius_tl = 18, .radius_tr = 18, .radius_br = 6, .radius_bl = 18) {
             if (steered) {
@@ -695,6 +1274,20 @@ static void draw_user_message(cui_ctx *ui, const char *thread_id, const char *te
                     cui_icon(ui, CUI_ICON_ARROW_RIGHT, 11, tag_col);
                     cui_text(ui, "Steered", .font = CUI_FONT_MEDIUM, .size = 11.0f,
                              .color = tag_col, .nowrap = true);
+                }
+            }
+            if (prompt_img_count > 0) {
+                cui_row(ui, .gap = 6, .wrap = true, .align = CUI_ALIGN_START) {
+                    float max_w = (prompt_img_count == 1) ? 220.0f : 124.0f;
+                    float max_h = (prompt_img_count == 1) ? 140.0f : 88.0f;
+                    for (int pi = 0; pi < prompt_img_count; ++pi) {
+                        char pid[32];
+                        snprintf(pid, sizeof pid, "uimg-%d", pi);
+                        mcode_ui_draw_image_preview_card(app, ui, pid,
+                                                         prompt_imgs[pi].resolved,
+                                                         prompt_imgs[pi].label,
+                                                         max_w, max_h, true);
+                    }
                 }
             }
             cui_text(ui, text, .color = CUI_COLOR_FOREGROUND,
@@ -714,7 +1307,8 @@ static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int tur
 
     cui_column(ui, .width = CUI_FILL, .gap = 10) {
         /* User prompt bubble */
-        draw_user_message(ui, thread->id, mcode_str_cstr(&turn->prompt), turn->steered);
+        draw_user_message(app, ui, thread->id, thread->workdir,
+                          mcode_str_cstr(&turn->prompt), turn->steered);
 
         /* Assistant stream blocks */
         const char *last_text = NULL;
@@ -766,20 +1360,30 @@ static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int tur
                 if (txt[0]) {
                     last_text = txt;
                     bool streaming = turn->running && (bi == turn->block_count - 1);
-                    cui_id md_id = cui_make_id(ui, bid);
-                    bool has_md_rect = cui_get_rect(ui, md_id).w > 0.0f;
-                    cui_size md_width = (!has_md_rect && fallback_md_w > 0.0f)
-                        ? CUI_PX(fallback_md_w)
-                        : CUI_FILL;
-                    cui_markdown_result mr = cui_markdown(ui, bid, txt,
-                                                          .length = (int)b->text.len,
-                                                          .width = md_width,
-                                                          .streaming = streaming);
-                    if (!has_md_rect && fallback_md_w > 0.0f) {
-                        cui_request_redraw(ui);
-                    }
-                    if (mr.link && mr.link[0]) {
-                        open_markdown_link(app, ui, thread, mr.link);
+                    draw_assistant_markdown_block(app, ui, thread, bid, txt, b->text.len,
+                                                  fallback_md_w, streaming);
+                }
+            } else if (b->kind == MCODE_BLOCK_IMAGE) {
+                char resolved[MCODE_PATH_MAX] = "";
+                const char *workdir = (thread && thread->workdir[0]) ? thread->workdir : NULL;
+                const char *img_path = b->image_path;
+                if (img_path[0] &&
+                    mcode_ui_resolve_local_path(img_path, workdir, false, resolved, sizeof resolved)) {
+                    img_path = resolved;
+                }
+                float col_w = (fallback_md_w > 0.0f) ? fallback_md_w : 640.0f;
+                float img_max_w = col_w - 16.0f;
+                if (img_max_w > 540.0f) img_max_w = 540.0f;
+                if (img_max_w < 160.0f) img_max_w = 160.0f;
+                const char *caption = mcode_str_cstr(&b->text);
+                if (!mcode_ui_draw_image_preview_card(app, ui, bid, img_path, caption,
+                                                      img_max_w, 380.0f, false)) {
+                    cui_row(ui, .gap = 8, .pad_x = 12, .pad_y = 8, .radius = 8,
+                            .border = 1.0f, .border_color = CUI_COLOR_BORDER,
+                            .bg = CUI_COLOR_SURFACE_MUTED, .align = CUI_ALIGN_CENTER) {
+                        cui_icon(ui, CUI_ICON_IMAGE, 14, CUI_COLOR_TEXT_MUTED);
+                        cui_text(ui, b->image_path[0] ? b->image_path : "Image unavailable",
+                                 .size = 12.5f, .color = CUI_COLOR_TEXT_MUTED);
                     }
                 }
             } else if (b->kind == MCODE_BLOCK_ERROR) {
@@ -789,7 +1393,7 @@ static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int tur
                 const char *stxt = mcode_str_cstr(&b->text);
                 if (stxt[0]) {
                     cui_push_id(ui, bid);
-                    draw_user_message(ui, thread->id, stxt, true);
+                    draw_user_message(app, ui, thread->id, thread->workdir, stxt, true);
                     cui_pop_id(ui);
                 }
             }
@@ -1971,7 +2575,9 @@ static bool composer_blocked_by_modal(const mcode_app *app) {
            app->rename_project_open ||
            app->new_thread_open ||
            app->git_dialog_open ||
+           app->discard_dialog_open ||
            app->actions_dialog_open ||
+           app->image_lightbox_open ||
            (app->chrome && (app->chrome->settings_open || app->chrome->palette_open));
 }
 
@@ -1992,6 +2598,22 @@ static void draw_thread_composer(mcode_app *app, cui_ctx *ui, mcode_thread *thre
     /* Refresh blank/busy status in case queue dock actions mutated draft or started a turn */
     busy = (thread->active_run != NULL);
     draft_blank = composer_draft_is_blank(thread->composer_draft);
+
+    chat_ref_image draft_imgs[6];
+    int draft_img_count = extract_prompt_images(app, ui, thread->workdir,
+                                                thread->composer_draft, draft_imgs, 6);
+    if (draft_img_count > 0) {
+        cui_row(ui, .width = CUI_FILL, .gap = 6, .wrap = true, .align = CUI_ALIGN_START) {
+            for (int di = 0; di < draft_img_count; ++di) {
+                char did[32];
+                snprintf(did, sizeof did, "draft-img-%d", di);
+                mcode_ui_draw_image_preview_card(app, ui, did,
+                                                 draft_imgs[di].resolved,
+                                                 draft_imgs[di].label,
+                                                 96.0f, 64.0f, true);
+            }
+        }
+    }
 
     bool want_queue = false;
     bool want_steer = false;

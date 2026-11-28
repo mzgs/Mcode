@@ -480,6 +480,8 @@ void mcode_ui_open_file_preview(mcode_app *app, cui_ctx *ui, const char *root_pa
     app->preview_is_binary = is_bin;
     app->preview_truncated = trunc;
     app->preview_file_size = fsz;
+    app->preview_image_path[0] = '\0';
+    memset(&app->preview_image_view, 0, sizeof app->preview_image_view);
     snprintf(app->preview_rel_path, sizeof app->preview_rel_path, "%s", rel_path);
     snprintf(app->preview_workdir, sizeof app->preview_workdir, "%s", root_path);
     app->inspector_open = true;

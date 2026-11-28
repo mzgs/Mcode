@@ -17,6 +17,9 @@
 #ifndef _WIN32
 #include <dirent.h>
 #include <sys/stat.h>
+#else
+#include <direct.h>
+#include <sys/stat.h>
 #endif
 
 typedef enum {
@@ -28,6 +31,7 @@ typedef enum {
     EV_TOOL_START,
     EV_TOOL_INPUT_DELTA,
     EV_TOOL_RESULT,
+    EV_IMAGE,
     EV_APPROVAL_REQUEST,
     EV_APPROVAL_CLEAR,
     EV_STATUS,
@@ -218,6 +222,185 @@ static void emit_tool_result_code(mcode_agent_run *run, const char *id, const ch
 
 static void emit_tool_result(mcode_agent_run *run, const char *id, const char *output, bool failed) {
     emit_tool_result_code(run, id, output, failed, -1);
+}
+
+static void emit_image_ev(mcode_agent_run *run, const char *image_path, const char *caption) {
+    if (!run || !image_path || !image_path[0]) return;
+    emit_simple(run, EV_REASONING_DONE, NULL);
+    agent_ev *ev = calloc(1, sizeof *ev);
+    if (!ev) return;
+    ev->kind = EV_IMAGE;
+    ev->extra_a = dup_or_null(image_path);
+    ev->text = dup_or_null(caption ? caption : "");
+    push_ev(run, ev);
+}
+
+static bool file_exists_nonempty(const char *path) {
+    if (!path || !path[0]) return false;
+    struct stat st;
+    return stat(path, &st) == 0 && st.st_size > 0;
+}
+
+static int b64_val(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return 26 + (c - 'a');
+    if (c >= '0' && c <= '9') return 52 + (c - '0');
+    if (c == '+' || c == '-') return 62;
+    if (c == '/' || c == '_') return 63;
+    return -1;
+}
+
+static unsigned char *decode_base64_bytes(const char *src, size_t *out_len) {
+    if (out_len) *out_len = 0;
+    if (!src || !src[0]) return NULL;
+    if (strncmp(src, "data:", 5) == 0) {
+        const char *comma = strchr(src, ',');
+        if (!comma) return NULL;
+        src = comma + 1;
+    }
+    size_t slen = strlen(src);
+    if (slen < 4) return NULL;
+    size_t max_out = (slen / 4) * 3 + 4;
+    unsigned char *out = malloc(max_out);
+    if (!out) return NULL;
+
+    size_t w = 0;
+    uint32_t acc = 0;
+    int bits = 0;
+    for (size_t i = 0; i < slen; ++i) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '=') break;
+        if (isspace(c)) continue;
+        int v = b64_val(c);
+        if (v < 0) continue;
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out[w++] = (unsigned char)((acc >> bits) & 0xFFu);
+        }
+    }
+    if (w == 0) {
+        free(out);
+        return NULL;
+    }
+    if (out_len) *out_len = w;
+    return out;
+}
+
+static bool save_base64_image_to_disk(const char *raw_b64, const char *mime_hint,
+                                      const char *id_hint, char *out_path, size_t out_cap) {
+    if (out_path && out_cap > 0) out_path[0] = '\0';
+    if (!raw_b64 || !raw_b64[0] || !out_path || out_cap == 0) return false;
+
+    size_t nbytes = 0;
+    unsigned char *bytes = decode_base64_bytes(raw_b64, &nbytes);
+    if (!bytes || nbytes < 8) {
+        free(bytes);
+        return false;
+    }
+
+    const char *ext = NULL;
+    if (bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47) {
+        ext = "png";
+    } else if (bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) {
+        ext = "jpg";
+    } else if (mime_hint && (strstr(mime_hint, "png") || strstr(mime_hint, "PNG"))) {
+        ext = "png";
+    } else if (mime_hint && (strstr(mime_hint, "jpeg") || strstr(mime_hint, "jpg") ||
+                             strstr(mime_hint, "JPEG") || strstr(mime_hint, "JPG"))) {
+        ext = "jpg";
+    }
+    if (!ext) {
+        free(bytes);
+        return false;
+    }
+
+    char base_dir[MCODE_PATH_MAX] = "";
+    char img_dir[MCODE_PATH_MAX] = "";
+    if (app_settings_dir(base_dir, sizeof base_dir, NULL, true) && base_dir[0]) {
+        snprintf(img_dir, sizeof img_dir, "%s/generated_images", base_dir);
+    } else {
+        const char *tmp = getenv("TMPDIR");
+        if (!tmp || !tmp[0]) tmp = "/tmp";
+        snprintf(img_dir, sizeof img_dir, "%s/mcode-images", tmp);
+    }
+#ifdef _WIN32
+    (void)_mkdir(img_dir);
+#else
+    (void)mkdir(img_dir, 0700);
+#endif
+
+    char safe_id[96] = "";
+    if (id_hint && id_hint[0]) {
+        size_t w = 0;
+        for (const char *p = id_hint; *p && w + 1 < sizeof safe_id; ++p) {
+            unsigned char c = (unsigned char)*p;
+            if (isalnum(c) || c == '-' || c == '_') safe_id[w++] = (char)c;
+        }
+        safe_id[w] = '\0';
+    }
+    if (!safe_id[0]) {
+        mcode_gen_id(safe_id, sizeof safe_id, "img");
+    }
+
+    int pn = snprintf(out_path, out_cap, "%s/%s.%s", img_dir, safe_id, ext);
+    if (pn <= 0 || (size_t)pn >= out_cap) {
+        out_path[0] = '\0';
+        free(bytes);
+        return false;
+    }
+
+    FILE *f = fopen(out_path, "wb");
+    if (!f) {
+        out_path[0] = '\0';
+        free(bytes);
+        return false;
+    }
+    bool ok = (fwrite(bytes, 1, nbytes, f) == nbytes);
+    if (fclose(f) != 0) ok = false;
+    free(bytes);
+    if (!ok) {
+        remove(out_path);
+        out_path[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+static const char *jstr(yyjson_val *obj, const char *key);
+
+static bool emit_json_image_content(mcode_agent_run *run, yyjson_val *item, const char *id_hint) {
+    if (!run || !yyjson_is_obj(item)) return false;
+    const char *t = jstr(item, "type");
+    if (!t || strcmp(t, "image") != 0) return false;
+
+    const char *path = jstr(item, "path");
+    if (!path) path = jstr(item, "savedPath");
+    if (!path) path = jstr(item, "uri");
+    if (path && strncmp(path, "file://", 7) == 0) path += 7;
+    if (path && file_exists_nonempty(path)) {
+        emit_image_ev(run, path, "");
+        return true;
+    }
+
+    const char *b64 = jstr(item, "data");
+    const char *mime = jstr(item, "mimeType");
+    if (!mime) mime = jstr(item, "media_type");
+    yyjson_val *src = yyjson_obj_get(item, "source");
+    if (yyjson_is_obj(src)) {
+        if (!b64) b64 = jstr(src, "data");
+        if (!mime) mime = jstr(src, "media_type");
+        if (!mime) mime = jstr(src, "mimeType");
+    }
+    if (b64 && b64[0]) {
+        char saved[MCODE_PATH_MAX] = "";
+        if (save_base64_image_to_disk(b64, mime, id_hint, saved, sizeof saved)) {
+            emit_image_ev(run, saved, "");
+            return true;
+        }
+    }
+    return false;
 }
 
 static void emit_approval_request(mcode_agent_run *run, const char *title, const char *tool_name,
@@ -753,6 +936,8 @@ static void parse_claude_json(mcode_agent_run *run, yyjson_val *root) {
                 if (detail[0]) snprintf(st, sizeof st, "%s: %s", tname ? tname : "tool", detail);
                 else snprintf(st, sizeof st, "Running %s...", tname ? tname : "tool");
                 emit_simple(run, EV_STATUS, st);
+            } else if (strcmp(it, "image") == 0) {
+                emit_json_image_content(run, item, "claude");
             }
         }
         /* Reset per-message streaming flags for next assistant turn within tool loop */
@@ -808,6 +993,13 @@ static void parse_claude_json(mcode_agent_run *run, yyjson_val *root) {
             }
             emit_tool_result(run, tid, out_str ? out_str : "", failed);
             free(out_str);
+            if (!failed && yyjson_is_arr(rc)) {
+                size_t j, jmax;
+                yyjson_val *part;
+                yyjson_arr_foreach(rc, j, jmax, part) {
+                    emit_json_image_content(run, part, tid);
+                }
+            }
         }
         return;
     }
@@ -1455,6 +1647,79 @@ bool mcode_tool_is_benign_probe_failure(const char *tool_name, const char *input
     return mcode_command_is_benign_probe_exit(input, output, exit_code);
 }
 
+/* ---- Shared Codex imageGeneration & imageView item handlers ---- */
+static void handle_codex_image_gen_item(mcode_agent_run *run, yyjson_val *item,
+                                        const char *iid, bool is_done) {
+    if (!run || !yyjson_is_obj(item)) return;
+    run->has_emitted_text = false;
+    const char *tid = (iid && iid[0]) ? iid : "imggen";
+    const char *status = jstr(item, "status");
+    const char *revised = jstr(item, "revisedPrompt");
+    if (!revised) revised = jstr(item, "revised_prompt");
+    const char *saved_path = jstr(item, "savedPath");
+    if (!saved_path) saved_path = jstr(item, "saved_path");
+    const char *result_b64 = jstr(item, "result");
+    yyjson_val *failure = yyjson_obj_get(item, "failure");
+
+    if (!is_done) {
+        emit_tool_start(run, tid, "image_gen", "", revised ? revised : "");
+        emit_simple(run, EV_STATUS, "Generating image...");
+        return;
+    }
+
+    bool failed = (failure && !yyjson_is_null(failure)) ||
+                  (status && (strcmp(status, "failed") == 0 ||
+                              strcmp(status, "declined") == 0 ||
+                              strcmp(status, "cancelled") == 0 ||
+                              strcmp(status, "canceled") == 0));
+
+    char resolved_path[MCODE_PATH_MAX] = "";
+    if (!failed) {
+        if (saved_path && file_exists_nonempty(saved_path)) {
+            snprintf(resolved_path, sizeof resolved_path, "%s", saved_path);
+        } else if (result_b64 && result_b64[0]) {
+            save_base64_image_to_disk(result_b64, "image/png", tid,
+                                      resolved_path, sizeof resolved_path);
+        }
+    }
+
+    emit_tool_start(run, tid, "image_gen", "", revised ? revised : "");
+    if (failed) {
+        const char *ftype = yyjson_is_obj(failure) ? jstr(failure, "type") : NULL;
+        char *fjson = (!ftype && failure && !yyjson_is_null(failure))
+            ? stringify_json_val(failure)
+            : NULL;
+        const char *err_msg = (ftype && strcmp(ftype, "usageLimitExceeded") == 0)
+            ? "Image generation usage limit exceeded."
+            : (fjson && fjson[0] ? fjson : "Image generation failed.");
+        emit_tool_result(run, tid, err_msg, true);
+        free(fjson);
+        return;
+    }
+
+    emit_tool_result(run, tid, resolved_path[0] ? resolved_path : "Image generated.", false);
+    if (resolved_path[0]) {
+        emit_image_ev(run, resolved_path, "Generated image");
+    }
+}
+
+static void handle_codex_image_view_item(mcode_agent_run *run, yyjson_val *item,
+                                         const char *iid, bool is_done) {
+    if (!run || !yyjson_is_obj(item)) return;
+    run->has_emitted_text = false;
+    const char *tid = (iid && iid[0]) ? iid : "imgview";
+    const char *path = jstr(item, "path");
+    emit_tool_start(run, tid, "view_image", path ? path : "", path ? path : "");
+    if (!is_done) {
+        emit_simple(run, EV_STATUS, "Viewing image...");
+    } else {
+        emit_tool_result(run, tid, path ? path : "", false);
+        if (path && file_exists_nonempty(path)) {
+            emit_image_ev(run, path, "");
+        }
+    }
+}
+
 /* ---- OpenAI Codex JSONL parser ---- */
 static void parse_codex_json(mcode_agent_run *run, yyjson_val *root) {
     const char *type = jstr(root, "type");
@@ -1558,6 +1823,12 @@ static void parse_codex_json(mcode_agent_run *run, yyjson_val *root) {
                                  err_s != NULL);
                 free(res_json);
             }
+        } else if (strcmp(itype, "image_generation") == 0 || strcmp(itype, "imageGeneration") == 0 ||
+                   (strcmp(itype, "Extension") == 0 &&
+                    jstr(item, "kind") && strcmp(jstr(item, "kind"), "image_gen.generation") == 0)) {
+            handle_codex_image_gen_item(run, item, iid, is_done);
+        } else if (strcmp(itype, "image_view") == 0 || strcmp(itype, "imageView") == 0) {
+            handle_codex_image_view_item(run, item, iid, is_done);
         }
         return;
     }
@@ -2568,6 +2839,12 @@ static void parse_codex_rpc_json(mcode_agent_run *run, yyjson_val *root) {
                                  err_s != NULL);
                 free(res_json);
             }
+        } else if (strcmp(itype, "imageGeneration") == 0 || strcmp(itype, "image_generation") == 0 ||
+                   (strcmp(itype, "Extension") == 0 &&
+                    jstr(item, "kind") && strcmp(jstr(item, "kind"), "image_gen.generation") == 0)) {
+            handle_codex_image_gen_item(run, item, iid, is_done);
+        } else if (strcmp(itype, "imageView") == 0 || strcmp(itype, "image_view") == 0) {
+            handle_codex_image_view_item(run, item, iid, is_done);
         }
         return;
     }
@@ -3139,6 +3416,8 @@ static void parse_agy_acp_json(mcode_agent_run *run, yyjson_val *root) {
             emit_simple(run, EV_REASONING_DONE, NULL);
             emit_simple(run, EV_TEXT_DELTA, txt);
             emit_simple(run, EV_STATUS, "Responding...");
+        } else if (yyjson_is_obj(content)) {
+            emit_json_image_content(run, content, "acp");
         }
     } else if (strcmp(su, "agent_thought_chunk") == 0) {
         yyjson_val *content = yyjson_obj_get(upd, "content");
@@ -3173,6 +3452,19 @@ static void parse_agy_acp_json(mcode_agent_run *run, yyjson_val *root) {
             char *out_s = extract_acp_tool_output(upd);
             emit_tool_result(run, tid, out_s ? out_s : "", failed);
             free(out_s);
+            if (!failed) {
+                yyjson_val *tc_content = yyjson_obj_get(upd, "content");
+                if (yyjson_is_arr(tc_content)) {
+                    size_t ci, cmax;
+                    yyjson_val *citem;
+                    yyjson_arr_foreach(tc_content, ci, cmax, citem) {
+                        if (!emit_json_image_content(run, citem, tid)) {
+                            yyjson_val *inner = yyjson_is_obj(citem) ? yyjson_obj_get(citem, "content") : NULL;
+                            emit_json_image_content(run, inner, tid);
+                        }
+                    }
+                }
+            }
         } else if (status && strcmp(status, "pending") == 0) {
             emit_simple(run, EV_STATUS, "Waiting for approval...");
         } else {
@@ -3266,13 +3558,18 @@ static void on_proc_bytes(const char *data, size_t len, bool is_stderr, void *us
     mcode_agent_run *run = (mcode_agent_run *)user;
     mcode_str *buf = is_stderr ? &run->err_line : &run->out_line;
 
-    for (size_t i = 0; i < len; ++i) {
-        if (data[i] == '\n') {
-            handle_line(run, mcode_str_cstr(buf), is_stderr);
-            mcode_str_clear(buf);
-        } else {
-            mcode_str_append(buf, &data[i], 1);
+    size_t pos = 0;
+    while (pos < len) {
+        const char *nl = memchr(data + pos, '\n', len - pos);
+        if (!nl) {
+            mcode_str_append(buf, data + pos, len - pos);
+            break;
         }
+        size_t chunk = (size_t)(nl - (data + pos));
+        if (chunk > 0) mcode_str_append(buf, data + pos, chunk);
+        handle_line(run, mcode_str_cstr(buf), is_stderr);
+        mcode_str_clear(buf);
+        pos += chunk + 1;
     }
 }
 
@@ -3462,6 +3759,21 @@ static void apply_event(mcode_thread *thread, mcode_turn *turn,
             b->duration_sec = (float)(mcode_now_mono() - b->started_mono);
             if (ev->text) mcode_str_set(&b->output, ev->text);
         }
+        break;
+    }
+    case EV_IMAGE: {
+        if (!ev->extra_a || !ev->extra_a[0]) break;
+        if (turn->block_count > 0 &&
+            turn->blocks[turn->block_count - 1].kind == MCODE_BLOCK_IMAGE &&
+            strcmp(turn->blocks[turn->block_count - 1].image_path, ev->extra_a) == 0) {
+            break;
+        }
+        mcode_block *b = mcode_turn_add_block(turn, MCODE_BLOCK_IMAGE);
+        if (b) {
+            snprintf(b->image_path, sizeof b->image_path, "%s", ev->extra_a);
+            if (ev->text && ev->text[0]) mcode_str_set(&b->text, ev->text);
+        }
+        thread->scroll_to_bottom_frames = 2;
         break;
     }
     case EV_APPROVAL_REQUEST: {

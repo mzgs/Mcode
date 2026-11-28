@@ -735,6 +735,93 @@ static void draw_discard_all_dialog(mcode_app *app, cui_ctx *ui) {
     }
 }
 
+static void format_image_file_size(int64_t bytes, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    if (bytes < 1024) {
+        snprintf(out, cap, "%lld B", (long long)bytes);
+    } else if (bytes < 1024 * 1024) {
+        snprintf(out, cap, "%.1f KB", (double)bytes / 1024.0);
+    } else {
+        snprintf(out, cap, "%.1f MB", (double)bytes / (1024.0 * 1024.0));
+    }
+}
+
+static void draw_image_lightbox_dialog(mcode_app *app, cui_ctx *ui) {
+    cui_vec2 vp = cui_viewport_size(ui);
+    float dlg_w = (vp.x > 0.0f) ? (vp.x - 96.0f) : 760.0f;
+    if (dlg_w > 960.0f) dlg_w = 960.0f;
+    if (dlg_w < 420.0f) dlg_w = 420.0f;
+    float viewer_h = (vp.y > 0.0f) ? (vp.y - 230.0f) : 440.0f;
+    if (viewer_h > 620.0f) viewer_h = 620.0f;
+    if (viewer_h < 220.0f) viewer_h = 220.0f;
+
+    const char *title = app->image_lightbox_title[0] ? app->image_lightbox_title : "Image Preview";
+    const mcode_image_cache_entry *img = app->image_lightbox_open
+        ? mcode_ui_image_get(app, ui, app->image_lightbox_path)
+        : NULL;
+
+    char short_p[MCODE_PATH_MAX] = "";
+    char desc[MCODE_PATH_MAX + 96] = "";
+    if (app->image_lightbox_path[0]) {
+        mcode_git_shorten_home_path(app->image_lightbox_path, short_p, sizeof short_p);
+        if (img) {
+            char sz_buf[32];
+            format_image_file_size(img->file_size, sz_buf, sizeof sz_buf);
+            snprintf(desc, sizeof desc, "%s · %d×%d · %s",
+                     short_p, img->width, img->height, sz_buf);
+        } else {
+            snprintf(desc, sizeof desc, "%s", short_p);
+        }
+    }
+
+    cui_push_id(ui, "image-lightbox-modal");
+    cui_dialog(ui, title, &app->image_lightbox_open,
+               .description = desc[0] ? desc : NULL,
+               .width = dlg_w) {
+        if (img && img->tex) {
+            cui_push_id(ui, app->image_lightbox_path);
+            cui_id vid = cui_make_id(ui, "img-lightbox-viewer");
+            if (cui_get_rect(ui, vid).w <= 0.0f) {
+                cui_request_redraw(ui);
+            }
+            cui_image_viewer(ui, "img-lightbox-viewer",
+                             img->tex, img->width, img->height,
+                             &app->image_lightbox_view,
+                             .width = CUI_FILL,
+                             .height = CUI_PX(viewer_h),
+                             .checkerboard = true);
+            cui_pop_id(ui);
+            cui_muted(ui, "Scroll to zoom, drag to pan, double-click to toggle 100%.");
+        } else {
+            cui_column(ui, .width = CUI_FILL, .height = CUI_PX(220),
+                       .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER,
+                       .gap = 8) {
+                cui_icon(ui, CUI_ICON_IMAGE, 28, CUI_COLOR_TEXT_MUTED);
+                cui_muted(ui, "Image could not be loaded.");
+            }
+        }
+
+        cui_dialog_footer(ui) {
+            if (img && app->image_lightbox_view.zoom > 0.0f) {
+                if (cui_button(ui, "Fit", .variant = CUI_BUTTON_GHOST,
+                               .icon = CUI_ICON_MAXIMIZE_2)) {
+                    memset(&app->image_lightbox_view, 0, sizeof app->image_lightbox_view);
+                }
+            }
+            if (app->image_lightbox_path[0]) {
+                if (cui_button(ui, "Open Externally", .variant = CUI_BUTTON_SECONDARY,
+                               .icon = CUI_ICON_EXTERNAL_LINK)) {
+                    cui_app_open_url(app->image_lightbox_path);
+                }
+            }
+            if (cui_button(ui, "Close", .variant = CUI_BUTTON_PRIMARY)) {
+                app->image_lightbox_open = false;
+            }
+        }
+    }
+    cui_pop_id(ui);
+}
+
 void mcode_ui_draw_dialogs(mcode_app *app, cui_ctx *ui) {
     draw_project_dialog(app, ui);
     draw_rename_project_dialog(app, ui);
@@ -742,4 +829,5 @@ void mcode_ui_draw_dialogs(mcode_app *app, cui_ctx *ui) {
     draw_git_dialog(app, ui);
     draw_project_actions_dialog(app, ui);
     draw_discard_all_dialog(app, ui);
+    draw_image_lightbox_dialog(app, ui);
 }

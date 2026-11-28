@@ -82,6 +82,18 @@ void mcode_ui_draw_project_badge(cui_ctx *ui, const char *name, float size);
 void mcode_ui_draw_provider_icon(mcode_app *app, cui_ctx *ui, app_agent_kind agent,
                                  float size, cui_color tint);
 
+/* Shared local image path resolution, LRU texture cache, and inline preview cards */
+bool mcode_image_has_supported_ext(const char *path);
+bool mcode_ui_resolve_local_path(const char *raw_link, const char *workdir,
+                                 bool strip_line_suffix,
+                                 char *out_path, size_t out_cap);
+const mcode_image_cache_entry *mcode_ui_image_get(mcode_app *app, cui_ctx *ui,
+                                                  const char *abs_path);
+void mcode_ui_open_image_lightbox(mcode_app *app, const char *abs_path, const char *title);
+bool mcode_ui_draw_image_preview_card(mcode_app *app, cui_ctx *ui, const char *id,
+                                      const char *abs_path, const char *caption,
+                                      float max_w, float max_h, bool compact);
+
 /* Panel renderers */
 void mcode_ui_draw_sidebar(mcode_app *app, cui_ctx *ui);
 void mcode_ui_keep_thread_scrolls_alive(mcode_app *app, cui_ctx *ui);
