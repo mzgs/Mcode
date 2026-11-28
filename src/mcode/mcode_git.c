@@ -1133,6 +1133,102 @@ bool mcode_git_get_sync_status(const char *workdir, mcode_git_sync_status *out) 
     return true;
 }
 
+static bool str_contains_icase(const char *haystack, const char *needle) {
+    if (!haystack || !needle || !needle[0]) return false;
+    size_t nlen = strlen(needle);
+    for (const char *p = haystack; *p; ++p) {
+        size_t i = 0;
+        while (i < nlen && p[i] &&
+               tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) {
+            ++i;
+        }
+        if (i == nlen) return true;
+    }
+    return false;
+}
+
+static bool git_output_is_transient_net_error(const char *out) {
+    if (!out || !out[0]) return false;
+
+    /* Never retry auth, permission, conflict, or remote rejection errors. */
+    static const char *const k_permanent[] = {
+        "authentication failed",
+        "permission denied",
+        "could not read username",
+        "could not read password",
+        "terminal prompts disabled",
+        "repository not found",
+        "requested url returned error: 401",
+        "requested url returned error: 403",
+        "requested url returned error: 404",
+        "non-fast-forward",
+        "fetch first",
+        "merge conflict",
+        "automatic merge failed",
+        "conflict (",
+        "local changes to the following files would be overwritten",
+    };
+    for (size_t i = 0; i < sizeof k_permanent / sizeof k_permanent[0]; ++i) {
+        if (str_contains_icase(out, k_permanent[i])) return false;
+    }
+
+    static const char *const k_transient[] = {
+        "connection reset by peer",
+        "recv failure",
+        "send failure",
+        "ssl_read",
+        "ssl_error_syscall",
+        "openssl ssl_connect",
+        "gnutls_handshake",
+        "http/2 stream",
+        "http2 framing layer",
+        "empty reply from server",
+        "unexpected eof",
+        "unexpected disconnect",
+        "early eof",
+        "the remote end hung up unexpectedly",
+        "rpc failed",
+        "connection timed out",
+        "operation timed out",
+        "failed to connect to",
+        "could not resolve host",
+        "temporarily unavailable",
+    };
+    for (size_t i = 0; i < sizeof k_transient / sizeof k_transient[0]; ++i) {
+        if (str_contains_icase(out, k_transient[i])) return true;
+    }
+    return false;
+}
+
+static bool git_output_suggests_http1_retry(const char *out) {
+    if (!out || !out[0]) return false;
+    return str_contains_icase(out, "unable to access 'http") ||
+           str_contains_icase(out, "http/2") ||
+           str_contains_icase(out, "http2") ||
+           str_contains_icase(out, "rpc failed") ||
+           str_contains_icase(out, "recv failure") ||
+           str_contains_icase(out, "send failure") ||
+           str_contains_icase(out, "ssl_read") ||
+           str_contains_icase(out, "ssl_error_syscall") ||
+           str_contains_icase(out, "connection reset by peer");
+}
+
+static size_t build_git_http1_argv(const char *const *src, const char **dst, size_t dst_cap) {
+    if (!src || !dst || !src[0]) return 0;
+    size_t src_len = 0;
+    while (src[src_len]) ++src_len;
+    if (src_len + 3 > dst_cap) return 0;
+    size_t n = 0;
+    dst[n++] = src[0];
+    dst[n++] = "-c";
+    dst[n++] = "http.version=HTTP/1.1";
+    for (size_t i = 1; i < src_len; ++i) {
+        dst[n++] = src[i];
+    }
+    dst[n] = NULL;
+    return n;
+}
+
 bool mcode_git_push(const char *workdir, char *err, size_t err_cap) {
     if (err && err_cap) err[0] = '\0';
     if (!workdir || !workdir[0]) return false;
@@ -1141,15 +1237,24 @@ bool mcode_git_push(const char *workdir, char *err, size_t err_cap) {
     bool has_st = mcode_git_get_sync_status(workdir, &st);
     const char *remote = (has_st && st.remote[0]) ? st.remote : "origin";
 
+    const char *argv_upstream[] = { "git", "push", NULL };
+    const char *argv_publish[] = { "git", "push", "-u", remote, "HEAD", NULL };
+    const char *const *argv = (has_st && st.has_upstream) ? argv_upstream : argv_publish;
+
     int rc = -1;
     char *out = NULL;
-    bool ran = false;
-    if (has_st && st.has_upstream) {
-        const char *argv[] = { "git", "push", NULL };
-        ran = mcode_proc_run_capture(argv, workdir, true, &rc, &out, NULL);
-    } else {
-        const char *argv[] = { "git", "push", "-u", remote, "HEAD", NULL };
-        ran = mcode_proc_run_capture(argv, workdir, true, &rc, &out, NULL);
+    bool ran = mcode_proc_run_capture(argv, workdir, true, &rc, &out, NULL);
+    if (ran && rc != 0 && git_output_is_transient_net_error(out)) {
+        const char *retry_argv[16];
+        bool use_http1 = git_output_suggests_http1_retry(out) &&
+                         build_git_http1_argv(argv, retry_argv,
+                                              sizeof retry_argv / sizeof retry_argv[0]) > 0;
+        app_log_info("Retrying git push in %s after transient network error (attempt 2/2%s)",
+                     workdir, use_http1 ? ", HTTP/1.1" : "");
+        free(out);
+        out = NULL;
+        rc = -1;
+        ran = mcode_proc_run_capture(use_http1 ? retry_argv : argv, workdir, true, &rc, &out, NULL);
     }
     if (!ran || rc != 0) {
         if (err && err_cap) {
@@ -1326,6 +1431,68 @@ static bool git_op_run_cmd(mcode_git_op *op, const char *const *argv,
     return !killed;
 }
 
+static bool git_op_sleep_ms(mcode_git_op *op, int ms) {
+    if (!op || ms <= 0) return true;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += ms / 1000;
+    ts.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec += 1;
+        ts.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&op->mu);
+    while (!op->stop_requested && !op->kill_requested) {
+        int wrc = pthread_cond_timedwait(&op->done_cond, &op->mu, &ts);
+        if (wrc == ETIMEDOUT) break;
+        if (wrc != 0 && wrc != EINTR) break;
+    }
+    bool cancelled = op->stop_requested || op->kill_requested;
+    pthread_mutex_unlock(&op->mu);
+    return !cancelled;
+}
+
+static bool git_op_run_net_cmd(mcode_git_op *op, const char *label,
+                               const char *const *argv,
+                               int *out_exit, char **out_buf) {
+    static const int k_retry_delays_ms[2] = { 500, 1200 };
+    const char *retry_argv[16];
+    const char *const *cur_argv = argv;
+    int rc = -1;
+    char *out = NULL;
+    bool ran = false;
+
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        free(out);
+        out = NULL;
+        rc = -1;
+        ran = git_op_run_cmd(op, cur_argv, &rc, &out);
+        if (!ran || rc == 0) break;
+        if (attempt >= 2 || !git_output_is_transient_net_error(out)) break;
+
+        bool use_http1 = (argv && argv[0] && strcmp(argv[0], "git") == 0 &&
+                          git_output_suggests_http1_retry(out) &&
+                          build_git_http1_argv(argv, retry_argv,
+                                               sizeof retry_argv / sizeof retry_argv[0]) > 0);
+        app_log_info("Retrying %s in %s after transient network error (attempt %d/3%s)",
+                     label ? label : "git", op->workdir, attempt + 2,
+                     use_http1 ? ", HTTP/1.1" : "");
+        if (!git_op_sleep_ms(op, k_retry_delays_ms[attempt])) {
+            ran = false;
+            break;
+        }
+        cur_argv = use_http1 ? retry_argv : argv;
+    }
+
+    if (out_exit) *out_exit = rc;
+    if (out_buf) {
+        *out_buf = out;
+    } else {
+        free(out);
+    }
+    return ran;
+}
+
 static void *git_op_worker_main(void *arg) {
     mcode_git_op *op = (mcode_git_op *)arg;
     const char *remote = op->remote[0] ? op->remote : "origin";
@@ -1337,7 +1504,7 @@ static void *git_op_worker_main(void *arg) {
 
     if (op->kind == MCODE_GIT_OP_FETCH) {
         const char *argv[] = { "git", "fetch", NULL };
-        if (git_op_run_cmd(op, argv, &rc, &out) && rc == 0) {
+        if (git_op_run_net_cmd(op, "git fetch", argv, &rc, &out) && rc == 0) {
             ok = true;
             snprintf(msg, sizeof msg, "Fetched latest changes.");
         } else {
@@ -1348,7 +1515,7 @@ static void *git_op_worker_main(void *arg) {
         free(out);
     } else if (op->kind == MCODE_GIT_OP_PULL) {
         const char *argv[] = { "git", "pull", "--no-edit", NULL };
-        if (git_op_run_cmd(op, argv, &rc, &out) && rc == 0) {
+        if (git_op_run_net_cmd(op, "git pull", argv, &rc, &out) && rc == 0) {
             ok = true;
             snprintf(msg, sizeof msg, "Pulled latest changes.");
         } else {
@@ -1359,7 +1526,7 @@ static void *git_op_worker_main(void *arg) {
         free(out);
     } else if (op->kind == MCODE_GIT_OP_PUBLISH) {
         const char *argv[] = { "git", "push", "-u", remote, "HEAD", NULL };
-        if (git_op_run_cmd(op, argv, &rc, &out) && rc == 0) {
+        if (git_op_run_net_cmd(op, "git push -u", argv, &rc, &out) && rc == 0) {
             ok = true;
             snprintf(msg, sizeof msg, "Branch published.");
         } else {
@@ -1372,10 +1539,10 @@ static void *git_op_worker_main(void *arg) {
         bool ran = false;
         if (op->has_upstream) {
             const char *argv[] = { "git", "push", NULL };
-            ran = git_op_run_cmd(op, argv, &rc, &out);
+            ran = git_op_run_net_cmd(op, "git push", argv, &rc, &out);
         } else {
             const char *argv[] = { "git", "push", "-u", remote, "HEAD", NULL };
-            ran = git_op_run_cmd(op, argv, &rc, &out);
+            ran = git_op_run_net_cmd(op, "git push -u", argv, &rc, &out);
         }
         if (ran && rc == 0) {
             ok = true;
@@ -1388,7 +1555,7 @@ static void *git_op_worker_main(void *arg) {
         free(out);
     } else if (op->kind == MCODE_GIT_OP_SYNC) {
         const char *argv_pull[] = { "git", "pull", "--no-edit", NULL };
-        if (!git_op_run_cmd(op, argv_pull, &rc, &out) || rc != 0) {
+        if (!git_op_run_net_cmd(op, "git sync pull", argv_pull, &rc, &out) || rc != 0) {
             extract_git_error_line(out, msg, sizeof msg);
             if (!msg[0]) snprintf(msg, sizeof msg, "Sync failed during pull.");
             if (out && out[0]) app_log_warn("git sync pull failed in %s: %s", op->workdir, out);
@@ -1405,11 +1572,11 @@ static void *git_op_worker_main(void *arg) {
                 bool ran = false;
                 if (!has_st || st.has_upstream) {
                     const char *argv_push[] = { "git", "push", NULL };
-                    ran = git_op_run_cmd(op, argv_push, &rc, &out);
+                    ran = git_op_run_net_cmd(op, "git sync push", argv_push, &rc, &out);
                 } else {
                     const char *push_rem = st.remote[0] ? st.remote : remote;
                     const char *argv_push[] = { "git", "push", "-u", push_rem, "HEAD", NULL };
-                    ran = git_op_run_cmd(op, argv_push, &rc, &out);
+                    ran = git_op_run_net_cmd(op, "git sync push", argv_push, &rc, &out);
                 }
                 if (ran && rc == 0) {
                     ok = true;
@@ -1476,6 +1643,7 @@ void mcode_git_op_stop(mcode_git_op *op) {
     pthread_mutex_lock(&op->mu);
     op->stop_requested = true;
     if (op->active_proc) mcode_proc_stop(op->active_proc);
+    pthread_cond_broadcast(&op->done_cond);
     pthread_mutex_unlock(&op->mu);
 }
 
@@ -1485,6 +1653,7 @@ void mcode_git_op_kill(mcode_git_op *op) {
     op->stop_requested = true;
     op->kill_requested = true;
     if (op->active_proc) mcode_proc_kill(op->active_proc);
+    pthread_cond_broadcast(&op->done_cond);
     pthread_mutex_unlock(&op->mu);
 }
 
