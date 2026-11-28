@@ -153,17 +153,9 @@ struct mcode_agent_run {
     int64_t agy_open_prompts[16];
     int agy_open_prompt_count;
 
-    /* Pending approval RPC metadata (protected by mu) */
-    bool approval_pending;
-    approval_rpc_kind approval_kind;
-    bool approval_rpc_id_is_str;
-    char approval_rpc_id_str[128];
-    int64_t approval_rpc_id_num;
-    char approval_allow_opt[64];
-    char approval_allow_always_opt[64];
-    char approval_deny_opt[64];
-    bool approval_codex_use_amendment;
-    char *approval_payload_json;
+    /* Pending approval RPC FIFO queue (protected by mu) */
+    struct pending_approval_item *approval_head;
+    struct pending_approval_item *approval_tail;
 
     /* Pending interactive question RPC metadata (protected by mu) */
     bool question_pending;
@@ -843,20 +835,156 @@ static bool encode_file_base64(const char *path, const char **out_mime, char **o
     return true;
 }
 
-static void emit_approval_request(mcode_agent_run *run, const char *title, const char *tool_name,
-                                  const char *command, const char *reason, const char *details,
-                                  bool can_allow_session) {
+typedef struct pending_approval_item {
+    approval_rpc_kind kind;
+    bool rpc_id_is_str;
+    char rpc_id_str[128];
+    int64_t rpc_id_num;
+    char allow_opt[64];
+    char allow_always_opt[64];
+    char deny_opt[64];
+    bool codex_use_amendment;
+    char *payload_json;
+    char *title;
+    char *tool_name;
+    char *command;
+    char *reason;
+    char *details;
+    bool can_allow_session;
+    struct pending_approval_item *next;
+} pending_approval_item;
+
+static void approval_item_free(pending_approval_item *it) {
+    if (!it) return;
+    free(it->payload_json);
+    free(it->title);
+    free(it->tool_name);
+    free(it->command);
+    free(it->reason);
+    free(it->details);
+    free(it);
+}
+
+static void approval_queue_clear_locked(mcode_agent_run *run) {
+    pending_approval_item *cur = run->approval_head;
+    run->approval_head = NULL;
+    run->approval_tail = NULL;
+    while (cur) {
+        pending_approval_item *next = cur->next;
+        approval_item_free(cur);
+        cur = next;
+    }
+}
+
+static agent_ev *approval_make_ev(const pending_approval_item *it) {
+    if (!it) return NULL;
     agent_ev *ev = calloc(1, sizeof *ev);
-    if (!ev) return;
+    if (!ev) return NULL;
     ev->kind = EV_APPROVAL_REQUEST;
-    ev->text = dup_or_null(title);
-    ev->tool_name = dup_or_null(tool_name);
-    ev->tool_detail = dup_or_null(command);
-    ev->extra_a = dup_or_null(reason);
-    ev->extra_b = dup_or_null(details);
-    ev->flag = can_allow_session;
-    push_ev(run, ev);
-    emit_simple(run, EV_STATUS, "Waiting for approval...");
+    ev->text = dup_or_null(it->title);
+    ev->tool_name = dup_or_null(it->tool_name);
+    ev->tool_detail = dup_or_null(it->command);
+    ev->extra_a = dup_or_null(it->reason);
+    ev->extra_b = dup_or_null(it->details);
+    ev->flag = it->can_allow_session;
+    return ev;
+}
+
+static void approval_item_set_rpc_id(pending_approval_item *it, yyjson_val *id_val) {
+    if (!it) return;
+    it->rpc_id_is_str = false;
+    it->rpc_id_str[0] = '\0';
+    it->rpc_id_num = 0;
+    if (yyjson_is_str(id_val)) {
+        it->rpc_id_is_str = true;
+        snprintf(it->rpc_id_str, sizeof it->rpc_id_str, "%s", yyjson_get_str(id_val));
+    } else if (yyjson_is_int(id_val)) {
+        it->rpc_id_num = yyjson_get_sint(id_val);
+    } else if (yyjson_is_num(id_val)) {
+        it->rpc_id_num = (int64_t)yyjson_get_num(id_val);
+    }
+}
+
+static bool approval_item_matches_id(const pending_approval_item *it, yyjson_val *id_val,
+                                     const char *str_id) {
+    if (!it) return false;
+    if (str_id && str_id[0]) {
+        return it->rpc_id_is_str && strcmp(it->rpc_id_str, str_id) == 0;
+    }
+    if (!id_val || yyjson_is_null(id_val)) return true;
+    if (yyjson_is_str(id_val)) {
+        return it->rpc_id_is_str && strcmp(it->rpc_id_str, yyjson_get_str(id_val)) == 0;
+    }
+    if (yyjson_is_int(id_val)) {
+        return !it->rpc_id_is_str && it->rpc_id_num == yyjson_get_sint(id_val);
+    }
+    if (yyjson_is_num(id_val)) {
+        return !it->rpc_id_is_str && it->rpc_id_num == (int64_t)yyjson_get_num(id_val);
+    }
+    return false;
+}
+
+static void approval_queue_push(mcode_agent_run *run, pending_approval_item *it) {
+    if (!run || !it) {
+        approval_item_free(it);
+        return;
+    }
+    agent_ev *ev = approval_make_ev(it);
+    pthread_mutex_lock(&run->mu);
+    bool was_empty = (run->approval_head == NULL);
+    it->next = NULL;
+    if (run->approval_tail) run->approval_tail->next = it;
+    else run->approval_head = it;
+    run->approval_tail = it;
+    pthread_mutex_unlock(&run->mu);
+
+    if (was_empty && ev) {
+        push_ev(run, ev);
+        emit_simple(run, EV_STATUS, "Waiting for approval...");
+    } else {
+        ev_free(ev);
+    }
+}
+
+static void approval_queue_cancel(mcode_agent_run *run, yyjson_val *id_val, const char *str_id) {
+    if (!run) return;
+    bool head_changed = false;
+    agent_ev *next_ev = NULL;
+    pthread_mutex_lock(&run->mu);
+    pending_approval_item *prev = NULL;
+    pending_approval_item *cur = run->approval_head;
+    while (cur) {
+        pending_approval_item *next = cur->next;
+        if (approval_item_matches_id(cur, id_val, str_id)) {
+            if (!prev) {
+                run->approval_head = next;
+                head_changed = true;
+            } else {
+                prev->next = next;
+            }
+            if (cur == run->approval_tail) {
+                run->approval_tail = prev;
+            }
+            approval_item_free(cur);
+            cur = next;
+            continue;
+        }
+        prev = cur;
+        cur = next;
+    }
+    if (head_changed && run->approval_head) {
+        next_ev = approval_make_ev(run->approval_head);
+    }
+    pthread_mutex_unlock(&run->mu);
+
+    if (head_changed) {
+        if (next_ev) {
+            push_ev(run, next_ev);
+            emit_simple(run, EV_STATUS, "Waiting for approval...");
+        } else {
+            emit_simple(run, EV_APPROVAL_CLEAR, NULL);
+        }
+    }
 }
 
 static bool send_json_doc(mcode_proc *proc, yyjson_mut_doc *doc) {
@@ -876,21 +1004,6 @@ static bool send_json_doc(mcode_proc *proc, yyjson_mut_doc *doc) {
     bool ok = mcode_proc_write(proc, line, len + 1);
     free(line);
     return ok;
-}
-
-static void rpc_save_id(mcode_agent_run *run, yyjson_val *id_val) {
-    run->approval_rpc_id_is_str = false;
-    run->approval_rpc_id_str[0] = '\0';
-    run->approval_rpc_id_num = 0;
-    if (yyjson_is_str(id_val)) {
-        run->approval_rpc_id_is_str = true;
-        snprintf(run->approval_rpc_id_str, sizeof run->approval_rpc_id_str, "%s",
-                 yyjson_get_str(id_val));
-    } else if (yyjson_is_int(id_val)) {
-        run->approval_rpc_id_num = yyjson_get_sint(id_val);
-    } else if (yyjson_is_num(id_val)) {
-        run->approval_rpc_id_num = (int64_t)yyjson_get_num(id_val);
-    }
 }
 
 static void rpc_add_saved_id(yyjson_mut_doc *doc, yyjson_mut_val *obj,
@@ -1284,21 +1397,15 @@ static void parse_claude_json(mcode_agent_run *run, yyjson_val *root) {
 
     if (strcmp(type, "control_cancel_request") == 0 && run->proto == AGENT_PROTO_CLAUDE_CTL) {
         const char *rid = jstr(root, "request_id");
-        bool cleared_app = false;
+        approval_queue_cancel(run, NULL, (rid && rid[0]) ? rid : NULL);
         bool cleared_q = false;
         pthread_mutex_lock(&run->mu);
-        if (run->approval_pending &&
-            (!rid || !rid[0] || strcmp(run->approval_rpc_id_str, rid) == 0)) {
-            run->approval_pending = false;
-            cleared_app = true;
-        }
         if (run->question_pending &&
             (!rid || !rid[0] || strcmp(run->question_rpc_id_str, rid) == 0)) {
             run->question_pending = false;
             cleared_q = true;
         }
         pthread_mutex_unlock(&run->mu);
-        if (cleared_app) emit_simple(run, EV_APPROVAL_CLEAR, NULL);
         if (cleared_q) emit_simple(run, EV_QUESTION_CLEAR, NULL);
         return;
     }
@@ -1346,15 +1453,6 @@ static void parse_claude_json(mcode_agent_run *run, yyjson_val *root) {
                 ? strdup(plan_text)
                 : stringify_json_val(inp);
 
-            pthread_mutex_lock(&run->mu);
-            run->approval_pending = true;
-            run->approval_kind = APPROVAL_KIND_CLAUDE_TOOL;
-            run->approval_rpc_id_is_str = true;
-            snprintf(run->approval_rpc_id_str, sizeof run->approval_rpc_id_str, "%s", rid);
-            free(run->approval_payload_json);
-            run->approval_payload_json = compact_inp ? compact_inp : strdup("{}");
-            pthread_mutex_unlock(&run->mu);
-
             char title[160];
             if (is_exit_plan) {
                 snprintf(title, sizeof title, "Approve plan & start implementing?");
@@ -1369,8 +1467,23 @@ static void parse_claude_json(mcode_agent_run *run, yyjson_val *root) {
             } else if (blocked && blocked[0]) {
                 snprintf(full_reason, sizeof full_reason, "Path: %s", blocked);
             }
-            emit_approval_request(run, title, tname, is_exit_plan ? "" : detail, full_reason,
-                                  pretty_inp ? pretty_inp : "", false);
+
+            pending_approval_item *ait = calloc(1, sizeof *ait);
+            if (ait) {
+                ait->kind = APPROVAL_KIND_CLAUDE_TOOL;
+                ait->rpc_id_is_str = true;
+                snprintf(ait->rpc_id_str, sizeof ait->rpc_id_str, "%s", rid);
+                ait->payload_json = compact_inp ? compact_inp : strdup("{}");
+                ait->title = dup_or_null(title);
+                ait->tool_name = dup_or_null(tname);
+                ait->command = dup_or_null(is_exit_plan ? "" : detail);
+                ait->reason = dup_or_null(full_reason);
+                ait->details = dup_or_null(pretty_inp ? pretty_inp : "");
+                ait->can_allow_session = false;
+                approval_queue_push(run, ait);
+            } else {
+                free(compact_inp);
+            }
             free(pretty_inp);
         }
         return;
@@ -2750,7 +2863,8 @@ static void codex_rpc_send_initialize(mcode_agent_run *run) {
 
 static const char *codex_approval_policy(mcode_permission_mode mode) {
     if (mode == MCODE_PERM_FULL_ACCESS) return "never";
-    if (mode == MCODE_PERM_SUPERVISED || mode == MCODE_PERM_PLAN) return "untrusted";
+    if (mode == MCODE_PERM_SUPERVISED) return "untrusted";
+    /* Auto-edits and Plan mode use "on-request" (Plan mode is already OS-sandboxed read-only). */
     return "on-request";
 }
 
@@ -3073,7 +3187,7 @@ static void codex_rpc_finish_turn(mcode_agent_run *run) {
     }
     pthread_mutex_lock(&run->mu);
     run->rpc_turn_done = true;
-    run->approval_pending = false;
+    approval_queue_clear_locked(run);
     run->question_pending = false;
     pthread_mutex_unlock(&run->mu);
     emit_simple(run, EV_APPROVAL_CLEAR, NULL);
@@ -3227,25 +3341,30 @@ static void parse_codex_rpc_json(mcode_agent_run *run, yyjson_val *root) {
                 has_session = true;
             }
 
-            pthread_mutex_lock(&run->mu);
-            run->approval_pending = true;
-            run->approval_kind = APPROVAL_KIND_CODEX_CMD;
-            rpc_save_id(run, id_val);
-            run->approval_codex_use_amendment = use_amend;
-            free(run->approval_payload_json);
-            run->approval_payload_json = use_amend ? amend_json : NULL;
-            if (!use_amend) free(amend_json);
-            pthread_mutex_unlock(&run->mu);
-
             char details[1024] = "";
             if (cmd && cmd[0] && cwd && cwd[0]) {
                 snprintf(details, sizeof details, "%s\n(cwd: %s)", cmd, cwd);
             } else if (cmd && cmd[0]) {
                 snprintf(details, sizeof details, "%s", cmd);
             }
-            emit_approval_request(run, "Approve command?", "command",
-                                  short_cmd[0] ? short_cmd : (cmd ? cmd : ""),
-                                  reason ? reason : "", details, has_session);
+
+            pending_approval_item *ait = calloc(1, sizeof *ait);
+            if (ait) {
+                ait->kind = APPROVAL_KIND_CODEX_CMD;
+                approval_item_set_rpc_id(ait, id_val);
+                ait->codex_use_amendment = use_amend;
+                ait->payload_json = use_amend ? amend_json : NULL;
+                if (!use_amend) free(amend_json);
+                ait->title = dup_or_null("Approve command?");
+                ait->tool_name = dup_or_null("command");
+                ait->command = dup_or_null(short_cmd[0] ? short_cmd : (cmd ? cmd : ""));
+                ait->reason = dup_or_null(reason ? reason : "");
+                ait->details = dup_or_null(details);
+                ait->can_allow_session = has_session;
+                approval_queue_push(run, ait);
+            } else {
+                free(amend_json);
+            }
             return;
         }
 
@@ -3253,17 +3372,18 @@ static void parse_codex_rpc_json(mcode_agent_run *run, yyjson_val *root) {
             const char *reason = jstr(params, "reason");
             const char *grant_root = jstr(params, "grantRoot");
 
-            pthread_mutex_lock(&run->mu);
-            run->approval_pending = true;
-            run->approval_kind = APPROVAL_KIND_CODEX_FILE;
-            rpc_save_id(run, id_val);
-            free(run->approval_payload_json);
-            run->approval_payload_json = NULL;
-            pthread_mutex_unlock(&run->mu);
-
-            emit_approval_request(run, "Approve file changes?", "file_change",
-                                  grant_root ? grant_root : "",
-                                  reason ? reason : "", "", true);
+            pending_approval_item *ait = calloc(1, sizeof *ait);
+            if (ait) {
+                ait->kind = APPROVAL_KIND_CODEX_FILE;
+                approval_item_set_rpc_id(ait, id_val);
+                ait->title = dup_or_null("Approve file changes?");
+                ait->tool_name = dup_or_null("file_change");
+                ait->command = dup_or_null(grant_root ? grant_root : "");
+                ait->reason = dup_or_null(reason ? reason : "");
+                ait->details = dup_or_null("");
+                ait->can_allow_session = true;
+                approval_queue_push(run, ait);
+            }
             return;
         }
 
@@ -3273,17 +3393,21 @@ static void parse_codex_rpc_json(mcode_agent_run *run, yyjson_val *root) {
             char *compact_perms = perms ? yyjson_val_write(perms, 0, NULL) : strdup("{}");
             char *pretty_perms = stringify_json_val(perms);
 
-            pthread_mutex_lock(&run->mu);
-            run->approval_pending = true;
-            run->approval_kind = APPROVAL_KIND_CODEX_PERMS;
-            rpc_save_id(run, id_val);
-            free(run->approval_payload_json);
-            run->approval_payload_json = compact_perms ? compact_perms : strdup("{}");
-            pthread_mutex_unlock(&run->mu);
-
-            emit_approval_request(run, "Grant extra permissions?", "permissions",
-                                  "", reason ? reason : "",
-                                  pretty_perms ? pretty_perms : "", true);
+            pending_approval_item *ait = calloc(1, sizeof *ait);
+            if (ait) {
+                ait->kind = APPROVAL_KIND_CODEX_PERMS;
+                approval_item_set_rpc_id(ait, id_val);
+                ait->payload_json = compact_perms ? compact_perms : strdup("{}");
+                ait->title = dup_or_null("Grant extra permissions?");
+                ait->tool_name = dup_or_null("permissions");
+                ait->command = dup_or_null("");
+                ait->reason = dup_or_null(reason ? reason : "");
+                ait->details = dup_or_null(pretty_perms ? pretty_perms : "");
+                ait->can_allow_session = true;
+                approval_queue_push(run, ait);
+            } else {
+                free(compact_perms);
+            }
             free(pretty_perms);
             return;
         }
@@ -3318,21 +3442,18 @@ static void parse_codex_rpc_json(mcode_agent_run *run, yyjson_val *root) {
             const char *cwd = jstr(params, "cwd");
             char *details = stringify_json_val(params);
 
-            pthread_mutex_lock(&run->mu);
-            run->approval_pending = true;
-            run->approval_kind = APPROVAL_KIND_CODEX_LEGACY;
-            rpc_save_id(run, id_val);
-            free(run->approval_payload_json);
-            run->approval_payload_json = NULL;
-            pthread_mutex_unlock(&run->mu);
-
-            emit_approval_request(run,
-                                  is_patch ? "Approve patch?" : "Approve command?",
-                                  is_patch ? "file_change" : "command",
-                                  cwd ? cwd : "",
-                                  reason ? reason : "",
-                                  details ? details : "",
-                                  true);
+            pending_approval_item *ait = calloc(1, sizeof *ait);
+            if (ait) {
+                ait->kind = APPROVAL_KIND_CODEX_LEGACY;
+                approval_item_set_rpc_id(ait, id_val);
+                ait->title = dup_or_null(is_patch ? "Approve patch?" : "Approve command?");
+                ait->tool_name = dup_or_null(is_patch ? "file_change" : "command");
+                ait->command = dup_or_null(cwd ? cwd : "");
+                ait->reason = dup_or_null(reason ? reason : "");
+                ait->details = dup_or_null(details ? details : "");
+                ait->can_allow_session = true;
+                approval_queue_push(run, ait);
+            }
             free(details);
             return;
         }
@@ -3342,20 +3463,21 @@ static void parse_codex_rpc_json(mcode_agent_run *run, yyjson_val *root) {
             const char *server = jstr(params, "serverName");
             char *details = stringify_json_val(params);
 
-            pthread_mutex_lock(&run->mu);
-            run->approval_pending = true;
-            run->approval_kind = APPROVAL_KIND_CODEX_ELICIT;
-            rpc_save_id(run, id_val);
-            free(run->approval_payload_json);
-            run->approval_payload_json = NULL;
-            pthread_mutex_unlock(&run->mu);
-
             char title[160];
             snprintf(title, sizeof title, "MCP request%s%s",
                      (server && server[0]) ? " — " : "", (server && server[0]) ? server : "");
-            emit_approval_request(run, title, "mcp", "",
-                                  msg ? msg : "An MCP server is requesting confirmation.",
-                                  details ? details : "", false);
+            pending_approval_item *ait = calloc(1, sizeof *ait);
+            if (ait) {
+                ait->kind = APPROVAL_KIND_CODEX_ELICIT;
+                approval_item_set_rpc_id(ait, id_val);
+                ait->title = dup_or_null(title);
+                ait->tool_name = dup_or_null("mcp");
+                ait->command = dup_or_null("");
+                ait->reason = dup_or_null(msg ? msg : "An MCP server is requesting confirmation.");
+                ait->details = dup_or_null(details ? details : "");
+                ait->can_allow_session = false;
+                approval_queue_push(run, ait);
+            }
             free(details);
             return;
         }
@@ -3381,12 +3503,24 @@ static void parse_codex_rpc_json(mcode_agent_run *run, yyjson_val *root) {
     if (!run->rpc_prompt_sent) return;
 
     if (strcmp(method, "serverRequest/resolved") == 0) {
+        yyjson_val *req_id = yyjson_is_obj(params) ? yyjson_obj_get(params, "requestId") : NULL;
+        approval_queue_cancel(run, req_id, NULL);
+        bool clear_q = false;
         pthread_mutex_lock(&run->mu);
-        run->approval_pending = false;
-        run->question_pending = false;
+        if (run->question_pending) {
+            if (!req_id || yyjson_is_null(req_id)) {
+                clear_q = true;
+            } else if (yyjson_is_str(req_id)) {
+                clear_q = run->question_rpc_id_is_str &&
+                          strcmp(run->question_rpc_id_str, yyjson_get_str(req_id)) == 0;
+            } else if (yyjson_is_int(req_id)) {
+                clear_q = !run->question_rpc_id_is_str &&
+                          run->question_rpc_id_num == yyjson_get_sint(req_id);
+            }
+            if (clear_q) run->question_pending = false;
+        }
         pthread_mutex_unlock(&run->mu);
-        emit_simple(run, EV_APPROVAL_CLEAR, NULL);
-        emit_simple(run, EV_QUESTION_CLEAR, NULL);
+        if (clear_q) emit_simple(run, EV_QUESTION_CLEAR, NULL);
         return;
     }
 
@@ -4122,7 +4256,7 @@ static void agy_acp_finish_turn(mcode_agent_run *run) {
     flush_unsent_live_steers(run);
     pthread_mutex_lock(&run->mu);
     run->rpc_turn_done = true;
-    run->approval_pending = false;
+    approval_queue_clear_locked(run);
     pthread_mutex_unlock(&run->mu);
     emit_simple(run, EV_APPROVAL_CLEAR, NULL);
     emit_simple(run, EV_REASONING_DONE, NULL);
@@ -4351,27 +4485,27 @@ static void parse_agy_acp_json(mcode_agent_run *run, yyjson_val *root) {
         if (!allow_opt[0]) snprintf(allow_opt, sizeof allow_opt, "allow");
         if (!deny_opt[0]) snprintf(deny_opt, sizeof deny_opt, "deny");
 
-        pthread_mutex_lock(&run->mu);
-        run->approval_pending = true;
-        run->approval_kind = APPROVAL_KIND_AGY_ACP;
-        rpc_save_id(run, id_val);
-        snprintf(run->approval_allow_opt, sizeof run->approval_allow_opt, "%s", allow_opt);
-        snprintf(run->approval_allow_always_opt, sizeof run->approval_allow_always_opt, "%s", allow_always_opt);
-        snprintf(run->approval_deny_opt, sizeof run->approval_deny_opt, "%s", deny_opt);
-        free(run->approval_payload_json);
-        run->approval_payload_json = NULL;
-        pthread_mutex_unlock(&run->mu);
-
         char title[160];
         if (strcmp(tname, "run_command") == 0) {
             snprintf(title, sizeof title, "Approve command?");
         } else {
             snprintf(title, sizeof title, "Allow %s?", tname);
         }
-        emit_approval_request(run, title, tname, detail,
-                              summary ? summary : "",
-                              pretty_in ? pretty_in : "",
-                              allow_always_opt[0] != '\0');
+        pending_approval_item *ait = calloc(1, sizeof *ait);
+        if (ait) {
+            ait->kind = APPROVAL_KIND_AGY_ACP;
+            approval_item_set_rpc_id(ait, id_val);
+            snprintf(ait->allow_opt, sizeof ait->allow_opt, "%s", allow_opt);
+            snprintf(ait->allow_always_opt, sizeof ait->allow_always_opt, "%s", allow_always_opt);
+            snprintf(ait->deny_opt, sizeof ait->deny_opt, "%s", deny_opt);
+            ait->title = dup_or_null(title);
+            ait->tool_name = dup_or_null(tname);
+            ait->command = dup_or_null(detail);
+            ait->reason = dup_or_null(summary ? summary : "");
+            ait->details = dup_or_null(pretty_in ? pretty_in : "");
+            ait->can_allow_session = (allow_always_opt[0] != '\0');
+            approval_queue_push(run, ait);
+        }
         free(pretty_in);
         return;
     }
@@ -4435,6 +4569,43 @@ static void parse_agy_acp_json(mcode_agent_run *run, yyjson_val *root) {
                         if (!emit_json_image_content(run, citem, tid)) {
                             yyjson_val *inner = yyjson_is_obj(citem) ? yyjson_obj_get(citem, "content") : NULL;
                             emit_json_image_content(run, inner, tid);
+                        }
+                    }
+                }
+                /* Surface Antigravity Plan-mode implementation_plan.md artifact as a Proposed Plan card */
+                const char *wpath = jstr(raw_in, "Path");
+                if (!wpath) wpath = jstr(raw_in, "path");
+                if (!wpath) {
+                    yyjson_val *locs = yyjson_obj_get(upd, "locations");
+                    if (yyjson_is_arr(locs)) {
+                        yyjson_val *l0 = yyjson_arr_get_first(locs);
+                        wpath = jstr(l0, "path");
+                    }
+                }
+                if (!wpath && detail[0]) wpath = detail;
+                if (wpath && strstr(wpath, "implementation_plan.md") != NULL &&
+                    (strcmp(tname, "write_file") == 0 || strcmp(tname, "edit_file") == 0 ||
+                     strstr(wpath, "/antigravity") != NULL)) {
+                    const char *plan_txt = jstr(raw_in, "Content");
+                    if (!plan_txt) plan_txt = jstr(raw_in, "content");
+                    if (plan_txt && plan_txt[0]) {
+                        emit_simple(run, EV_PLAN_SET, plan_txt);
+                    } else {
+                        FILE *pf = fopen(wpath, "rb");
+                        if (pf) {
+                            if (fseek(pf, 0, SEEK_END) == 0) {
+                                long sz = ftell(pf);
+                                if (sz > 0 && sz <= 256 * 1024 && fseek(pf, 0, SEEK_SET) == 0) {
+                                    char *buf = malloc((size_t)sz + 1);
+                                    if (buf) {
+                                        size_t nr = fread(buf, 1, (size_t)sz, pf);
+                                        buf[nr] = '\0';
+                                        if (nr > 0) emit_simple(run, EV_PLAN_SET, buf);
+                                        free(buf);
+                                    }
+                                }
+                            }
+                            fclose(pf);
                         }
                     }
                 }
@@ -7203,7 +7374,7 @@ mcode_steer_result mcode_agent_steer(mcode_agent_run *run, mcode_thread *thread,
     bool has_question = false;
     bool already_done = false;
     pthread_mutex_lock(&run->mu);
-    has_approval = run->approval_pending;
+    has_approval = (run->approval_head != NULL);
     has_question = run->question_pending;
     already_done = run->rpc_turn_done || run->finished;
     pthread_mutex_unlock(&run->mu);
@@ -7212,10 +7383,16 @@ mcode_steer_result mcode_agent_steer(mcode_agent_run *run, mcode_thread *thread,
         return MCODE_STEER_INTERRUPTING;
     }
 
-    /* If an interactive permission or question prompt is blocking the agent, clear it first
-     * to unblock the RPC channel and redirect on the next turn. */
+    /* If interactive permission or question prompts are blocking the agent, clear all of them
+     * first to unblock the RPC channel and redirect on the next turn. */
     if (has_approval || has_question) {
-        if (has_approval) mcode_agent_respond_approval(run, thread, MCODE_APPROVAL_DENY);
+        for (int n = 0; n < 64 && has_approval; ++n) {
+            mcode_agent_respond_approval(run, thread, MCODE_APPROVAL_DENY);
+            pthread_mutex_lock(&run->mu);
+            has_approval = (run->approval_head != NULL);
+            pthread_mutex_unlock(&run->mu);
+        }
+        emit_simple(run, EV_APPROVAL_CLEAR, NULL);
         if (has_question) mcode_agent_respond_question(run, thread, false);
         pthread_mutex_lock(&run->mu);
         run->steer_interrupting = true;
@@ -7388,38 +7565,41 @@ bool mcode_agent_respond_approval(mcode_agent_run *run, mcode_thread *thread,
     }
     if (!run || !run->proc || decision == MCODE_APPROVAL_NONE) return false;
 
-    bool pending = false;
-    approval_rpc_kind kind = APPROVAL_KIND_NONE;
-    bool id_is_str = false;
-    char id_str[128] = "";
-    int64_t id_num = 0;
-    char allow_opt[64] = "";
-    char allow_always_opt[64] = "";
-    char deny_opt[64] = "";
-    bool codex_amend = false;
-    char *payload = NULL;
+    pending_approval_item *item = NULL;
+    agent_ev *next_ev = NULL;
 
     pthread_mutex_lock(&run->mu);
-    pending = run->approval_pending;
-    if (pending) {
-        run->approval_pending = false;
-        kind = run->approval_kind;
-        id_is_str = run->approval_rpc_id_is_str;
-        snprintf(id_str, sizeof id_str, "%s", run->approval_rpc_id_str);
-        id_num = run->approval_rpc_id_num;
-        snprintf(allow_opt, sizeof allow_opt, "%s", run->approval_allow_opt);
-        snprintf(allow_always_opt, sizeof allow_always_opt, "%s", run->approval_allow_always_opt);
-        snprintf(deny_opt, sizeof deny_opt, "%s", run->approval_deny_opt);
-        codex_amend = run->approval_codex_use_amendment;
-        payload = run->approval_payload_json;
-        run->approval_payload_json = NULL;
+    item = run->approval_head;
+    if (item) {
+        run->approval_head = item->next;
+        if (!run->approval_head) run->approval_tail = NULL;
+        item->next = NULL;
+        if (run->approval_head) {
+            next_ev = approval_make_ev(run->approval_head);
+        }
     }
     pthread_mutex_unlock(&run->mu);
 
-    if (!pending) {
-        free(payload);
+    if (!item) {
+        ev_free(next_ev);
         return false;
     }
+
+    approval_rpc_kind kind = item->kind;
+    bool id_is_str = item->rpc_id_is_str;
+    char id_str[128] = "";
+    snprintf(id_str, sizeof id_str, "%s", item->rpc_id_str);
+    int64_t id_num = item->rpc_id_num;
+    char allow_opt[64] = "";
+    snprintf(allow_opt, sizeof allow_opt, "%s", item->allow_opt);
+    char allow_always_opt[64] = "";
+    snprintf(allow_always_opt, sizeof allow_always_opt, "%s", item->allow_always_opt);
+    char deny_opt[64] = "";
+    snprintf(deny_opt, sizeof deny_opt, "%s", item->deny_opt);
+    bool codex_amend = item->codex_use_amendment;
+    char *payload = item->payload_json;
+    item->payload_json = NULL;
+    approval_item_free(item);
 
     bool ok = false;
     bool allow = (decision == MCODE_APPROVAL_ALLOW_ONCE || decision == MCODE_APPROVAL_ALLOW_SESSION);
@@ -7523,7 +7703,12 @@ bool mcode_agent_respond_approval(mcode_agent_run *run, mcode_thread *thread,
     }
 
     free(payload);
-    if (ok && thread) {
+    if (next_ev) {
+        push_ev(run, next_ev);
+        if (thread) {
+            snprintf(thread->status_text, sizeof thread->status_text, "Waiting for approval...");
+        }
+    } else if (ok && thread) {
         snprintf(thread->status_text, sizeof thread->status_text, "%s",
                  allow ? "Approved — continuing..." : "Denied — continuing...");
     }
@@ -7673,8 +7858,7 @@ void mcode_agent_destroy_timeout(mcode_agent_run *run, int grace_ms) {
     pthread_mutex_lock(&run->mu);
     agent_ev *cur = run->head;
     run->head = run->tail = NULL;
-    free(run->approval_payload_json);
-    run->approval_payload_json = NULL;
+    approval_queue_clear_locked(run);
     free(run->question_payload_json);
     run->question_payload_json = NULL;
     for (int i = 0; i < run->pending_live_steer_count; ++i) {
