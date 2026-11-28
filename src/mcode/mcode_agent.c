@@ -112,6 +112,7 @@ struct mcode_agent_run {
     char *init_prompt;
     char init_cwd[MCODE_PATH_MAX];
     char init_model[APP_MODEL_NAME_MAX];
+    char resolved_model[APP_MODEL_NAME_MAX];
     char init_effort[32];
     mcode_speed_mode init_speed;
     mcode_permission_mode init_perm_mode;
@@ -2739,6 +2740,9 @@ static void codex_rpc_send_initialize(mcode_agent_run *run) {
     yyjson_mut_obj_add_str(doc, ci, "name", "mcode");
     yyjson_mut_obj_add_str(doc, ci, "version", "0.1.0");
     yyjson_mut_obj_add_val(doc, params, "clientInfo", ci);
+    yyjson_mut_val *caps = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_bool(doc, caps, "experimentalApi", true);
+    yyjson_mut_obj_add_val(doc, params, "capabilities", caps);
     yyjson_mut_obj_add_val(doc, root, "params", params);
     send_json_doc(run->proc, doc);
     yyjson_mut_doc_free(doc);
@@ -2786,11 +2790,6 @@ static void codex_rpc_send_thread_open(mcode_agent_run *run, bool resume, int rp
                         : (run->init_perm_mode == MCODE_PERM_PLAN) ? "read-only"
                         : "workspace-write";
     yyjson_mut_obj_add_str(doc, params, "sandbox", sandbox);
-    if (!resume && run->init_perm_mode == MCODE_PERM_PLAN) {
-        yyjson_mut_obj_add_str(doc, params, "developerInstructions",
-            "Plan mode is active. Inspect the workspace read-only, propose a clear step-by-step plan, "
-            "and do not modify files or run mutating commands until the user switches out of Plan mode.");
-    }
     if (run->init_model[0]) {
         yyjson_mut_obj_add_strcpy(doc, params, "model", run->init_model);
     }
@@ -2835,6 +2834,22 @@ static void codex_rpc_send_turn_start(mcode_agent_run *run) {
     }
     if (run->init_effort[0]) {
         yyjson_mut_obj_add_strcpy(doc, params, "effort", run->init_effort);
+    }
+    const char *cm_model = run->init_model[0] ? run->init_model : run->resolved_model;
+    if (cm_model && cm_model[0]) {
+        yyjson_mut_val *cm = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, cm, "mode",
+                               run->init_perm_mode == MCODE_PERM_PLAN ? "plan" : "default");
+        yyjson_mut_val *cset = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, cset, "model", cm_model);
+        if (run->init_effort[0]) {
+            yyjson_mut_obj_add_strcpy(doc, cset, "reasoning_effort", run->init_effort);
+        } else {
+            yyjson_mut_obj_add_null(doc, cset, "reasoning_effort");
+        }
+        yyjson_mut_obj_add_null(doc, cset, "developer_instructions");
+        yyjson_mut_obj_add_val(doc, cm, "settings", cset);
+        yyjson_mut_obj_add_val(doc, params, "collaborationMode", cm);
     }
     if (run->init_speed == MCODE_SPEED_FAST) {
         yyjson_mut_obj_add_str(doc, params, "serviceTier", "fast");
@@ -3111,6 +3126,10 @@ static void parse_codex_rpc_json(mcode_agent_run *run, yyjson_val *root) {
             }
             yyjson_val *thr = yyjson_is_obj(res_v) ? yyjson_obj_get(res_v, "thread") : NULL;
             const char *tid = jstr(thr, "id");
+            const char *rmodel = jstr(res_v, "model");
+            if (rmodel && rmodel[0]) {
+                snprintf(run->resolved_model, sizeof run->resolved_model, "%s", rmodel);
+            }
             if (tid && tid[0]) {
                 pthread_mutex_lock(&run->mu);
                 snprintf(run->active_session_id, sizeof run->active_session_id, "%s", tid);
