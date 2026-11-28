@@ -684,11 +684,13 @@ static void draw_source_control_commit_box(mcode_app *app, cui_ctx *ui,
                 }
             }
 
+            bool btn_disabled = (mode == SC_BTN_BUSY) || (app->git_op != NULL);
             if (cui_button(ui, btn_label,
                            .variant = CUI_BUTTON_PRIMARY,
                            .size = CUI_SIZE_SM,
                            .font_size = 13.0f,
                            .icon = btn_icon,
+                           .disabled = btn_disabled,
                            .loading = (mode == SC_BTN_BUSY),
                            .full_width = true,
                            .bg = active_bg,

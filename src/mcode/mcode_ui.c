@@ -2203,12 +2203,12 @@ static void draw_topbar_right_controls(mcode_app *app, cui_ctx *ui, mcode_thread
                             mcode_app_action_commit(ui, app);
                             close_actions = true;
                         }
-                        if (app->git_sync.valid && strcmp(app->git_workdir, thread->workdir) == 0 &&
-                            !mcode_ui_is_git_op_running(app, thread->workdir)) {
+                        bool git_op_busy = (app->git_op != NULL);
+                        if (app->git_sync.valid && strcmp(app->git_workdir, thread->workdir) == 0) {
                             if (!app->git_sync.has_upstream && !app->git_sync.is_unborn &&
                                 !app->git_sync.is_detached && app->git_sync.has_remote) {
                                 if (draw_actions_pop_item(ui, "act-publish", CUI_ICON_UPLOAD,
-                                                          "Publish Branch", NULL, false)) {
+                                                          "Publish Branch", NULL, git_op_busy)) {
                                     mcode_ui_start_git_op(app, ui, MCODE_GIT_OP_PUBLISH,
                                                           thread->workdir, false);
                                     close_actions = true;
@@ -2228,7 +2228,7 @@ static void draw_topbar_right_controls(mcode_app *app, cui_ctx *ui, mcode_thread
                                              "Sync Changes %d\xe2\x86\x91", app->git_sync.ahead);
                                 }
                                 if (draw_actions_pop_item(ui, "act-sync", CUI_ICON_REFRESH_CW,
-                                                          sync_lbl, NULL, false)) {
+                                                          sync_lbl, NULL, git_op_busy)) {
                                     mcode_ui_start_git_op(app, ui, MCODE_GIT_OP_SYNC,
                                                           thread->workdir, false);
                                     close_actions = true;
@@ -2236,7 +2236,7 @@ static void draw_topbar_right_controls(mcode_app *app, cui_ctx *ui, mcode_thread
                             }
                         }
                         if (draw_actions_pop_item(ui, "act-pr", CUI_ICON_ARROW_UP_RIGHT,
-                                                  "Push & Create PR...", "Cmd Shift P", false)) {
+                                                  "Push & Create PR...", "Cmd Shift P", git_op_busy)) {
                             mcode_app_action_create_pr(ui, app);
                             close_actions = true;
                         }
