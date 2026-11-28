@@ -7905,6 +7905,7 @@ struct mcode_title_run {
     mcode_proc *proc;
     pthread_mutex_t mu;
     mcode_str stdout_buf;
+    mcode_str stderr_buf;
     double started_mono;
     bool timed_out;
     bool finished;
@@ -8450,12 +8451,23 @@ static mcode_proc *spawn_one_shot_prompt(app_agent_kind agent, const char *bin,
         }
         argv[n++] = prompt;
     } else { /* APP_AGENT_AGY */
+        /* Deny all tool actions in headless one-shot mode so the agent cannot
+         * trigger an interactive permission prompt (which headless mode soft-denies
+         * by canceling the turn with an empty response and exit code 0) or execute
+         * side effects when summarizing prompts or diffs. */
+        static const char k_agy_one_shot_settings[] =
+            "{\"permissions\":{\"deny\":["
+            "\"command(*)\",\"read_file(*)\",\"write_file(*)\","
+            "\"read_url(*)\",\"execute_url(*)\",\"mcp(*)\""
+            "]}}";
         argv[n++] = bin;
         argv[n++] = "-p";
         argv[n++] = prompt;
         argv[n++] = "--output-format";
-        argv[n++] = "stream-json";
+        argv[n++] = "json";
         argv[n++] = "--disable-slash-commands";
+        argv[n++] = "--settings";
+        argv[n++] = k_agy_one_shot_settings;
         argv[n++] = "--print-timeout";
         argv[n++] = (agy_timeout_s && agy_timeout_s[0]) ? agy_timeout_s : "30s";
         if (model && model[0]) {
@@ -8475,11 +8487,119 @@ static mcode_proc *spawn_one_shot_prompt(app_agent_kind agent, const char *bin,
     });
 }
 
+static void copy_first_clean_line(const char *raw, size_t len, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (!raw || len == 0) return;
+
+    const char *p = raw;
+    const char *end = raw + len;
+    while (p < end) {
+        const char *nl = memchr(p, '\n', (size_t)(end - p));
+        size_t line_len = nl ? (size_t)(nl - p) : (size_t)(end - p);
+        while (line_len > 0 && p[line_len - 1] == '\r') --line_len;
+
+        const char *seg = p;
+        size_t seg_len = line_len;
+        for (size_t i = 0; i < line_len; ++i) {
+            if (p[i] == '\r') {
+                seg = p + i + 1;
+                seg_len = line_len - (i + 1);
+            }
+        }
+
+        char tmp[256];
+        strip_ansi_into(seg, seg_len, tmp, sizeof tmp);
+        char *s = tmp;
+        while (*s && isspace((unsigned char)*s)) ++s;
+        size_t sl = strlen(s);
+        while (sl > 0 && isspace((unsigned char)s[sl - 1])) s[--sl] = '\0';
+        if (sl > 0) {
+            snprintf(out, cap, "%s", s);
+            return;
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+}
+
+static void summarize_one_shot_failure(const mcode_str *stdout_buf,
+                                       const mcode_str *stderr_buf,
+                                       char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+
+    if (stdout_buf && stdout_buf->len > 0) {
+        const char *p = mcode_str_cstr(stdout_buf);
+        const char *end = p + stdout_buf->len;
+        while (p < end) {
+            const char *nl = memchr(p, '\n', (size_t)(end - p));
+            size_t line_len = nl ? (size_t)(nl - p) : (size_t)(end - p);
+            while (line_len > 0 && p[line_len - 1] == '\r') --line_len;
+
+            const char *trim = p;
+            size_t tlen = line_len;
+            while (tlen > 0 && isspace((unsigned char)*trim)) { ++trim; --tlen; }
+            while (tlen > 0 && isspace((unsigned char)trim[tlen - 1])) --tlen;
+            if (tlen >= 2 && trim[0] == '{') {
+                yyjson_doc *doc = yyjson_read(trim, tlen, 0);
+                if (doc) {
+                    yyjson_val *root = yyjson_doc_get_root(doc);
+                    if (yyjson_is_obj(root)) {
+                        yyjson_val *res = yyjson_obj_get(root, "result");
+                        yyjson_val *src = yyjson_is_obj(res) ? res : root;
+                        yyjson_val *err_v = yyjson_obj_get(root, "is_error");
+                        bool is_err = yyjson_is_bool(err_v) && yyjson_get_bool(err_v);
+                        const char *err_s = jstr(src, "error");
+                        if ((!err_s || !err_s[0]) && is_err) err_s = jstr(root, "result");
+                        if (!err_s || !err_s[0]) err_s = jstr(root, "message");
+                        if (err_s && err_s[0]) {
+                            copy_first_clean_line(err_s, strlen(err_s), out, cap);
+                        } else {
+                            yyjson_val *denied = yyjson_obj_get(src, "denied_actions");
+                            if (yyjson_is_arr(denied) && yyjson_arr_size(denied) > 0) {
+                                yyjson_val *first = yyjson_arr_get_first(denied);
+                                const char *disp = jstr(first, "display_name");
+                                const char *act = jstr(first, "action");
+                                snprintf(out, cap, "denied tool action: %s",
+                                         (disp && disp[0]) ? disp
+                                                           : ((act && act[0]) ? act : "unknown"));
+                            } else {
+                                const char *status = jstr(src, "status");
+                                if (status && status[0] && strcmp(status, "SUCCESS") != 0) {
+                                    snprintf(out, cap, "status=%s", status);
+                                }
+                            }
+                        }
+                    }
+                    yyjson_doc_free(doc);
+                }
+            }
+            if (!nl) break;
+            p = nl + 1;
+        }
+    }
+
+    if (!out[0] && stderr_buf && stderr_buf->len > 0) {
+        copy_first_clean_line(mcode_str_cstr(stderr_buf), stderr_buf->len, out, cap);
+    }
+    if (!out[0]) {
+        if (!stdout_buf || stdout_buf->len == 0) {
+            snprintf(out, cap, "empty stdout");
+        } else {
+            snprintf(out, cap, "unparseable output (%zu bytes)", stdout_buf->len);
+        }
+    }
+}
+
 static void on_title_bytes(const char *data, size_t len, bool is_stderr, void *user) {
-    if (is_stderr) return;
     mcode_title_run *run = (mcode_title_run *)user;
     pthread_mutex_lock(&run->mu);
-    if (run->stdout_buf.len < 64 * 1024) {
+    if (is_stderr) {
+        if (run->stderr_buf.len < 4 * 1024) {
+            mcode_str_append(&run->stderr_buf, data, len);
+        }
+    } else if (run->stdout_buf.len < 64 * 1024) {
         mcode_str_append(&run->stdout_buf, data, len);
     }
     pthread_mutex_unlock(&run->mu);
@@ -8514,6 +8634,7 @@ mcode_title_run *mcode_agent_start_title(const mcode_thread *thread,
     mcode_str_init(&title_prompt);
     mcode_str_append_cstr(&title_prompt,
         "Generate a concise 3 to 6 word title summarizing this coding request. "
+        "Use ONLY the request text below; do not run commands, read files, or call any tools. "
         "Reply with ONLY the title text: no quotes, no markdown, no prefixes, "
         "no explanation, and no trailing punctuation.\n\nRequest:\n");
     mcode_str_append(&title_prompt, prompt, plen);
@@ -8529,6 +8650,7 @@ mcode_title_run *mcode_agent_start_title(const mcode_thread *thread,
     run->agent = thread->agent;
     run->started_mono = mcode_now_mono();
     mcode_str_init(&run->stdout_buf);
+    mcode_str_init(&run->stderr_buf);
     pthread_mutex_init(&run->mu, NULL);
 
     run->proc = spawn_one_shot_prompt(thread->agent, bin, model, thread->workdir,
@@ -8538,6 +8660,7 @@ mcode_title_run *mcode_agent_start_title(const mcode_thread *thread,
 
     if (!run->proc) {
         mcode_str_free(&run->stdout_buf);
+        mcode_str_free(&run->stderr_buf);
         pthread_mutex_destroy(&run->mu);
         free(run);
         return NULL;
@@ -8572,8 +8695,11 @@ bool mcode_agent_poll_title(mcode_title_run *run, char *out_title, size_t cap, b
                                               out_title, cap);
     }
     if (!ok && !run->killed) {
-        app_log_warn("Title generation via %s did not produce a title (exit=%d)",
-                     mcode_agent_label(run->agent), run->exit_code);
+        char reason[256] = "";
+        summarize_one_shot_failure(&run->stdout_buf, &run->stderr_buf, reason, sizeof reason);
+        app_log_warn("Title generation via %s did not produce a title (exit=%d%s%s)",
+                     mcode_agent_label(run->agent), run->exit_code,
+                     reason[0] ? ", " : "", reason);
     }
     if (out_ok) *out_ok = ok;
     return true;
@@ -8596,6 +8722,7 @@ void mcode_agent_title_destroy(mcode_title_run *run) {
         run->proc = NULL;
     }
     mcode_str_free(&run->stdout_buf);
+    mcode_str_free(&run->stderr_buf);
     pthread_mutex_destroy(&run->mu);
     free(run);
 }
@@ -8607,6 +8734,7 @@ struct mcode_commit_msg_run {
     mcode_proc *proc;
     pthread_mutex_t mu;
     mcode_str stdout_buf;
+    mcode_str stderr_buf;
     double started_mono;
     bool timed_out;
     bool finished;
@@ -8615,10 +8743,13 @@ struct mcode_commit_msg_run {
 };
 
 static void on_commit_msg_bytes(const char *data, size_t len, bool is_stderr, void *user) {
-    if (is_stderr) return;
     mcode_commit_msg_run *run = (mcode_commit_msg_run *)user;
     pthread_mutex_lock(&run->mu);
-    if (run->stdout_buf.len < 64 * 1024) {
+    if (is_stderr) {
+        if (run->stderr_buf.len < 4 * 1024) {
+            mcode_str_append(&run->stderr_buf, data, len);
+        }
+    } else if (run->stdout_buf.len < 64 * 1024) {
         mcode_str_append(&run->stdout_buf, data, len);
     }
     pthread_mutex_unlock(&run->mu);
@@ -8655,6 +8786,7 @@ mcode_commit_msg_run *mcode_agent_start_commit_msg(app_agent_kind agent,
     mcode_str_init(&prompt);
     mcode_str_append_cstr(&prompt,
         "Write a concise single-line git commit message summarizing the changes below. "
+        "Use ONLY the context provided below; do not run commands, read files, or call any tools. "
         "Match the repository's recent commit style if shown (such as conventional commits); "
         "otherwise use imperative mood (about 50 to 72 characters). "
         "Reply with ONLY the commit message line: no quotes, no code fences, no markdown, "
@@ -8672,6 +8804,7 @@ mcode_commit_msg_run *mcode_agent_start_commit_msg(app_agent_kind agent,
     run->agent = agent;
     run->started_mono = mcode_now_mono();
     mcode_str_init(&run->stdout_buf);
+    mcode_str_init(&run->stderr_buf);
     pthread_mutex_init(&run->mu, NULL);
 
     run->proc = spawn_one_shot_prompt(agent, bin, eff_model, workdir,
@@ -8681,6 +8814,7 @@ mcode_commit_msg_run *mcode_agent_start_commit_msg(app_agent_kind agent,
 
     if (!run->proc) {
         mcode_str_free(&run->stdout_buf);
+        mcode_str_free(&run->stderr_buf);
         pthread_mutex_destroy(&run->mu);
         free(run);
         return NULL;
@@ -8716,8 +8850,11 @@ bool mcode_agent_poll_commit_msg(mcode_commit_msg_run *run, char *out_msg, size_
                                                    out_msg, cap);
     }
     if (!ok && !run->killed) {
-        app_log_warn("Commit message generation via %s did not produce a message (exit=%d)",
-                     mcode_agent_label(run->agent), run->exit_code);
+        char reason[256] = "";
+        summarize_one_shot_failure(&run->stdout_buf, &run->stderr_buf, reason, sizeof reason);
+        app_log_warn("Commit message generation via %s did not produce a message (exit=%d%s%s)",
+                     mcode_agent_label(run->agent), run->exit_code,
+                     reason[0] ? ", " : "", reason);
     }
     if (out_ok) *out_ok = ok;
     return true;
@@ -8740,6 +8877,7 @@ void mcode_agent_commit_msg_destroy(mcode_commit_msg_run *run) {
         run->proc = NULL;
     }
     mcode_str_free(&run->stdout_buf);
+    mcode_str_free(&run->stderr_buf);
     pthread_mutex_destroy(&run->mu);
     free(run);
 }
