@@ -1287,6 +1287,7 @@ void mcode_app_shutdown(mcode_app *app) {
     mcode_usage_tracker_begin_shutdown(&app->usage);
     mcode_model_catalog_begin_shutdown(&app->models);
     mcode_cli_updates_begin_shutdown(&app->cli_updates);
+    mcode_ui_images_shutdown(app);
     if (app->clone_proc) {
         mcode_proc_stop(app->clone_proc);
     }
@@ -1721,6 +1722,14 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
     bool catalog_updated = mcode_model_catalog_poll(&app->models);
     bool usage_updated = mcode_usage_tracker_poll(&app->usage, &app->cli_status, agy_busy);
     bool cli_updates_changed = mcode_cli_updates_poll(&app->cli_updates, &app->cli_status);
+    bool images_loading = false;
+    bool images_updated = mcode_ui_images_poll(app, &images_loading);
+    if (images_updated) {
+        mcode_thread *sel_img = mcode_store_selected_thread(&app->store);
+        if (sel_img && sel_img->scroll_at_bottom && !sel_img->scroll_restore_pending) {
+            sel_img->scroll_to_bottom_frames = 2;
+        }
+    }
 
     mcode_cli_update_result cli_upd_res;
     while (mcode_cli_updates_take_result(&app->cli_updates, &cli_upd_res)) {
@@ -1789,9 +1798,10 @@ static void poll_background_work(mcode_app *app, cui_ctx *ui, int *out_running_c
         }
     }
 
-    if (term_dirty) {
+    if (term_dirty || images_updated) {
         cui_request_redraw(ui);
-    } else if (running > 0 || clone_active || commit_gen_running || git_op_running || term_visible_running) {
+    } else if (running > 0 || clone_active || commit_gen_running || git_op_running ||
+               term_visible_running || images_loading) {
         cui_request_wakeup(ui, 0.033f);
     } else if (title_running > 0 || app->models.loading_agy ||
                mcode_usage_tracker_is_loading(&app->usage) ||

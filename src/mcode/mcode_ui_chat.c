@@ -118,6 +118,7 @@ typedef struct {
     size_t end;
     char alt[160];
     char resolved[MCODE_PATH_MAX];
+    bool loading;
 } chat_md_image;
 
 typedef struct {
@@ -369,9 +370,21 @@ static void scan_markdown_images(mcode_app *app, cui_ctx *ui, const char *workdi
             size_t end = 0;
             if (parse_md_bracket_link(s, len, i + 1, alt, sizeof alt, dest, sizeof dest, &end)) {
                 char resolved[MCODE_PATH_MAX] = "";
-                if (mcode_image_has_supported_ext(dest) &&
-                    mcode_ui_resolve_local_path(dest, workdir, false, resolved, sizeof resolved) &&
-                    mcode_ui_image_get(app, ui, resolved) != NULL) {
+                bool loading = false;
+                bool matched = false;
+                if (mcode_image_is_http_url(dest)) {
+                    if (mcode_ui_resolve_remote_image(app, dest, resolved, sizeof resolved, &loading)) {
+                        matched = (mcode_ui_image_get(app, ui, resolved) != NULL);
+                    } else if (loading) {
+                        matched = true;
+                        cui_request_wakeup(ui, 0.05f);
+                    }
+                } else if (mcode_image_has_supported_ext(dest) &&
+                           mcode_ui_resolve_local_path(dest, workdir, false, resolved, sizeof resolved) &&
+                           mcode_ui_image_get(app, ui, resolved) != NULL) {
+                    matched = true;
+                }
+                if (matched) {
                     size_t span_start = i;
                     size_t span_end = end;
                     if (i > 0 && s[i - 1] == '[' && end < len && s[end] == ']' &&
@@ -386,6 +399,7 @@ static void scan_markdown_images(mcode_app *app, cui_ctx *ui, const char *workdi
                         chat_md_image *im = &inline_out[(*inline_count)++];
                         im->start = span_start;
                         im->end = span_end;
+                        im->loading = loading;
                         snprintf(im->alt, sizeof im->alt, "%s", alt);
                         snprintf(im->resolved, sizeof im->resolved, "%s", resolved);
                     }
@@ -399,16 +413,26 @@ static void scan_markdown_images(mcode_app *app, cui_ctx *ui, const char *workdi
             }
         }
 
-        /* Case 2: Regular markdown link [label](dest) targeting a local PNG/JPEG */
+        /* Case 2: Regular markdown link [label](dest) targeting a local or remote image */
         if (s[i] == '[' && !(i + 2 < len && s[i + 1] == '!' && s[i + 2] == '[')) {
             char label[160] = "";
             char dest[MCODE_PATH_MAX] = "";
             size_t end = 0;
             if (parse_md_bracket_link(s, len, i, label, sizeof label, dest, sizeof dest, &end)) {
                 char resolved[MCODE_PATH_MAX] = "";
-                if (mcode_image_has_supported_ext(dest) &&
-                    mcode_ui_resolve_local_path(dest, workdir, false, resolved, sizeof resolved) &&
-                    mcode_ui_image_get(app, ui, resolved) != NULL) {
+                bool loading = false;
+                bool ok = false;
+                if (mcode_image_has_supported_ext(dest)) {
+                    if (mcode_image_is_http_url(dest)) {
+                        ok = mcode_ui_resolve_remote_image(app, dest, resolved, sizeof resolved, &loading) &&
+                             mcode_ui_image_get(app, ui, resolved) != NULL;
+                        if (loading) cui_request_wakeup(ui, 0.05f);
+                    } else {
+                        ok = mcode_ui_resolve_local_path(dest, workdir, false, resolved, sizeof resolved) &&
+                             mcode_ui_image_get(app, ui, resolved) != NULL;
+                    }
+                }
+                if (ok) {
                     if (*ref_count < MCODE_CHAT_MAX_REF_IMAGES &&
                         !has_resolved_in_refs(ref_out, *ref_count, resolved)) {
                         chat_ref_image *rf = &ref_out[(*ref_count)++];
@@ -730,10 +754,14 @@ static void draw_assistant_markdown_block(mcode_app *app, cui_ctx *ui, const mco
                 }
                 char img_id[64];
                 snprintf(img_id, sizeof img_id, "%s-img-%d", bid, ii);
-                mcode_ui_draw_image_preview_card(app, ui, img_id,
-                                                 inline_imgs[ii].resolved,
-                                                 inline_imgs[ii].alt,
-                                                 img_max_w, 280.0f, false);
+                if (inline_imgs[ii].loading) {
+                    mcode_ui_draw_image_loading_card(ui, inline_imgs[ii].alt, img_max_w);
+                } else {
+                    mcode_ui_draw_image_preview_card(app, ui, img_id,
+                                                     inline_imgs[ii].resolved,
+                                                     inline_imgs[ii].alt,
+                                                     img_max_w, 280.0f, false);
+                }
                 cursor = inline_imgs[ii].end;
             }
             size_t tail_s = 0, tail_e = 0;
@@ -1387,8 +1415,15 @@ static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int tur
                 char resolved[MCODE_PATH_MAX] = "";
                 const char *workdir = (thread && thread->workdir[0]) ? thread->workdir : NULL;
                 const char *img_path = b->image_path;
-                if (img_path[0] &&
-                    mcode_ui_resolve_local_path(img_path, workdir, false, resolved, sizeof resolved)) {
+                bool loading = false;
+                if (mcode_image_is_http_url(img_path)) {
+                    if (mcode_ui_resolve_remote_image(app, img_path, resolved, sizeof resolved, &loading)) {
+                        img_path = resolved;
+                    } else if (loading) {
+                        cui_request_wakeup(ui, 0.05f);
+                    }
+                } else if (img_path[0] &&
+                           mcode_ui_resolve_local_path(img_path, workdir, false, resolved, sizeof resolved)) {
                     img_path = resolved;
                 }
                 float col_w = (fallback_md_w > 0.0f) ? fallback_md_w : 640.0f;
@@ -1396,8 +1431,10 @@ static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int tur
                 if (img_max_w > 540.0f) img_max_w = 540.0f;
                 if (img_max_w < 160.0f) img_max_w = 160.0f;
                 const char *caption = mcode_str_cstr(&b->text);
-                if (!mcode_ui_draw_image_preview_card(app, ui, bid, img_path, caption,
-                                                      img_max_w, 380.0f, false)) {
+                if (loading) {
+                    mcode_ui_draw_image_loading_card(ui, caption, img_max_w);
+                } else if (!mcode_ui_draw_image_preview_card(app, ui, bid, img_path, caption,
+                                                             img_max_w, 380.0f, false)) {
                     cui_row(ui, .gap = 8, .pad_x = 12, .pad_y = 8, .radius = 8,
                             .border = 1.0f, .border_color = CUI_COLOR_BORDER,
                             .bg = CUI_COLOR_SURFACE_MUTED, .align = CUI_ALIGN_CENTER) {

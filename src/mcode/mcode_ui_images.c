@@ -1,4 +1,5 @@
 #include "mcode_ui_internal.h"
+#include "platform.h"
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
@@ -6,12 +7,42 @@
 #include <string.h>
 #include <sys/stat.h>
 
-#if defined(_WIN32) && !defined(S_ISREG)
+#if defined(_WIN32)
+#include <direct.h>
+#include <windows.h>
+#ifndef S_ISREG
 #define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+#endif
 #endif
 
 enum {
     MCODE_IMAGE_MAX_BYTES = 64 * 1024 * 1024,
+    MCODE_REMOTE_IMAGE_MAX_BYTES = 20 * 1024 * 1024,
+    MCODE_REMOTE_SLOTS = 48,
+    MCODE_REMOTE_MAX_WORKERS = 4,
+};
+
+typedef enum {
+    RFETCH_EMPTY = 0,
+    RFETCH_PENDING,
+    RFETCH_FETCHING,
+    RFETCH_DONE,
+    RFETCH_FAILED,
+} rfetch_state;
+
+typedef struct {
+    rfetch_state state;
+    char url[MCODE_PATH_MAX];
+    char cache_path[MCODE_PATH_MAX];
+} rfetch_slot;
+
+struct mcode_remote_image_loader {
+    pthread_mutex_t mu;
+    int refcount;
+    int active_workers;
+    bool shutting_down;
+    bool completed_flag;
+    rfetch_slot slots[MCODE_REMOTE_SLOTS];
 };
 
 static const double MCODE_IMAGE_STAT_INTERVAL_SEC = 1.0;
@@ -87,6 +118,16 @@ static const char *path_basename(const char *path) {
     return (sep && sep[1]) ? sep + 1 : path;
 }
 
+bool mcode_image_is_http_url(const char *s) {
+    if (!s) return false;
+    while (*s == ' ' || *s == '\t') ++s;
+    return starts_with_icase(s, "http://") || starts_with_icase(s, "https://");
+}
+
+static bool ext_is_icase(const char *ext, size_t n, const char *lit) {
+    return strlen(lit) == n && starts_with_icase(ext, lit);
+}
+
 bool mcode_image_has_supported_ext(const char *path) {
     if (!path || !path[0]) return false;
     size_t len = 0;
@@ -104,14 +145,14 @@ bool mcode_image_has_supported_ext(const char *path) {
         }
     }
     if (!dot) return false;
-    size_t ext_len = (size_t)((path + len) - (dot + 1));
-    if (ext_len == 3) {
-        return starts_with_icase(dot + 1, "png") || starts_with_icase(dot + 1, "jpg");
-    }
-    if (ext_len == 4) {
-        return starts_with_icase(dot + 1, "jpeg");
-    }
-    return false;
+    const char *ext = dot + 1;
+    size_t ext_len = (size_t)((path + len) - ext);
+    return ext_is_icase(ext, ext_len, "png") || ext_is_icase(ext, ext_len, "jpg") ||
+           ext_is_icase(ext, ext_len, "jpeg") || ext_is_icase(ext, ext_len, "webp") ||
+           ext_is_icase(ext, ext_len, "gif") || ext_is_icase(ext, ext_len, "bmp") ||
+           ext_is_icase(ext, ext_len, "tif") || ext_is_icase(ext, ext_len, "tiff") ||
+           ext_is_icase(ext, ext_len, "heic") || ext_is_icase(ext, ext_len, "heif") ||
+           ext_is_icase(ext, ext_len, "avif") || ext_is_icase(ext, ext_len, "ico");
 }
 
 bool mcode_ui_resolve_local_path(const char *raw_link, const char *workdir,
@@ -260,7 +301,14 @@ static void cache_entry_load(mcode_image_cache_entry *e, cui_ctx *ui, const char
     e->checked_mono = now;
 
     int w = 0, h = 0;
-    cui_texture tex = cui_image_load(ui, abs_path, &w, &h);
+    unsigned char *rgba = NULL;
+    cui_texture tex = 0;
+    if (app_image_decode_file_rgba(abs_path, 4096, &rgba, &w, &h)) {
+        tex = cui_image_create(ui, w, h, rgba);
+        free(rgba);
+    } else {
+        tex = cui_image_load(ui, abs_path, &w, &h);
+    }
     if (tex && w > 0 && h > 0) {
         e->tex = tex;
         e->width = w;
@@ -272,10 +320,198 @@ static void cache_entry_load(mcode_image_cache_entry *e, cui_ctx *ui, const char
     }
 }
 
+static void rloader_release(mcode_remote_image_loader *L) {
+    if (!L) return;
+    pthread_mutex_lock(&L->mu);
+    bool drop = (--L->refcount <= 0);
+    pthread_mutex_unlock(&L->mu);
+    if (drop) {
+        pthread_mutex_destroy(&L->mu);
+        free(L);
+    }
+}
+
+static bool rloader_should_abort(void *user) {
+    mcode_remote_image_loader *L = (mcode_remote_image_loader *)user;
+    pthread_mutex_lock(&L->mu);
+    bool stop = L->shutting_down;
+    pthread_mutex_unlock(&L->mu);
+    return stop;
+}
+
+static void *rloader_worker(void *arg) {
+    mcode_remote_image_loader *L = (mcode_remote_image_loader *)arg;
+    for (;;) {
+        int idx = -1;
+        char url[MCODE_PATH_MAX] = "", dst[MCODE_PATH_MAX] = "";
+        pthread_mutex_lock(&L->mu);
+        if (!L->shutting_down) {
+            for (int i = 0; i < MCODE_REMOTE_SLOTS; ++i) {
+                if (L->slots[i].state == RFETCH_PENDING) {
+                    idx = i;
+                    L->slots[i].state = RFETCH_FETCHING;
+                    snprintf(url, sizeof url, "%s", L->slots[i].url);
+                    snprintf(dst, sizeof dst, "%s", L->slots[i].cache_path);
+                    break;
+                }
+            }
+        }
+        if (idx < 0) {
+            if (L->active_workers > 0) L->active_workers--;
+            pthread_mutex_unlock(&L->mu);
+            break;
+        }
+        pthread_mutex_unlock(&L->mu);
+
+        char tmp[MCODE_PATH_MAX + 32];
+        snprintf(tmp, sizeof tmp, "%s.tmp.%d", dst, idx);
+        bool ok = app_http_download_file(url, tmp, MCODE_REMOTE_IMAGE_MAX_BYTES,
+                                         rloader_should_abort, L);
+        if (ok) {
+#ifdef _WIN32
+            ok = MoveFileExA(tmp, dst, MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+            ok = (rename(tmp, dst) == 0);
+#endif
+            if (!ok) (void)remove(tmp);
+        }
+
+        pthread_mutex_lock(&L->mu);
+        L->slots[idx].state = ok ? RFETCH_DONE : RFETCH_FAILED;
+        L->completed_flag = true;
+        pthread_mutex_unlock(&L->mu);
+    }
+    rloader_release(L);
+    return NULL;
+}
+
+static void remote_cache_path(mcode_app *app, const char *url, char *out, size_t cap) {
+    if (!app->image_cache.remote_cache_dir[0]) {
+        char base[MCODE_PATH_MAX] = "";
+        const char *sp = app->chrome ? app->chrome->cli.settings_path : NULL;
+        if (app_settings_dir(base, sizeof base, sp, true) && base[0]) {
+            snprintf(app->image_cache.remote_cache_dir, sizeof app->image_cache.remote_cache_dir,
+                     "%s/remote_images", base);
+        } else {
+            const char *tmp = getenv("TMPDIR");
+            snprintf(app->image_cache.remote_cache_dir, sizeof app->image_cache.remote_cache_dir,
+                     "%s/mcode-remote-images", (tmp && tmp[0]) ? tmp : "/tmp");
+        }
+#ifdef _WIN32
+        (void)_mkdir(app->image_cache.remote_cache_dir);
+#else
+        (void)mkdir(app->image_cache.remote_cache_dir, 0700);
+#endif
+    }
+    uint64_t h1 = 14695981039346656037ULL, h2 = 1099511628211ULL ^ 0x9e3779b97f4a7c15ULL;
+    for (const unsigned char *p = (const unsigned char *)url; *p; ++p) {
+        h1 = (h1 ^ *p) * 1099511628211ULL;
+        h2 = (h2 ^ (*p + (h1 >> 32))) * 0xbf58476d1ce4e5b9ULL;
+    }
+    snprintf(out, cap, "%s/%016llx%016llx.imgcache",
+             app->image_cache.remote_cache_dir, (unsigned long long)h1, (unsigned long long)h2);
+}
+
+bool mcode_ui_resolve_remote_image(mcode_app *app, const char *url,
+                                   char *out_path, size_t out_cap, bool *out_loading) {
+    if (out_path && out_cap > 0) out_path[0] = '\0';
+    if (out_loading) *out_loading = false;
+    if (!app || !mcode_image_is_http_url(url) || strlen(url) >= MCODE_PATH_MAX) return false;
+
+    char cpath[MCODE_PATH_MAX] = "";
+    remote_cache_path(app, url, cpath, sizeof cpath);
+    if (path_exists_on_disk(cpath)) {
+        if (out_path && out_cap > 0) snprintf(out_path, out_cap, "%s", cpath);
+        return true;
+    }
+
+    mcode_remote_image_loader *L = app->image_cache.remote_loader;
+    if (!L) {
+        L = calloc(1, sizeof *L);
+        if (!L) return false;
+        pthread_mutex_init(&L->mu, NULL);
+        L->refcount = 1;
+        app->image_cache.remote_loader = L;
+    }
+
+    bool ready = false, loading = false;
+    pthread_mutex_lock(&L->mu);
+    int found = -1, empty = -1, reusable = -1;
+    for (int i = 0; i < MCODE_REMOTE_SLOTS; ++i) {
+        if (L->slots[i].state == RFETCH_EMPTY) {
+            if (empty < 0) empty = i;
+        } else if (strcmp(L->slots[i].url, url) == 0) {
+            found = i;
+            break;
+        } else if (L->slots[i].state == RFETCH_DONE && reusable < 0) {
+            reusable = i;
+        }
+    }
+    if (empty < 0) empty = reusable;
+    if (found >= 0) {
+        rfetch_state st = L->slots[found].state;
+        if (st == RFETCH_DONE && path_exists_on_disk(cpath)) ready = true;
+        else if (st == RFETCH_PENDING || st == RFETCH_FETCHING) loading = true;
+    } else if (!L->shutting_down && empty >= 0) {
+        rfetch_slot *s = &L->slots[empty];
+        s->state = RFETCH_PENDING;
+        snprintf(s->url, sizeof s->url, "%s", url);
+        snprintf(s->cache_path, sizeof s->cache_path, "%s", cpath);
+        loading = true;
+        if (L->active_workers < MCODE_REMOTE_MAX_WORKERS) {
+            L->refcount++;
+            L->active_workers++;
+            pthread_t tid;
+            if (pthread_create(&tid, NULL, rloader_worker, L) == 0) pthread_detach(tid);
+            else { L->active_workers--; L->refcount--; }
+        }
+    }
+    pthread_mutex_unlock(&L->mu);
+
+    if (ready && out_path && out_cap > 0) snprintf(out_path, out_cap, "%s", cpath);
+    if (out_loading) *out_loading = loading;
+    return ready;
+}
+
+bool mcode_ui_images_poll(mcode_app *app, bool *out_loading) {
+    if (out_loading) *out_loading = false;
+    if (!app || !app->image_cache.remote_loader) return false;
+    mcode_remote_image_loader *L = app->image_cache.remote_loader;
+    pthread_mutex_lock(&L->mu);
+    bool updated = L->completed_flag;
+    L->completed_flag = false;
+    bool loading = (L->active_workers > 0);
+    pthread_mutex_unlock(&L->mu);
+    if (out_loading) *out_loading = loading;
+    return updated;
+}
+
+void mcode_ui_images_shutdown(mcode_app *app) {
+    if (!app || !app->image_cache.remote_loader) return;
+    mcode_remote_image_loader *L = app->image_cache.remote_loader;
+    app->image_cache.remote_loader = NULL;
+    pthread_mutex_lock(&L->mu);
+    L->shutting_down = true;
+    pthread_mutex_unlock(&L->mu);
+    rloader_release(L);
+}
+
+void mcode_ui_draw_image_loading_card(cui_ctx *ui, const char *caption, float max_w) {
+    if (!ui) return;
+    float w = max_w > 0.0f && max_w < 300.0f ? max_w : 300.0f;
+    cui_row(ui, .width = CUI_PX(w), .pad_x = 12, .pad_y = 9, .gap = 8, .radius = 10,
+            .border = 1.0f, .border_color = CUI_COLOR_BORDER,
+            .bg = CUI_COLOR_SURFACE_MUTED, .align = CUI_ALIGN_CENTER, .clip = true) {
+        cui_spinner(ui, 13);
+        cui_text(ui, (caption && caption[0]) ? caption : "Loading image...",
+                 .size = 12.0f, .color = CUI_COLOR_TEXT_SECONDARY,
+                 .width = CUI_FILL, .nowrap = true);
+    }
+}
+
 const mcode_image_cache_entry *mcode_ui_image_get(mcode_app *app, cui_ctx *ui,
                                                   const char *abs_path) {
     if (!app || !ui || !abs_path || !abs_path[0]) return NULL;
-    if (!mcode_image_has_supported_ext(abs_path)) return NULL;
 
     mcode_image_cache *cache = &app->image_cache;
     uint64_t frame = cui_frame_count(ui);

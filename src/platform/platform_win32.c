@@ -6,11 +6,16 @@
 #include "app_config.h"
 #include "platform.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#ifndef COBJMACROS
+#define COBJMACROS
+#endif
 #include <windows.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <wchar.h>
+#include <wincodec.h>
 #include <winhttp.h>
 
 int app_system_dark(void) {
@@ -413,6 +418,137 @@ bool app_http_resolve_redirect(const char *url, char *final_url, size_t capacity
     if (request) WinHttpCloseHandle(request);
     if (connect) WinHttpCloseHandle(connect);
     if (session) WinHttpCloseHandle(session);
+    return ok;
+}
+
+bool app_http_download_file(const char *url, const char *dest_path, size_t max_bytes,
+                            app_updater_abort_fn should_abort, void *abort_user) {
+    if (!url || !url[0] || !dest_path || !dest_path[0]) return false;
+    wchar_t wide_url[2048], host[256] = { 0 }, path[2048] = { 0 };
+    if (MultiByteToWideChar(CP_UTF8, 0, url, -1, wide_url, 2048) <= 0) return false;
+    URL_COMPONENTSW parts = {
+        .dwStructSize = sizeof parts,
+        .lpszHostName = host, .dwHostNameLength = 256,
+        .lpszUrlPath = path, .dwUrlPathLength = 2048,
+    };
+    if (!WinHttpCrackUrl(wide_url, 0, 0, &parts) || !host[0] ||
+        (parts.nScheme != INTERNET_SCHEME_HTTP && parts.nScheme != INTERNET_SCHEME_HTTPS)) {
+        return false;
+    }
+
+    HINTERNET session = WinHttpOpen(L"Mcode/" L"0.1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    HINTERNET connect = NULL, request = NULL;
+    FILE *f = NULL;
+    bool ok = false;
+    do {
+        if (!session) break;
+        WinHttpSetTimeouts(session, 10000, 10000, 15000, 20000);
+        connect = WinHttpConnect(session, host, parts.nPort, 0);
+        if (!connect) break;
+        DWORD flags = (parts.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+        request = WinHttpOpenRequest(connect, L"GET", path[0] ? path : L"/",
+                                     NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+        if (!request || !WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+            !WinHttpReceiveResponse(request, NULL)) {
+            break;
+        }
+        DWORD status = 0, ssz = sizeof status;
+        if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                 WINHTTP_HEADER_NAME_BY_INDEX, &status, &ssz, WINHTTP_NO_HEADER_INDEX) ||
+            status < 200 || status >= 300) {
+            break;
+        }
+        f = fopen(dest_path, "wb");
+        if (!f) break;
+        size_t total = 0;
+        unsigned char chunk[16384];
+        bool read_ok = true;
+        for (;;) {
+            if (should_abort && should_abort(abort_user)) { read_ok = false; break; }
+            DWORD avail = 0, got = 0;
+            if (!WinHttpQueryDataAvailable(request, &avail)) { read_ok = false; break; }
+            if (avail == 0) break;
+            if (avail > sizeof chunk) avail = (DWORD)sizeof chunk;
+            if (!WinHttpReadData(request, chunk, avail, &got)) { read_ok = false; break; }
+            if (got == 0) break;
+            total += got;
+            if ((max_bytes > 0 && total > max_bytes) || fwrite(chunk, 1, got, f) != got) {
+                read_ok = false;
+                break;
+            }
+        }
+        ok = read_ok && total > 0;
+    } while (0);
+
+    if (f && fclose(f) != 0) ok = false;
+    if (!ok) (void)remove(dest_path);
+    if (request) WinHttpCloseHandle(request);
+    if (connect) WinHttpCloseHandle(connect);
+    if (session) WinHttpCloseHandle(session);
+    return ok;
+}
+
+bool app_image_decode_file_rgba(const char *path, int max_dim,
+                                unsigned char **out_rgba, int *out_w, int *out_h) {
+    if (out_rgba) *out_rgba = NULL;
+    if (out_w) *out_w = 0;
+    if (out_h) *out_h = 0;
+    if (!path || !path[0] || !out_rgba || !out_w || !out_h) return false;
+    wchar_t wpath[4096];
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 4096) <= 0) return false;
+
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    bool com_inited = (hr == S_OK || hr == S_FALSE);
+    IWICImagingFactory *fac = NULL;
+    IWICBitmapDecoder *dec = NULL;
+    IWICBitmapFrameDecode *frm = NULL;
+    IWICBitmapScaler *scl = NULL;
+    IWICFormatConverter *conv = NULL;
+    unsigned char *rgba = NULL;
+    bool ok = false;
+    do {
+        if (FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+                                    &IID_IWICImagingFactory, (void **)&fac)) || !fac) break;
+        if (FAILED(IWICImagingFactory_CreateDecoderFromFilename(
+                fac, wpath, NULL, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec)) || !dec) break;
+        if (FAILED(IWICBitmapDecoder_GetFrame(dec, 0, &frm)) || !frm) break;
+        UINT w = 0, h = 0;
+        if (FAILED(IWICBitmapFrameDecode_GetSize(frm, &w, &h)) || !w || !h) break;
+        UINT dw = w, dh = h, limit = (UINT)(max_dim > 0 ? max_dim : 4096);
+        if (dw > limit || dh > limit) {
+            double sc = (double)limit / (double)(dw > dh ? dw : dh);
+            dw = (UINT)(dw * sc + 0.5);
+            dh = (UINT)(dh * sc + 0.5);
+            if (!dw) dw = 1;
+            if (!dh) dh = 1;
+        }
+        if (dw > 8192 || dh > 8192 || (uint64_t)dw * dh > 33554432u) break;
+        IWICBitmapSource *src = (IWICBitmapSource *)frm;
+        if ((dw != w || dh != h) &&
+            SUCCEEDED(IWICImagingFactory_CreateBitmapScaler(fac, &scl)) && scl &&
+            SUCCEEDED(IWICBitmapScaler_Initialize(scl, src, dw, dh, WICBitmapInterpolationModeFant))) {
+            src = (IWICBitmapSource *)scl;
+        }
+        if (FAILED(IWICImagingFactory_CreateFormatConverter(fac, &conv)) || !conv) break;
+        if (FAILED(IWICFormatConverter_Initialize(
+                conv, src, &GUID_WICPixelFormat32bppRGBA,
+                WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom))) break;
+        UINT stride = dw * 4u, bsz = stride * dh;
+        rgba = malloc(bsz);
+        if (!rgba || FAILED(IWICFormatConverter_CopyPixels(conv, NULL, stride, bsz, rgba))) break;
+        *out_rgba = rgba; *out_w = (int)dw; *out_h = (int)dh;
+        rgba = NULL;
+        ok = true;
+    } while (0);
+    free(rgba);
+    if (conv) IWICFormatConverter_Release(conv);
+    if (scl) IWICBitmapScaler_Release(scl);
+    if (frm) IWICBitmapFrameDecode_Release(frm);
+    if (dec) IWICBitmapDecoder_Release(dec);
+    if (fac) IWICImagingFactory_Release(fac);
+    if (com_inited) CoUninitialize();
     return ok;
 }
 

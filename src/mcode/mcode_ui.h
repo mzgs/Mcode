@@ -32,8 +32,12 @@ typedef struct {
     bool failed;
 } mcode_image_cache_entry;
 
+typedef struct mcode_remote_image_loader mcode_remote_image_loader;
+
 typedef struct {
     mcode_image_cache_entry entries[MCODE_IMAGE_CACHE_MAX];
+    mcode_remote_image_loader *remote_loader;
+    char remote_cache_dir[MCODE_PATH_MAX];
 } mcode_image_cache;
 
 typedef enum {

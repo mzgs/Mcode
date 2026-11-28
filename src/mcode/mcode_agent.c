@@ -325,11 +325,19 @@ static bool save_base64_image_to_disk(const char *raw_b64, const char *mime_hint
         ext = "png";
     } else if (bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) {
         ext = "jpg";
+    } else if (nbytes >= 12 && memcmp(bytes, "RIFF", 4) == 0 && memcmp(bytes + 8, "WEBP", 4) == 0) {
+        ext = "webp";
+    } else if (nbytes >= 6 && (memcmp(bytes, "GIF87a", 6) == 0 || memcmp(bytes, "GIF89a", 6) == 0)) {
+        ext = "gif";
     } else if (mime_hint && (strstr(mime_hint, "png") || strstr(mime_hint, "PNG"))) {
         ext = "png";
     } else if (mime_hint && (strstr(mime_hint, "jpeg") || strstr(mime_hint, "jpg") ||
                              strstr(mime_hint, "JPEG") || strstr(mime_hint, "JPG"))) {
         ext = "jpg";
+    } else if (mime_hint && (strstr(mime_hint, "webp") || strstr(mime_hint, "WEBP"))) {
+        ext = "webp";
+    } else if (mime_hint && (strstr(mime_hint, "gif") || strstr(mime_hint, "GIF"))) {
+        ext = "gif";
     }
     if (!ext) {
         free(bytes);
@@ -398,6 +406,11 @@ static bool emit_json_image_content(mcode_agent_run *run, yyjson_val *item, cons
     const char *path = jstr(item, "path");
     if (!path) path = jstr(item, "savedPath");
     if (!path) path = jstr(item, "uri");
+    if (!path) path = jstr(item, "url");
+    if (path && (strncmp(path, "http://", 7) == 0 || strncmp(path, "https://", 8) == 0)) {
+        emit_image_ev(run, path, "");
+        return true;
+    }
     if (path && strncmp(path, "file://", 7) == 0) path += 7;
     if (path && file_exists_nonempty(path)) {
         emit_image_ev(run, path, "");

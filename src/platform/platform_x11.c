@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -538,6 +539,40 @@ bool app_http_resolve_redirect(const char *url, char *final_url, size_t capacity
                              "Update check cancelled.",
                              "Could not reach GitHub (check network connection and curl).",
                              err, err_cap);
+}
+
+bool app_http_download_file(const char *url, const char *dest_path, size_t max_bytes,
+                            app_updater_abort_fn should_abort, void *abort_user) {
+    if (!url || !dest_path || !dest_path[0]) return false;
+    if (strncasecmp(url, "http://", 7) != 0 && strncasecmp(url, "https://", 8) != 0) return false;
+    char max_fs[32];
+    snprintf(max_fs, sizeof max_fs, "%zu", max_bytes > 0 ? max_bytes : (size_t)(20 * 1024 * 1024));
+    char *argv[] = {
+        "curl", "-fsSL", "--proto", "=http,https", "--proto-redir", "=http,https",
+        "--max-time", "20", "--max-filesize", max_fs,
+        "-H", "Accept: image/png,image/jpeg,image/webp,image/*;q=0.8,*/*;q=0.1",
+        "-o", (char *)dest_path, "--", (char *)url, NULL
+    };
+    if (!linux_run_process(argv, NULL, 0, should_abort, abort_user, NULL, NULL, NULL, 0)) {
+        (void)unlink(dest_path);
+        return false;
+    }
+    struct stat st;
+    if (stat(dest_path, &st) != 0 || st.st_size <= 0 ||
+        (max_bytes > 0 && (size_t)st.st_size > max_bytes)) {
+        (void)unlink(dest_path);
+        return false;
+    }
+    return true;
+}
+
+bool app_image_decode_file_rgba(const char *path, int max_dim,
+                                unsigned char **out_rgba, int *out_w, int *out_h) {
+    (void)path; (void)max_dim;
+    if (out_rgba) *out_rgba = NULL;
+    if (out_w) *out_w = 0;
+    if (out_h) *out_h = 0;
+    return false;
 }
 
 bool app_updater_can_self_update(void) {

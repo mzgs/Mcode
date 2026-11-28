@@ -62,6 +62,15 @@ bool app_http_resolve_redirect(const char *url, char *final_url, size_t capacity
                                app_updater_abort_fn should_abort, void *abort_user,
                                char *err, size_t err_cap);
 
+/* Download an HTTP(S) resource to dest_path, enforcing max_bytes and polling should_abort. */
+bool app_http_download_file(const char *url, const char *dest_path, size_t max_bytes,
+                            app_updater_abort_fn should_abort, void *abort_user);
+
+/* Decode a local image file (PNG, JPEG, WebP, GIF, BMP, TIFF, HEIC, AVIF, ...) into straight
+ * RGBA8 pixels (caller frees *out_rgba), scaling down to max_dim when > 0. */
+bool app_image_decode_file_rgba(const char *path, int max_dim,
+                                unsigned char **out_rgba, int *out_w, int *out_h);
+
 /* True when the running installation can be updated in place. */
 bool app_updater_can_self_update(void);
 

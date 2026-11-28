@@ -1,4 +1,5 @@
 #import <Cocoa/Cocoa.h>
+#import <ImageIO/ImageIO.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #include "app_config.h"
@@ -621,6 +622,107 @@ bool app_http_resolve_redirect(const char *url, char *final_url, size_t capacity
             return false;
         }
         snprintf(final_url, capacity, "%s", utf8);
+        return true;
+    }
+}
+
+bool app_http_download_file(const char *url, const char *dest_path, size_t max_bytes,
+                            app_updater_abort_fn should_abort, void *abort_user) {
+    if (!url || !url[0] || !dest_path || !dest_path[0]) return false;
+    @autoreleasepool {
+        NSString *urlStr = [NSString stringWithUTF8String:url];
+        NSURL *nsUrl = urlStr ? [NSURL URLWithString:urlStr] : nil;
+        NSString *scheme = nsUrl.scheme.lowercaseString;
+        if (!nsUrl || (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"])) {
+            return false;
+        }
+        NSString *dst = [NSString stringWithUTF8String:dest_path];
+        if (!dst.length) return false;
+        [[NSFileManager defaultManager] removeItemAtPath:dst error:nil];
+        if (!macos_url_fetch(nsUrl, dst, 12.0, 25.0, should_abort, abort_user, NULL, NULL, 0)) {
+            [[NSFileManager defaultManager] removeItemAtPath:dst error:nil];
+            return false;
+        }
+        NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:dst error:nil];
+        unsigned long long sz = [attrs fileSize];
+        if (sz == 0 || (max_bytes > 0 && sz > (unsigned long long)max_bytes)) {
+            [[NSFileManager defaultManager] removeItemAtPath:dst error:nil];
+            return false;
+        }
+        return true;
+    }
+}
+
+bool app_image_decode_file_rgba(const char *path, int max_dim,
+                                unsigned char **out_rgba, int *out_w, int *out_h) {
+    if (out_rgba) *out_rgba = NULL;
+    if (out_w) *out_w = 0;
+    if (out_h) *out_h = 0;
+    if (!path || !path[0] || !out_rgba || !out_w || !out_h) return false;
+    @autoreleasepool {
+        NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+        CGImageSourceRef src = url ? CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL) : NULL;
+        if (!src || CGImageSourceGetCount(src) == 0) {
+            if (src) CFRelease(src);
+            return false;
+        }
+        int limit = max_dim > 0 ? max_dim : 4096;
+        int ow = 0, oh = 0;
+        CFDictionaryRef props = CGImageSourceCopyPropertiesAtIndex(src, 0, NULL);
+        if (props) {
+            CFNumberRef wn = CFDictionaryGetValue(props, kCGImagePropertyPixelWidth);
+            CFNumberRef hn = CFDictionaryGetValue(props, kCGImagePropertyPixelHeight);
+            if (wn) CFNumberGetValue(wn, kCFNumberIntType, &ow);
+            if (hn) CFNumberGetValue(hn, kCFNumberIntType, &oh);
+            CFRelease(props);
+        }
+        int tmax = (ow > oh ? ow : oh);
+        if (tmax <= 0 || tmax > limit) tmax = limit;
+        NSDictionary *opts = @{
+            (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+            (id)kCGImageSourceCreateThumbnailWithTransform: @YES,
+            (id)kCGImageSourceShouldCacheImmediately: @YES,
+            (id)kCGImageSourceThumbnailMaxPixelSize: @(tmax),
+        };
+        CGImageRef img = CGImageSourceCreateThumbnailAtIndex(src, 0, (__bridge CFDictionaryRef)opts);
+        if (!img) img = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+        CFRelease(src);
+        if (!img) return false;
+
+        size_t w = CGImageGetWidth(img), h = CGImageGetHeight(img);
+        if (w == 0 || h == 0 || w > 8192 || h > 8192 || w * h > 33554432u) {
+            CGImageRelease(img);
+            return false;
+        }
+        unsigned char *rgba = calloc(w * h, 4);
+        CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        if (!cs) cs = CGColorSpaceCreateDeviceRGB();
+        CGContextRef ctx = rgba ? CGBitmapContextCreate(
+            rgba, w, h, 8, w * 4, cs,
+            (CGBitmapInfo)(kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big)) : NULL;
+        if (cs) CGColorSpaceRelease(cs);
+        if (!ctx) {
+            free(rgba);
+            CGImageRelease(img);
+            return false;
+        }
+        CGContextDrawImage(ctx, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h), img);
+        CGContextRelease(ctx);
+        CGImageRelease(img);
+
+        for (size_t i = 0; i < w * h; ++i) {
+            unsigned char *p = rgba + i * 4;
+            unsigned int a = p[3];
+            if (a > 0 && a < 255) {
+                for (int c = 0; c < 3; ++c) {
+                    unsigned int v = ((unsigned int)p[c] * 255u + (a >> 1)) / a;
+                    p[c] = (unsigned char)(v > 255u ? 255u : v);
+                }
+            }
+        }
+        *out_rgba = rgba;
+        *out_w = (int)w;
+        *out_h = (int)h;
         return true;
     }
 }
