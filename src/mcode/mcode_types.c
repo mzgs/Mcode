@@ -177,6 +177,10 @@ void mcode_turn_free(mcode_turn *turn) {
     turn->blocks = NULL;
     turn->block_count = 0;
     turn->block_cap = 0;
+    free(turn->plan_steps);
+    turn->plan_steps = NULL;
+    turn->plan_step_count = 0;
+    turn->plan_title[0] = '\0';
 }
 
 void mcode_thread_free_runtime(mcode_thread *thread) {

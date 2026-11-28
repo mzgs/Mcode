@@ -195,6 +195,10 @@ bool mcode_agent_supports_live_steer(const mcode_agent_run *run);
 bool mcode_agent_respond_approval(mcode_agent_run *run, mcode_thread *thread,
                                   mcode_approval_decision decision);
 
+/* Respond to the active interactive user-input question (Codex requestUserInput /
+ * Claude AskUserQuestion). Pass submit=false to dismiss cleanly. */
+bool mcode_agent_respond_question(mcode_agent_run *run, mcode_thread *thread, bool submit);
+
 /* Destroy an agent run (stops and joins background thread if still active). */
 void mcode_agent_destroy(mcode_agent_run *run);
 

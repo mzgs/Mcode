@@ -13,6 +13,8 @@ typedef enum {
     TOOL_KIND_SEARCH,
     TOOL_KIND_WEB,
     TOOL_KIND_IMAGE,
+    TOOL_KIND_AGENT,
+    TOOL_KIND_WAIT,
     TOOL_KIND_OTHER,
 } tool_kind;
 
@@ -22,6 +24,12 @@ static tool_kind classify_tool_name(const char *name) {
         strstr(name, "view_image") || strstr(name, "imageView") ||
         strstr(name, "generate_image"))
         return TOOL_KIND_IMAGE;
+    if (strstr(name, "subagent") || strstr(name, "collab") ||
+        strcmp(name, "Agent") == 0 || strcmp(name, "Task") == 0 ||
+        strstr(name, "invoke_subagent"))
+        return TOOL_KIND_AGENT;
+    if (strcmp(name, "sleep") == 0 || strstr(name, "clock.sleep"))
+        return TOOL_KIND_WAIT;
     if (strstr(name, "bash") || strstr(name, "Bash") || strstr(name, "command") || strstr(name, "shell"))
         return TOOL_KIND_CMD;
     if (strstr(name, "Edit") || strstr(name, "Write") || strstr(name, "edit") ||
@@ -47,6 +55,8 @@ static const char *tool_icon_for_kind(tool_kind kind) {
     case TOOL_KIND_SEARCH: return CUI_ICON_SEARCH;
     case TOOL_KIND_WEB:    return CUI_ICON_GLOBE;
     case TOOL_KIND_IMAGE:  return CUI_ICON_IMAGE;
+    case TOOL_KIND_AGENT:  return CUI_ICON_CPU;
+    case TOOL_KIND_WAIT:   return CUI_ICON_CLOCK;
     default:               return CUI_ICON_ZAP;
     }
 }
@@ -911,6 +921,14 @@ static void format_tool_row_title(const mcode_block *b, const char *workdir, flo
             detail[0] = '\0';
         }
         break;
+    case TOOL_KIND_AGENT:
+        verb = running ? "Running subagent" : "Subagent";
+        fallback = "task";
+        break;
+    case TOOL_KIND_WAIT:
+        verb = running ? "Waiting" : "Waited";
+        fallback = "";
+        break;
     default:
         verb = b->tool_name[0] ? b->tool_name : "Tool";
         fallback = "";
@@ -953,7 +971,7 @@ static void append_clause(char *buf, size_t cap, int *pos, const char *fmt, int 
 static void format_tool_group_title(const mcode_block *blocks, int start, int count,
                                     const char *workdir, char *out, size_t cap,
                                     bool *out_running, int *out_failed) {
-    int n_cmd = 0, n_edit = 0, n_read = 0, n_search = 0, n_web = 0, n_image = 0, n_other = 0;
+    int n_cmd = 0, n_edit = 0, n_read = 0, n_search = 0, n_web = 0, n_image = 0, n_agent = 0, n_other = 0;
     int n_failed = 0;
     int running_idx = -1;
     float total_secs = 0.0f;
@@ -967,6 +985,7 @@ static void format_tool_group_title(const mcode_block *blocks, int start, int co
         case TOOL_KIND_SEARCH: ++n_search; break;
         case TOOL_KIND_WEB:    ++n_web; break;
         case TOOL_KIND_IMAGE:  ++n_image; break;
+        case TOOL_KIND_AGENT:  ++n_agent; break;
         default:               ++n_other; break;
         }
         if (b->status == CUI_TASK_RUNNING) running_idx = start + i;
@@ -998,6 +1017,7 @@ static void format_tool_group_title(const mcode_block *blocks, int start, int co
     if (n_edit > 0)   append_clause(out, cap, &pos, "edited %d file%s", n_edit);
     if (n_web > 0)    append_clause(out, cap, &pos, "%d web lookup%s", n_web);
     if (n_image > 0)  append_clause(out, cap, &pos, "processed %d image%s", n_image);
+    if (n_agent > 0)  append_clause(out, cap, &pos, "%d subagent%s", n_agent);
     if (n_other > 0)  append_clause(out, cap, &pos, "%d tool call%s", n_other);
 
     if (out[0] >= 'a' && out[0] <= 'z') {
@@ -1386,6 +1406,62 @@ static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int tur
                                  .size = 12.5f, .color = CUI_COLOR_TEXT_MUTED);
                     }
                 }
+            } else if (b->kind == MCODE_BLOCK_PLAN) {
+                const char *ptxt = mcode_str_cstr(&b->text);
+                if (ptxt[0]) {
+                    last_text = ptxt;
+                    bool streaming = turn->running && (bi == turn->block_count - 1);
+                    bool dark = (cui_get_theme_mode(ui) == CUI_THEME_DARK);
+                    cui_color info_c = cui_color_of(ui, CUI_COLOR_INFO);
+                    cui_column(ui, .width = CUI_FILL, .pad = 14, .gap = 10, .radius = 10,
+                               .border = 1.0f,
+                               .border_color = cui_alpha(info_c, dark ? 0.42f : 0.35f),
+                               .bg = cui_alpha(info_c, dark ? 0.07f : 0.045f)) {
+                        cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
+                            cui_icon(ui, CUI_ICON_COMPASS, 15, info_c);
+                            cui_text(ui, "Proposed Plan", .font = CUI_FONT_MEDIUM, .size = 13.0f,
+                                     .color = CUI_COLOR_FOREGROUND, .nowrap = true);
+                            cui_spacer(ui);
+                            cui_push_id(ui, bid);
+                            cui_copy_button(ui, "copy-plan", ptxt);
+                            cui_pop_id(ui);
+                        }
+                        cui_separator(ui);
+                        float inner_w = (fallback_md_w > 32.0f) ? (fallback_md_w - 30.0f) : 0.0f;
+                        draw_assistant_markdown_block(app, ui, thread, bid, ptxt, b->text.len,
+                                                      inner_w, streaming);
+                    }
+                }
+            } else if (b->kind == MCODE_BLOCK_NOTICE) {
+                const char *ntxt = mcode_str_cstr(&b->text);
+                if (ntxt[0]) {
+                    bool dark = (cui_get_theme_mode(ui) == CUI_THEME_DARK);
+                    if (b->notice_tone == CUI_TONE_WARNING || b->notice_tone == CUI_TONE_INFO) {
+                        cui_color tc = cui_color_of(ui, b->notice_tone == CUI_TONE_WARNING
+                                                        ? CUI_COLOR_WARNING : CUI_COLOR_INFO);
+                        const char *ic = (b->notice_tone == CUI_TONE_WARNING)
+                            ? CUI_ICON_TRIANGLE_ALERT : CUI_ICON_INFO;
+                        cui_row(ui, .width = CUI_FILL, .pad_x = 11, .pad_y = 7, .gap = 8,
+                                .radius = 8, .border = 1.0f,
+                                .border_color = cui_alpha(tc, dark ? 0.40f : 0.32f),
+                                .bg = cui_alpha(tc, dark ? 0.08f : 0.055f),
+                                .align = CUI_ALIGN_CENTER) {
+                            cui_icon(ui, ic, 14, tc);
+                            cui_text(ui, ntxt, .size = 12.5f, .color = CUI_COLOR_FOREGROUND,
+                                     .width = CUI_FILL, .selectable = true);
+                        }
+                    } else {
+                        cui_row(ui, .width = CUI_FILL, .gap = 10, .pad_y = 2,
+                                .align = CUI_ALIGN_CENTER) {
+                            cui_box(ui, .width = CUI_FILL, .height = CUI_PX(1),
+                                    .bg = CUI_COLOR_BORDER_SUBTLE) {}
+                            cui_text(ui, ntxt, .font = CUI_FONT_MEDIUM, .size = 11.5f,
+                                     .color = CUI_COLOR_TEXT_MUTED, .nowrap = true);
+                            cui_box(ui, .width = CUI_FILL, .height = CUI_PX(1),
+                                    .bg = CUI_COLOR_BORDER_SUBTLE) {}
+                        }
+                    }
+                }
             } else if (b->kind == MCODE_BLOCK_ERROR) {
                 cui_alert(ui, "Agent error", .description = mcode_str_cstr(&b->text),
                           .tone = CUI_TONE_DANGER);
@@ -1396,6 +1472,162 @@ static void draw_turn(mcode_app *app, cui_ctx *ui, mcode_thread *thread, int tur
                     draw_user_message(app, ui, thread->id, thread->workdir, stxt, true);
                     cui_pop_id(ui);
                 }
+            }
+        }
+
+        if (turn->plan_step_count > 0 && turn->plan_steps) {
+            cui_plan_step steps[MCODE_MAX_PLAN_STEPS];
+            int nsteps = turn->plan_step_count < MCODE_MAX_PLAN_STEPS
+                ? turn->plan_step_count : MCODE_MAX_PLAN_STEPS;
+            for (int pi = 0; pi < nsteps; ++pi) {
+                steps[pi].title = turn->plan_steps[pi].title;
+                steps[pi].detail = turn->plan_steps[pi].detail[0] ? turn->plan_steps[pi].detail : NULL;
+                steps[pi].status = turn->plan_steps[pi].status;
+            }
+            char pid[48];
+            snprintf(pid, sizeof pid, "turn-plan-%d", turn_idx);
+            (void)cui_agent_plan(ui, pid, steps, nsteps,
+                                 .title = turn->plan_title[0] ? turn->plan_title : "Plan");
+        }
+
+        if (is_last_turn && turn->running && thread->pending_question.active &&
+            thread->pending_question.count > 0) {
+            mcode_pending_question *pq = &thread->pending_question;
+            bool dark = (cui_get_theme_mode(ui) == CUI_THEME_DARK);
+            cui_color acc = cui_color_of(ui, app_theme_has_accent(ui) ? CUI_COLOR_ACCENT : CUI_COLOR_INFO);
+            cui_color fg = cui_color_of(ui, CUI_COLOR_FOREGROUND);
+            cui_vec2 mp = cui_mouse_pos(ui);
+            bool submit_now = false;
+            bool dismiss_now = false;
+            bool any_answered = false;
+
+            cui_column(ui, .id = "question-card", .width = CUI_FILL, .pad = 14, .gap = 12,
+                       .radius = 10, .border = 1.0f,
+                       .border_color = cui_alpha(acc, dark ? 0.50f : 0.38f),
+                       .bg = cui_alpha(acc, dark ? 0.075f : 0.045f)) {
+                cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
+                    cui_icon(ui, CUI_ICON_CIRCLE_HELP, 16, acc);
+                    cui_text(ui, pq->count == 1 ? "Question from agent" : "Questions from agent",
+                             .font = CUI_FONT_MEDIUM, .size = 13.5f,
+                             .color = CUI_COLOR_FOREGROUND);
+                }
+
+                for (int qi = 0; qi < pq->count; ++qi) {
+                    mcode_question_item *item = &pq->items[qi];
+                    cui_push_id_int(ui, qi);
+                    cui_column(ui, .width = CUI_FILL, .gap = 6) {
+                        cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER, .wrap = true) {
+                            if (item->header[0]) {
+                                cui_badge(ui, item->header, .tone = CUI_TONE_INFO, .size = CUI_SIZE_SM);
+                            }
+                            if (item->multi_select) {
+                                cui_text(ui, "Select one or more", .size = 11.5f,
+                                         .color = CUI_COLOR_TEXT_MUTED, .nowrap = true);
+                            }
+                        }
+                        cui_text(ui, item->question, .font = CUI_FONT_MEDIUM, .size = 13.0f,
+                                 .color = CUI_COLOR_FOREGROUND, .width = CUI_FILL);
+
+                        if (item->option_count > 0) {
+                            cui_column(ui, .width = CUI_FILL, .gap = 5) {
+                                for (int oi = 0; oi < item->option_count; ++oi) {
+                                    bool sel = (item->selected_mask & (1u << oi)) != 0;
+                                    cui_push_id_int(ui, oi);
+                                    cui_id oid = cui_make_id(ui, "qopt");
+                                    cui_rect or_ = cui_get_rect(ui, oid);
+                                    bool hov = or_.w > 0.0f &&
+                                               mp.x >= or_.x && mp.x <= or_.x + or_.w &&
+                                               mp.y >= or_.y && mp.y <= or_.y + or_.h;
+                                    cui_color obg = sel
+                                        ? cui_alpha(acc, dark ? 0.18f : 0.12f)
+                                        : (hov ? cui_alpha(fg, dark ? 0.07f : 0.045f)
+                                               : cui_color_of(ui, CUI_COLOR_SURFACE));
+                                    cui_color obdr = sel
+                                        ? cui_alpha(acc, dark ? 0.65f : 0.55f)
+                                        : cui_color_of(ui, CUI_COLOR_BORDER);
+                                    bool oclick = cui_card_begin(ui, &(cui_card_opts){
+                                        .id = "qopt",
+                                        .dir = CUI_ROW,
+                                        .align = CUI_ALIGN_START,
+                                        .width = CUI_FILL,
+                                        .pad_x = 10,
+                                        .pad_y = 8,
+                                        .gap = 9,
+                                        .hoverable = true,
+                                        .border = 1.0f,
+                                        .border_color = obdr,
+                                        .radius = 8,
+                                        .bg = obg,
+                                    });
+                                    cui_box(ui, .pad_top = 2) {
+                                        const char *ind = item->multi_select
+                                            ? (sel ? CUI_ICON_SQUARE_CHECK : CUI_ICON_SQUARE)
+                                            : (sel ? CUI_ICON_CIRCLE_DOT : CUI_ICON_CIRCLE);
+                                        cui_icon(ui, ind, 14, sel ? acc : CUI_COLOR_TEXT_MUTED);
+                                    }
+                                    cui_column(ui, .width = CUI_FILL, .gap = 2) {
+                                        cui_text(ui, item->options[oi].label,
+                                                 .font = CUI_FONT_MEDIUM, .size = 12.5f,
+                                                 .color = CUI_COLOR_FOREGROUND, .width = CUI_FILL);
+                                        if (item->options[oi].description[0]) {
+                                            cui_text(ui, item->options[oi].description,
+                                                     .size = 11.5f, .color = CUI_COLOR_TEXT_MUTED,
+                                                     .width = CUI_FILL);
+                                        }
+                                    }
+                                    cui_card_end(ui);
+                                    cui_pop_id(ui);
+
+                                    if (oclick) {
+                                        if (item->multi_select) {
+                                            item->selected_mask ^= (1u << oi);
+                                        } else {
+                                            item->selected_mask = (1u << oi);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (item->allow_other || item->option_count == 0) {
+                            int inf = cui_input(ui, "q-other", item->other_text, sizeof item->other_text,
+                                                .placeholder = item->option_count > 0
+                                                    ? "Or type a custom answer..."
+                                                    : "Type your answer...",
+                                                .password = item->is_secret,
+                                                .size = CUI_SIZE_SM,
+                                                .width = CUI_FILL);
+                            if ((inf & CUI_SUBMITTED) && pq->count == 1) {
+                                submit_now = true;
+                            }
+                        }
+
+                        const char *ot = item->other_text;
+                        while (*ot == ' ' || *ot == '\t') ++ot;
+                        if (item->selected_mask != 0 || ot[0] != '\0') {
+                            any_answered = true;
+                        }
+                    }
+                    cui_pop_id(ui);
+                }
+
+                cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
+                    if (cui_button(ui, "Submit Answer", .variant = CUI_BUTTON_PRIMARY,
+                                   .size = CUI_SIZE_SM, .icon = CUI_ICON_CHECK,
+                                   .disabled = !any_answered)) {
+                        submit_now = true;
+                    }
+                    if (cui_button(ui, "Dismiss", .variant = CUI_BUTTON_OUTLINE,
+                                   .size = CUI_SIZE_SM, .icon = CUI_ICON_X)) {
+                        dismiss_now = true;
+                    }
+                }
+            }
+
+            if (submit_now && any_answered) {
+                mcode_agent_respond_question(thread->active_run, thread, true);
+            } else if (dismiss_now) {
+                mcode_agent_respond_question(thread->active_run, thread, false);
             }
         }
 
@@ -2121,7 +2353,13 @@ static void draw_thread_permission_selector(mcode_app *app, cui_ctx *ui, mcode_t
         const char *icon;
         const char *title;
         const char *desc;
-    } k_modes[3] = {
+    } k_modes[4] = {
+        {
+            MCODE_PERM_PLAN,
+            CUI_ICON_COMPASS,
+            "Plan",
+            "Inspect read-only and propose a plan before editing.",
+        },
         {
             MCODE_PERM_SUPERVISED,
             CUI_ICON_LOCK,
@@ -2144,8 +2382,8 @@ static void draw_thread_permission_selector(mcode_app *app, cui_ctx *ui, mcode_t
 
     mcode_permission_mode cur = thread->perm_mode;
     if (thread->auto_approve) cur = MCODE_PERM_FULL_ACCESS;
-    int cur_idx = 1;
-    for (int i = 0; i < 3; ++i) {
+    int cur_idx = 2;
+    for (int i = 0; i < 4; ++i) {
         if (k_modes[i].mode == cur) { cur_idx = i; break; }
     }
 
@@ -2156,11 +2394,15 @@ static void draw_thread_permission_selector(mcode_app *app, cui_ctx *ui, mcode_t
                    mp.x >= pr.x && mp.x <= pr.x + pr.w &&
                    mp.y >= pr.y && mp.y <= pr.y + pr.h;
     bool open = cui_popover_is_open(ui, "perm-mode-pop");
+    bool is_plan = (cur == MCODE_PERM_PLAN);
 
-    cui_color bg = (open || hovered)
-        ? cui_alpha(cui_color_of(ui, CUI_COLOR_FOREGROUND), 0.08f)
-        : CUI_RGBA(0x00000001u);
-    cui_color fg = busy ? CUI_COLOR_TEXT_MUTED : CUI_COLOR_TEXT_SECONDARY;
+    cui_color bg = is_plan
+        ? cui_alpha(cui_color_of(ui, CUI_COLOR_INFO), (open || hovered) ? 0.22f : 0.14f)
+        : ((open || hovered)
+            ? cui_alpha(cui_color_of(ui, CUI_COLOR_FOREGROUND), 0.08f)
+            : CUI_RGBA(0x00000001u));
+    cui_color fg = busy ? CUI_COLOR_TEXT_MUTED
+                        : (is_plan ? CUI_COLOR_INFO : CUI_COLOR_TEXT_SECONDARY);
 
     bool clicked = cui_card_begin(ui, &(cui_card_opts){
         .id = "perm-mode-btn",
@@ -2192,7 +2434,7 @@ static void draw_thread_permission_selector(mcode_app *app, cui_ctx *ui, mcode_t
     cui_popover(ui, "perm-mode-pop", .placement = popover_placement,
                 .width = 336, .pad = 6, .gap = 4) {
         cui_column(ui, .width = CUI_FILL, .gap = 4) {
-            for (int i = 0; i < 3; ++i) {
+            for (int i = 0; i < 4; ++i) {
                 bool sel = (k_modes[i].mode == cur);
                 cui_push_id_int(ui, i);
                 cui_id rid = cui_make_id(ui, "pm-row");
@@ -2569,6 +2811,28 @@ static void draw_message_queue_dock(mcode_app *app, cui_ctx *ui, mcode_thread *t
     }
 }
 
+static void append_attached_path_to_draft(mcode_thread *thread, const char *fpath) {
+    if (!thread || !fpath || !fpath[0]) return;
+    size_t cur_len = strlen(thread->composer_draft);
+    const char *rel = fpath;
+    size_t wd_len = strlen(thread->workdir);
+    if (wd_len > 0 && strncmp(fpath, thread->workdir, wd_len) == 0 &&
+        (fpath[wd_len] == '/' || fpath[wd_len] == '\\')) {
+        rel = fpath + wd_len + 1;
+    }
+    bool has_space = (strchr(rel, ' ') != NULL || strchr(rel, '\t') != NULL);
+    bool need_sep = (cur_len > 0 && !isspace((unsigned char)thread->composer_draft[cur_len - 1]));
+    if (has_space) {
+        snprintf(thread->composer_draft + cur_len,
+                 sizeof thread->composer_draft - cur_len,
+                 "%s@\"%s\" ", need_sep ? " " : "", rel);
+    } else {
+        snprintf(thread->composer_draft + cur_len,
+                 sizeof thread->composer_draft - cur_len,
+                 "%s@%s ", need_sep ? " " : "", rel);
+    }
+}
+
 static bool composer_blocked_by_modal(const mcode_app *app) {
     if (!app) return false;
     return app->project_dialog_open ||
@@ -2733,17 +2997,9 @@ static void draw_thread_composer(mcode_app *app, cui_ctx *ui, mcode_thread *thre
         char fpath[MCODE_PATH_MAX] = "";
         if (cui_app_file_dialog(NULL, &(cui_file_dialog_opts){
                 .kind = CUI_FILE_OPEN,
-                .title = "Reference File in Prompt",
+                .title = "Attach File or Image to Prompt",
             }, fpath, sizeof fpath)) {
-            size_t cur_len = strlen(thread->composer_draft);
-            const char *rel = fpath;
-            size_t wd_len = strlen(thread->workdir);
-            if (wd_len > 0 && strncmp(fpath, thread->workdir, wd_len) == 0 && fpath[wd_len] == '/') {
-                rel = fpath + wd_len + 1;
-            }
-            snprintf(thread->composer_draft + cur_len,
-                     sizeof thread->composer_draft - cur_len,
-                     "%s@%s ", cur_len > 0 ? " " : "", rel);
+            append_attached_path_to_draft(thread, fpath);
         }
     }
     if (want_steer && !composer_draft_is_blank(thread->composer_draft)) {
@@ -2797,6 +3053,21 @@ void mcode_ui_draw_chat(mcode_app *app, cui_ctx *ui, mcode_thread *thread) {
         app->last_chat_scroll_thread_id[0] = '\0';
         draw_empty_workspace(app, ui);
         return;
+    }
+
+    /* Accept drag-and-dropped files/images onto the chat view directly into the composer. */
+    if (!composer_blocked_by_modal(app)) {
+        int ndrop = cui_dropped_file_count(ui);
+        if (ndrop > 0) {
+            for (int di = 0; di < ndrop; ++di) {
+                const char *dp = cui_dropped_file(ui, di);
+                if (dp && dp[0]) {
+                    append_attached_path_to_draft(thread, dp);
+                }
+            }
+            cui_dropped_files_claim(ui);
+            app->composer_want_focus = true;
+        }
     }
 
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0) {

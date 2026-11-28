@@ -56,6 +56,8 @@ typedef enum {
     MCODE_BLOCK_ERROR,
     MCODE_BLOCK_STEER,
     MCODE_BLOCK_IMAGE,
+    MCODE_BLOCK_PLAN,
+    MCODE_BLOCK_NOTICE,
 } mcode_block_kind;
 
 typedef struct {
@@ -76,9 +78,24 @@ typedef struct {
     /* Image block fields */
     char image_path[MCODE_PATH_MAX];
 
+    /* Notice block fields */
+    cui_tone notice_tone;
+
     double started_mono;
     float duration_sec;
 } mcode_block;
+
+enum {
+    MCODE_MAX_PLAN_STEPS = 32,
+    MCODE_MAX_QUESTIONS = 4,
+    MCODE_MAX_QUESTION_OPTIONS = 6,
+};
+
+typedef struct {
+    char title[256];
+    char detail[256];
+    cui_task_status status;
+} mcode_plan_step;
 
 typedef struct {
     mcode_str prompt;
@@ -99,6 +116,11 @@ typedef struct {
     mcode_block *blocks;
     int block_count;
     int block_cap;
+
+    /* Structured live task/plan checklist (Codex turn/plan/updated, Claude TodoWrite, ACP plan) */
+    mcode_plan_step *plan_steps;
+    int plan_step_count;
+    char plan_title[160];
 } mcode_turn;
 
 enum {
@@ -182,6 +204,7 @@ typedef enum {
     MCODE_PERM_SUPERVISED = 0,
     MCODE_PERM_ACCEPT_EDITS,
     MCODE_PERM_FULL_ACCESS,
+    MCODE_PERM_PLAN,
 } mcode_permission_mode;
 
 typedef enum {
@@ -200,6 +223,30 @@ typedef struct {
     char details[2048];
     bool can_allow_session;
 } mcode_pending_approval;
+
+typedef struct {
+    char label[128];
+    char description[256];
+} mcode_question_option;
+
+typedef struct {
+    char id[96];
+    char header[96];
+    char question[512];
+    mcode_question_option options[MCODE_MAX_QUESTION_OPTIONS];
+    int option_count;
+    bool multi_select;
+    bool allow_other;
+    bool is_secret;
+    uint32_t selected_mask;
+    char other_text[512];
+} mcode_question_item;
+
+typedef struct {
+    bool active;
+    mcode_question_item items[MCODE_MAX_QUESTIONS];
+    int count;
+} mcode_pending_question;
 
 typedef struct {
     char id[MCODE_ID_MAX];
@@ -246,6 +293,7 @@ typedef struct {
     char status_text[160];
     double run_started_mono;
     mcode_pending_approval pending_approval;
+    mcode_pending_question pending_question;
     bool queue_paused;
     bool stop_requested;
     bool steer_pending;

@@ -301,6 +301,47 @@ static double jnum_or(yyjson_val *obj, const char *key, double fallback) {
     return yyjson_is_num(v) ? yyjson_get_num(v) : fallback;
 }
 
+static const char *tone_to_str(cui_tone tone) {
+    switch (tone) {
+        case CUI_TONE_INFO:    return "info";
+        case CUI_TONE_SUCCESS: return "success";
+        case CUI_TONE_WARNING: return "warning";
+        case CUI_TONE_DANGER:  return "danger";
+        case CUI_TONE_VIOLET:  return "violet";
+        case CUI_TONE_TEAL:    return "teal";
+        case CUI_TONE_ROSE:    return "rose";
+        case CUI_TONE_ACCENT:  return "accent";
+        case CUI_TONE_NEUTRAL:
+        default:               return "neutral";
+    }
+}
+
+static cui_tone tone_from_json(yyjson_val *obj, const char *key, cui_tone fallback) {
+    yyjson_val *v = yyjson_is_obj(obj) ? yyjson_obj_get(obj, key) : NULL;
+    if (!v) return fallback;
+    if (yyjson_is_str(v)) {
+        const char *s = yyjson_get_str(v);
+        if (!s) return fallback;
+        if (strcmp(s, "info") == 0)    return CUI_TONE_INFO;
+        if (strcmp(s, "success") == 0) return CUI_TONE_SUCCESS;
+        if (strcmp(s, "warning") == 0) return CUI_TONE_WARNING;
+        if (strcmp(s, "danger") == 0)  return CUI_TONE_DANGER;
+        if (strcmp(s, "violet") == 0)  return CUI_TONE_VIOLET;
+        if (strcmp(s, "teal") == 0)    return CUI_TONE_TEAL;
+        if (strcmp(s, "rose") == 0)    return CUI_TONE_ROSE;
+        if (strcmp(s, "accent") == 0)  return CUI_TONE_ACCENT;
+        if (strcmp(s, "neutral") == 0) return CUI_TONE_NEUTRAL;
+        return fallback;
+    }
+    if (yyjson_is_num(v)) {
+        int nt = (int)yyjson_get_num(v);
+        if (nt >= (int)CUI_TONE_NEUTRAL && nt <= (int)CUI_TONE_ACCENT) {
+            return (cui_tone)nt;
+        }
+    }
+    return fallback;
+}
+
 bool mcode_store_load(mcode_store *store, const char *path) {
     if (!store || !path || !path[0]) return false;
     FILE *f = fopen(path, "rb");
@@ -424,6 +465,9 @@ bool mcode_store_load(mcode_store *store, const char *path) {
             } else if (strcmp(pm, "full_access") == 0) {
                 t->perm_mode = MCODE_PERM_FULL_ACCESS;
                 t->auto_approve = true;
+            } else if (strcmp(pm, "plan") == 0) {
+                t->perm_mode = MCODE_PERM_PLAN;
+                t->auto_approve = false;
             } else {
                 t->perm_mode = t->auto_approve ? MCODE_PERM_FULL_ACCESS : MCODE_PERM_ACCEPT_EDITS;
             }
@@ -475,7 +519,7 @@ bool mcode_store_load(mcode_store *store, const char *path) {
                         yyjson_arr_foreach(blocks, bi, bmax, bv) {
                             if (!yyjson_is_obj(bv)) continue;
                             int bk = jint_or(bv, "kind", MCODE_BLOCK_TEXT);
-                            if (bk < MCODE_BLOCK_TEXT || bk > MCODE_BLOCK_IMAGE) bk = MCODE_BLOCK_TEXT;
+                            if (bk < MCODE_BLOCK_TEXT || bk > MCODE_BLOCK_NOTICE) bk = MCODE_BLOCK_TEXT;
                             mcode_block *b = mcode_turn_add_block(turn, (mcode_block_kind)bk);
                             if (!b) break;
                             mcode_str_set(&b->text, jstr_or(bv, "text", ""));
@@ -483,6 +527,7 @@ bool mcode_store_load(mcode_store *store, const char *path) {
                             snprintf(b->tool_name, sizeof b->tool_name, "%s", jstr_or(bv, "tool_name", ""));
                             snprintf(b->tool_detail, sizeof b->tool_detail, "%s", jstr_or(bv, "tool_detail", ""));
                             snprintf(b->image_path, sizeof b->image_path, "%s", jstr_or(bv, "image_path", ""));
+                            b->notice_tone = tone_from_json(bv, "notice_tone", CUI_TONE_NEUTRAL);
                             mcode_str_set(&b->input, jstr_or(bv, "input", ""));
                             mcode_str_set(&b->output, jstr_or(bv, "output", ""));
                             int bs = jint_or(bv, "status", CUI_TASK_DONE);
@@ -496,6 +541,37 @@ bool mcode_store_load(mcode_store *store, const char *path) {
                                 b->status = CUI_TASK_DONE;
                             }
                             b->duration_sec = (float)jnum_or(bv, "duration_sec", 0.0);
+                        }
+                    }
+
+                    snprintf(turn->plan_title, sizeof turn->plan_title, "%s",
+                             jstr_or(trv, "plan_title", ""));
+                    yyjson_val *psteps = yyjson_obj_get(trv, "plan_steps");
+                    if (yyjson_is_arr(psteps)) {
+                        size_t pn = yyjson_arr_size(psteps);
+                        if (pn > MCODE_MAX_PLAN_STEPS) pn = MCODE_MAX_PLAN_STEPS;
+                        if (pn > 0) {
+                            turn->plan_steps = calloc(pn, sizeof *turn->plan_steps);
+                            if (turn->plan_steps) {
+                                size_t pi, pmax;
+                                yyjson_val *pv;
+                                int cnt = 0;
+                                yyjson_arr_foreach(psteps, pi, pmax, pv) {
+                                    if (cnt >= (int)pn || !yyjson_is_obj(pv)) continue;
+                                    const char *stitle = jstr_or(pv, "title", "");
+                                    if (!stitle[0]) continue;
+                                    snprintf(turn->plan_steps[cnt].title,
+                                             sizeof turn->plan_steps[cnt].title, "%s", stitle);
+                                    snprintf(turn->plan_steps[cnt].detail,
+                                             sizeof turn->plan_steps[cnt].detail, "%s",
+                                             jstr_or(pv, "detail", ""));
+                                    int ps = jint_or(pv, "status", CUI_TASK_PENDING);
+                                    if (ps < CUI_TASK_PENDING || ps > CUI_TASK_SKIPPED) ps = CUI_TASK_PENDING;
+                                    turn->plan_steps[cnt].status = (cui_task_status)ps;
+                                    ++cnt;
+                                }
+                                turn->plan_step_count = cnt;
+                            }
                         }
                     }
                 }
@@ -618,6 +694,7 @@ bool mcode_store_save(const mcode_store *store, const char *path) {
         yyjson_mut_obj_add_bool(doc, to, "auto_approve", t->perm_mode == MCODE_PERM_FULL_ACCESS);
         const char *pm_str = (t->perm_mode == MCODE_PERM_SUPERVISED) ? "supervised"
                            : (t->perm_mode == MCODE_PERM_FULL_ACCESS) ? "full_access"
+                           : (t->perm_mode == MCODE_PERM_PLAN) ? "plan"
                            : "accept_edits";
         yyjson_mut_obj_add_str(doc, to, "permission_mode", pm_str);
         yyjson_mut_obj_add_str(doc, to, "workdir", t->workdir);
@@ -672,11 +749,29 @@ bool mcode_store_save(const mcode_store *store, const char *path) {
                     yyjson_mut_obj_add_int(doc, bo, "status", (int)b->status);
                 } else if (b->kind == MCODE_BLOCK_IMAGE && b->image_path[0]) {
                     yyjson_mut_obj_add_str(doc, bo, "image_path", b->image_path);
+                } else if (b->kind == MCODE_BLOCK_NOTICE) {
+                    yyjson_mut_obj_add_str(doc, bo, "notice_tone", tone_to_str(b->notice_tone));
                 }
                 yyjson_mut_obj_add_real(doc, bo, "duration_sec", b->duration_sec);
                 yyjson_mut_arr_append(blocks, bo);
             }
             yyjson_mut_obj_add_val(doc, tro, "blocks", blocks);
+            if (tr->plan_step_count > 0 && tr->plan_steps) {
+                if (tr->plan_title[0]) {
+                    yyjson_mut_obj_add_str(doc, tro, "plan_title", tr->plan_title);
+                }
+                yyjson_mut_val *parr = yyjson_mut_arr(doc);
+                for (int pi = 0; pi < tr->plan_step_count; ++pi) {
+                    yyjson_mut_val *po = yyjson_mut_obj(doc);
+                    yyjson_mut_obj_add_str(doc, po, "title", tr->plan_steps[pi].title);
+                    if (tr->plan_steps[pi].detail[0]) {
+                        yyjson_mut_obj_add_str(doc, po, "detail", tr->plan_steps[pi].detail);
+                    }
+                    yyjson_mut_obj_add_int(doc, po, "status", (int)tr->plan_steps[pi].status);
+                    yyjson_mut_arr_append(parr, po);
+                }
+                yyjson_mut_obj_add_val(doc, tro, "plan_steps", parr);
+            }
             yyjson_mut_arr_append(turns, tro);
         }
         yyjson_mut_obj_add_val(doc, to, "turns", turns);
